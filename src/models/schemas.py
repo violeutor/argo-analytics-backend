@@ -18,13 +18,13 @@ class AnalyzeRequest(BaseModel):
 
 
 class TechReadinessInputs(BaseModel):
-    tech_stack_fit: float = Field(..., ge=0, le=1, description="0–1: how well target tech fits buyer stack")
-    gtm_fit: float = Field(..., ge=0, le=1, description="0–1: go-to-market overlap")
-    integration_capacity: float = Field(..., ge=0, le=1, description="0–1: buyer's M&A integration track record")
-    rd_intensity: float = Field(..., ge=0, le=1, description="0–1: buyer R&D spend relative to revenue")
-    capital_deployment_velocity: float = Field(..., ge=0, le=1, description="0–1: speed of capital deployment post-deal")
-    regulatory_readiness: float = Field(..., ge=0, le=1, description="0–1: regulatory alignment")
-    strategic_coherence: float = Field(..., ge=0, le=1, description="0–1: deal fits stated strategic priorities")
+    tech_stack_fit: float = Field(..., ge=0, le=1)
+    gtm_fit: float = Field(..., ge=0, le=1)
+    integration_capacity: float = Field(..., ge=0, le=1)
+    rd_intensity: float = Field(..., ge=0, le=1)
+    capital_deployment_velocity: float = Field(..., ge=0, le=1)
+    regulatory_readiness: float = Field(..., ge=0, le=1)
+    strategic_coherence: float = Field(..., ge=0, le=1)
 
 
 # ── Scores ───────────────────────────────────────────────────────────────────
@@ -32,8 +32,8 @@ class TechReadinessInputs(BaseModel):
 class SRRResult(BaseModel):
     value: float
     category: Literal["Low Strategic", "High Strategic", "Transformational", "Transformational++"]
-    cap_segment: Literal["low", "mid", "high"]  # <10B / 10–100B / >100B
-    execution_warning: bool  # True if low cap + high SRR
+    cap_segment: Literal["low", "mid", "high"]
+    execution_warning: bool
 
 
 class MFRResult(BaseModel):
@@ -42,7 +42,7 @@ class MFRResult(BaseModel):
 
 
 class TechReadinessResult(BaseModel):
-    value: float  # 0–1
+    value: float
     factor_scores: dict[str, float]
 
 
@@ -50,7 +50,7 @@ class ScoreResult(BaseModel):
     srr: SRRResult
     mfr: MFRResult
     tech_readiness: TechReadinessResult
-    deal_success_score: float = Field(..., description="SRR_norm × MFR_norm × TechReadiness — 0 to 1")
+    deal_success_score: float = Field(..., description="SRR_norm x MFR_norm x TechReadiness")
     rating: Literal["A · No-Brainer", "B · Solide", "C · Abwägen", "D · Uninteressant"]
     quadrant: Literal[
         "HighPotential_LowRisk",
@@ -63,8 +63,36 @@ class ScoreResult(BaseModel):
 # ── Full Report ───────────────────────────────────────────────────────────────
 
 class AnalyzeResponse(BaseModel):
+    deal_id: str | None = None
     company_name: str
     buyer_name: str
     scores: ScoreResult
     executive_summary: str
     warnings: list[str] = []
+
+
+# ── Company & Buyer List ──────────────────────────────────────────────────────
+
+class CompanyListItem(BaseModel):
+    id: str
+    name: str
+    category: str | None = None
+    potential: str | None = None
+    risk: str | None = None
+    ipo_potential: str | None = None
+    investment_path: str | None = None
+    proxy_ticker: str | None = None
+    funding_total_usd_mn: float | None = None
+    funding_last_round: str | None = None
+    last_signal: str | None = None
+    last_signal_date: str | None = None
+    source: str | None = None
+
+
+class BuyerListItem(BaseModel):
+    id: str
+    name: str
+    ticker: str | None = None
+    exchange: str | None = None
+    market_cap_usd_bn: float | None = None
+    sector: str | None = None
