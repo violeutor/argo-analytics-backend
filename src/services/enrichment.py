@@ -1,27 +1,28 @@
 """
-Company Enrichment Pipeline
-============================
-Search-time enrichment with progressive caching.
-
-Flow:
-  1. Check Supabase — is company known? Is data fresh (< 7 days)?
-  2. YES fresh  → return cached data immediately
-  3. YES stale  → return cached, trigger background refresh
-  4. NO         → scrape now → persist → return enriched data
-
+Company Enrichment Pipeline — v2.0
+====================================
 Sources:
-  - Crunchbase public (funding, stage, investors)
-  - Company website (description, tech tags)
-  - Wikipedia API (founding year, description)
-  - Yahoo Finance (if ticker known)
-  - TAM service (curated + Google + Claude)
-  - Supply Chain mapping (tag-based)
+  - Crunchbase public HTML  → funding rounds + investor list
+  - Bundesanzeiger          → financials + ownership for private DE companies
+  - Wikipedia API           → founding year, description
+
+Bundesanzeiger-Strategie:
+  - Öffentlich zugängliche Jahresabschlüsse (§ 325 HGB Pflichtveröffentlichung)
+  - Suche: https://www.bundesanzeiger.de/pub/de/suchergebnis
+  - Kurzansicht + Metadaten ohne Login; Volltext hinter Login
+  - Wir ziehen: Rechtsform, HRB, letztes Geschäftsjahr, strukturierte Finanzkennzahlen
+    aus dem öffentlichen Listing-Snippet + verlinkter Detailseite
 """
 
-import httpx
 import re
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+
+import httpx
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +34,113 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-CACHE_TTL_DAYS = 7
+DE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "de-DE,de;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 
-# ── Wikipedia ─────────────────────────────────────────────────────────────────
+# ─── Data Models ─────────────────────────────────────────────────────────────
+
+@dataclass
+class InvestorEntry:
+    name: str
+    type: str           # "VC" | "Corporate" | "Impact VC" | "Government" | "Fund" | "Unknown"
+    role: str           # "Lead" | "Strategic" | "Early" | "Co-Investor" | "Shareholder"
+    rounds: list[str] = field(default_factory=list)
+    notes: str | None = None
+
+
+@dataclass
+class FundingRound:
+    round_name: str
+    amount_mn: float | None
+    date: str | None
+    investors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CrunchbaseData:
+    url: str
+    description: str | None = None
+    funding_total_mn: float | None = None
+    stage: str | None = None
+    investors: list[InvestorEntry] = field(default_factory=list)
+    funding_rounds: list[FundingRound] = field(default_factory=list)
+    founded_year: str | None = None
+    headquarters: str | None = None
+    employee_count: str | None = None
+
+
+@dataclass
+class BundesanzeigerData:
+    company_name: str
+    legal_form: str | None = None
+    registered_at: str | None = None          # "HRB 12345 AG München"
+    last_annual_report_year: str | None = None
+    revenue_mn: float | None = None           # EUR Mio
+    ebitda_mn: float | None = None
+    equity_mn: float | None = None            # Eigenkapital
+    total_assets_mn: float | None = None      # Bilanzsumme
+    employees: int | None = None
+    shareholders: list[InvestorEntry] = field(default_factory=list)
+    source_url: str | None = None
+    found: bool = False
+
+
+@dataclass
+class EnrichmentResult:
+    name: str
+    description: str | None = None
+    wikipedia_url: str | None = None
+    founded_year: str | None = None
+    headquarters: str | None = None
+    employee_count: str | None = None
+    crunchbase: CrunchbaseData | None = None
+    bundesanzeiger: BundesanzeigerData | None = None
+    investors: list[InvestorEntry] = field(default_factory=list)
+    funding_rounds: list[FundingRound] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    enriched_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+# ─── Investor classifier ──────────────────────────────────────────────────────
+
+_VC_KW     = ["ventures", "venture", "capital", "partners", "fund", "equity", "growth", "invest"]
+_CORP_KW   = ["ag", "inc", "corp", "gmbh", "se ", "plc", "ltd", "technologies",
+              "energy", "chemicals", "materials", "systems", "industries"]
+_GOV_KW    = ["government", "federal", "national", "ministry", "department",
+              "bundesministerium", "kfw", "eib", "beis", "doe", "arena"]
+_IMPACT_KW = ["impact", "climate", "green", "sustainability", "esg",
+              "breakthrough energy", "amazon climate", "pledge"]
+
+
+def _classify_investor(name: str) -> str:
+    n = name.lower()
+    if any(k in n for k in _GOV_KW):    return "Government"
+    if any(k in n for k in _IMPACT_KW): return "Impact VC"
+    if any(k in n for k in _VC_KW):     return "VC"
+    if any(k in n for k in _CORP_KW):   return "Corporate"
+    return "Fund"
+
+
+def _classify_role(context: str) -> str:
+    c = context.lower()
+    if any(k in c for k in ["lead", "leading"]):              return "Lead"
+    if any(k in c for k in ["strategic", "partner"]):         return "Strategic"
+    if any(k in c for k in ["seed", "early", "angel"]):       return "Early"
+    return "Co-Investor"
+
+
+# ─── Wikipedia ───────────────────────────────────────────────────────────────
 
 async def _fetch_wikipedia(company: str) -> dict:
-    """Get company summary from Wikipedia API."""
     try:
         async with httpx.AsyncClient(timeout=8, headers=HEADERS) as client:
             resp = await client.get(
@@ -48,177 +149,401 @@ async def _fetch_wikipedia(company: str) -> dict:
             )
         if resp.status_code == 200:
             data = resp.json()
+            desc = data.get("extract", "")
+            year_m = re.search(
+                r"founded in (\d{4})|established in (\d{4})|(\d{4})\s+(?:startup|company|founded)",
+                desc, re.I,
+            )
+            year = next((g for g in (year_m.groups() if year_m else []) if g), None)
             return {
-                "description": data.get("extract", "")[:500],
+                "description": desc[:500],
                 "wikipedia_url": data.get("content_urls", {}).get("desktop", {}).get("page"),
+                "founded_year": year,
             }
     except Exception as e:
-        logger.debug("Wikipedia lookup failed for '%s': %s", company, e)
+        logger.debug("Wikipedia failed for '%s': %s", company, e)
     return {}
 
 
-# ── Crunchbase (public HTML) ──────────────────────────────────────────────────
+# ─── Crunchbase ───────────────────────────────────────────────────────────────
 
-async def _fetch_crunchbase(company: str) -> dict:
-    """
-    Scrape basic public Crunchbase data.
-    Returns funding stage + last round + investor hints from meta tags.
-    """
-    slug = company.lower().replace(" ", "-").replace(".", "")
-    url = f"https://www.crunchbase.com/organization/{slug}"
+async def _fetch_crunchbase(company: str) -> CrunchbaseData:
+    slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
+    url  = f"https://www.crunchbase.com/organization/{slug}"
+    result = CrunchbaseData(url=url)
+
     try:
-        async with httpx.AsyncClient(timeout=10, headers=HEADERS, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=12, headers=HEADERS, follow_redirects=True
+        ) as client:
             resp = await client.get(url)
+
         if resp.status_code != 200:
-            return {}
-        html = resp.text
+            return result
 
-        # Extract from meta description (Crunchbase always has this)
-        meta = re.search(r'<meta name="description" content="([^"]{20,400})"', html)
-        description = meta.group(1) if meta else ""
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try to extract funding figures from description
-        funding_match = re.search(r"\$([0-9,.]+)\s*(M|B|million|billion)", description, re.I)
-        funding_mn = None
-        if funding_match:
-            val = float(funding_match.group(1).replace(",", ""))
-            unit = funding_match.group(2).upper()
-            funding_mn = val * 1000 if unit in ("B", "BILLION") else val
+        # Meta description (SSR, always present)
+        meta = soup.find("meta", attrs={"name": "description"})
+        if meta:
+            desc = meta.get("content", "")
+            result.description = desc[:400]
+            # Funding total
+            m = re.search(r"\$([0-9,.]+)\s*(M|B|million|billion)", desc, re.I)
+            if m:
+                val  = float(m.group(1).replace(",", ""))
+                unit = m.group(2).upper()
+                result.funding_total_mn = val * 1000 if unit in ("B", "BILLION") else val
+            # Stage
+            for s in ["Series E", "Series D", "Series C", "Series B", "Series A", "Seed", "IPO"]:
+                if s.lower() in desc.lower():
+                    result.stage = s
+                    break
 
-        # Stage hints
-        stage = None
-        for s in ["Series D", "Series C", "Series B", "Series A", "Seed", "IPO", "Public"]:
-            if s.lower() in description.lower():
-                stage = s
+        # JSON-LD structured data
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if isinstance(data, dict):
+                    if "foundingDate" in data:
+                        result.founded_year = str(data["foundingDate"])[:4]
+                    emp = data.get("numberOfEmployees")
+                    if emp:
+                        result.employee_count = str(
+                            emp.get("value", emp) if isinstance(emp, dict) else emp
+                        )
+                    addr = data.get("address")
+                    if isinstance(addr, dict):
+                        city    = addr.get("addressLocality", "")
+                        country = addr.get("addressCountry", "")
+                        result.headquarters = f"{city}, {country}".strip(", ")
+            except Exception:
+                pass
+
+        # Investor mentions from page text
+        page_text = soup.get_text(" ", strip=True)
+        for pat in [
+            r"(?:Lead investors?|Notable investors?)[:\s]+([^.]{10,200})",
+            r"(?:backed by|funded by)[:\s]+([^.]{10,150})",
+        ]:
+            m = re.search(pat, page_text, re.I)
+            if m:
+                raw_text = m.group(1)
+                for raw in re.split(r",\s*|\band\b|\s+&\s+", raw_text):
+                    name = raw.strip().rstrip(".")
+                    if 3 < len(name) < 60:
+                        result.investors.append(InvestorEntry(
+                            name=name,
+                            type=_classify_investor(name),
+                            role=_classify_role(raw_text),
+                        ))
                 break
 
-        return {
-            "crunchbase_url": url,
-            "crunchbase_description": description[:400],
-            "funding_hint_mn": funding_mn,
-            "stage_hint": stage,
-        }
+        # Funding rounds from page text (heuristic)
+        round_re = re.compile(
+            r"(Seed|Series [A-F]|Growth|Venture)\s+[\·\-–]?\s*\$?([\d,.]+)\s*(M|B|million|billion)?",
+            re.I,
+        )
+        seen_rounds: set[str] = set()
+        for m in round_re.finditer(page_text[:6000]):
+            rname = m.group(1).strip().title()
+            if rname in seen_rounds:
+                continue
+            seen_rounds.add(rname)
+            try:
+                val  = float(m.group(2).replace(",", ""))
+                unit = (m.group(3) or "M").upper()
+                if unit in ("B", "BILLION"):
+                    val *= 1000
+                result.funding_rounds.append(FundingRound(
+                    round_name=rname, amount_mn=val, date=None,
+                ))
+            except ValueError:
+                pass
+
     except Exception as e:
-        logger.debug("Crunchbase scrape failed for '%s': %s", company, e)
-    return {}
+        logger.warning("Crunchbase scrape failed for '%s': %s", company, e)
+
+    return result
 
 
-# ── Company website ───────────────────────────────────────────────────────────
+# ─── Bundesanzeiger ──────────────────────────────────────────────────────────
 
-async def _fetch_website_description(website: str | None) -> dict:
-    """Extract meta description and title from company website."""
-    if not website:
-        return {}
-    url = website if website.startswith("http") else f"https://{website}"
+_BA_BASE   = "https://www.bundesanzeiger.de"
+_BA_SEARCH = f"{_BA_BASE}/pub/de/suchergebnis"
+
+
+def _parse_de_amount(amount_str: str, unit: str) -> float | None:
+    """Parse German number format '1.234,56' + unit to float Mio EUR."""
     try:
-        async with httpx.AsyncClient(timeout=8, headers=HEADERS, follow_redirects=True) as client:
-            resp = await client.get(url)
+        clean = amount_str.replace(".", "").replace(",", ".")
+        val   = float(clean)
+        u     = unit.upper()
+        if "MIO" in u:         return round(val, 2)
+        if "T" in u or "TSD" in u: return round(val / 1_000, 4)   # TEUR → Mio
+        return round(val / 1_000_000, 4)                            # EUR → Mio
+    except (ValueError, AttributeError):
+        return None
+
+
+async def _fetch_bundesanzeiger(company: str) -> BundesanzeigerData:
+    result = BundesanzeigerData(company_name=company)
+
+    # Strip legal suffixes for broader search match
+    search_name = re.sub(
+        r"\s+(GmbH & Co\.?\s*KG|GmbH|AG|SE|KG|UG|OHG|Inc\.?|Ltd\.?|Corp\.?)$",
+        "", company, flags=re.I,
+    ).strip()
+
+    params = {
+        "suchenach":  search_name,
+        "kategorie":  "Jahresabschluss",
+        "rechtsform": "",
+        "land":       "",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=15, headers=DE_HEADERS, follow_redirects=True
+        ) as client:
+            resp = await client.get(_BA_SEARCH, params=params)
+
         if resp.status_code != 200:
-            return {}
-        html = resp.text[:5000]  # only need head section
+            logger.debug("Bundesanzeiger %s for '%s'", resp.status_code, company)
+            return result
 
-        title = re.search(r"<title[^>]*>([^<]{5,120})</title>", html, re.I)
-        desc  = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{20,400})["\']', html, re.I)
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        return {
-            "website_title": title.group(1).strip() if title else None,
-            "website_description": desc.group(1).strip() if desc else None,
-        }
+        # Find result rows — multiple possible selectors across BA redesigns
+        rows = (
+            soup.select("table.result_container tr")
+            or soup.select(".result-table tr")
+            or soup.select("tr.publication-row")
+            or [
+                tr for tr in soup.find_all("tr")
+                if search_name.lower() in tr.get_text().lower()
+            ]
+        )
+
+        if not rows:
+            logger.debug("Bundesanzeiger: no results for '%s'", company)
+            return result
+
+        result.found = True
+        row = rows[0]
+        row_text = row.get_text(" ", strip=True)
+
+        # Legal form
+        for lf in ["GmbH & Co. KG", "GmbH", "AG", "SE", "UG", "KG", "OHG", "GbR"]:
+            if lf.lower() in row_text.lower():
+                result.legal_form = lf
+                break
+
+        # Register number
+        hrb = re.search(r"(HRB|HRA|VR|PR)\s*(\d+)", row_text)
+        if hrb:
+            result.registered_at = f"{hrb.group(1)} {hrb.group(2)}"
+
+        # Filing year
+        year_m = re.search(r"(20\d{2})", row_text)
+        if year_m:
+            result.last_annual_report_year = year_m.group(1)
+
+        # Follow detail link
+        link = row.find("a", href=True)
+        if link:
+            detail_url = link["href"]
+            if not detail_url.startswith("http"):
+                detail_url = _BA_BASE + detail_url
+            result.source_url = detail_url
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=12, headers=DE_HEADERS, follow_redirects=True
+                ) as client:
+                    dr = await client.get(detail_url)
+
+                if dr.status_code == 200:
+                    dtxt = BeautifulSoup(dr.text, "html.parser").get_text(" ", strip=True)
+
+                    # Revenue
+                    for pat in [
+                        r"Umsatzerlöse[^0-9]*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})?)\s*(T?EUR|Tsd\.?\s*EUR|Mio\.?\s*EUR)",
+                        r"Umsatz[^0-9]*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})?)\s*(T?EUR|Tsd\.?\s*EUR|Mio\.?\s*EUR)",
+                    ]:
+                        m = re.search(pat, dtxt, re.I)
+                        if m:
+                            result.revenue_mn = _parse_de_amount(m.group(1), m.group(2))
+                            break
+
+                    # Equity
+                    m = re.search(
+                        r"Eigenkapital[^0-9]*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})?)\s*(T?EUR|Tsd\.?\s*EUR|Mio\.?\s*EUR)",
+                        dtxt, re.I,
+                    )
+                    if m:
+                        result.equity_mn = _parse_de_amount(m.group(1), m.group(2))
+
+                    # Balance sheet total
+                    m = re.search(
+                        r"Bilanzsumme[^0-9]*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})?)\s*(T?EUR|Tsd\.?\s*EUR|Mio\.?\s*EUR)",
+                        dtxt, re.I,
+                    )
+                    if m:
+                        result.total_assets_mn = _parse_de_amount(m.group(1), m.group(2))
+
+                    # Employees
+                    emp_m = re.search(
+                        r"(?:Mitarbeiter|Arbeitnehmer|Beschäftigte)[:\s]*([0-9\.]{1,7})",
+                        dtxt,
+                    )
+                    if emp_m:
+                        try:
+                            result.employees = int(emp_m.group(1).replace(".", ""))
+                        except ValueError:
+                            pass
+
+                    # Shareholders / Gesellschafter
+                    for pat in [
+                        r"Gesellschafter[:\s]+([^.]{10,200})",
+                        r"Anteilseigner[:\s]+([^.]{10,200})",
+                        r"Alleiniger Gesellschafter[:\s]+([^.]{5,100})",
+                    ]:
+                        m = re.search(pat, dtxt, re.I)
+                        if m:
+                            known = {inv.name.lower() for inv in result.shareholders}
+                            for raw in re.split(r",\s*|\bund\b|;\s*", m.group(1)):
+                                n = raw.strip().rstrip(".")
+                                if 3 < len(n) < 80 and n.lower() not in known:
+                                    result.shareholders.append(InvestorEntry(
+                                        name=n,
+                                        type=_classify_investor(n),
+                                        role="Shareholder",
+                                    ))
+                            break
+
+            except Exception as e:
+                logger.debug("BA detail fetch failed: %s", e)
+
     except Exception as e:
-        logger.debug("Website fetch failed for '%s': %s", website, e)
-    return {}
+        logger.warning("Bundesanzeiger lookup failed for '%s': %s", company, e)
+
+    logger.info(
+        "Bundesanzeiger: %s — found=%s rev_mn=%s equity_mn=%s",
+        company, result.found, result.revenue_mn, result.equity_mn,
+    )
+    return result
 
 
-# ── Tag inference from description ────────────────────────────────────────────
+# ─── DE-company heuristic ────────────────────────────────────────────────────
+
+_SKIP_BA = {"Climeworks", "Micropep", "Amini"}   # non-DE despite European origin
+
+_DE_HINTS = ["gmbh", "ag", " se", " kg", "germany", "deutschland",
+             "berlin", "munich", "münchen", "hamburg", "frankfurt",
+             "stuttgart", "düsseldorf", "köln"]
+
+
+def _is_likely_german(company_record: dict) -> bool:
+    name = company_record.get("name", "")
+    if name in _SKIP_BA:
+        return False
+    haystack = " ".join(filter(None, [
+        name,
+        company_record.get("headquarters", ""),
+        company_record.get("website", ""),
+        company_record.get("funding_last_round", ""),
+    ])).lower()
+    return any(h in haystack for h in _DE_HINTS)
+
+
+# ─── Tag inference ────────────────────────────────────────────────────────────
 
 TAG_KEYWORDS: dict[str, list[str]] = {
-    "carbon-capture":       ["co2 capture", "carbon capture", "ccs", "dac", "direct air"],
-    "low-carbon-cement":    ["cement", "concrete", "clinker", "calcite"],
-    "battery":              ["battery", "lithium", "cell", "bess", "energy storage"],
-    "long-duration-storage":["iron air", "long duration", "ldes", "multi-day storage"],
-    "solid-state-battery":  ["solid state", "solid-state", "solid electrolyte"],
-    "grid":                 ["grid", "microgrid", "transmission", "distribution", "utility"],
-    "solar":                ["solar", "photovoltaic", "pv panel"],
-    "hydrogen":             ["hydrogen", "electrolyzer", "fuel cell", "h2"],
-    "geothermal":           ["geothermal", "enhanced geothermal", "egs", "hot rock"],
-    "agritech":             ["agriculture", "crop", "farm", "irrigation", "precision ag"],
-    "bioengineering":       ["crispr", "gene edit", "genomic", "synthetic biology"],
-    "co2-to-fuels":         ["saf", "sustainable aviation", "e-fuel", "syngas", "co2 to fuel"],
-    "datacenter-cooling":   ["cooling", "hvac", "data center", "datacenter", "thermal"],
-    "waste-to-energy":      ["waste", "biogas", "landfill", "anaerobic"],
-    "climate-risk-saas":    ["climate risk", "climate analytics", "esg platform", "adaptation"],
-    "carbon-credits":       ["carbon credit", "carbon market", "offset", "voluntary carbon"],
-    "soil-carbon":          ["soil carbon", "microbial", "soil sequestration"],
-    "irrigation":           ["irrigation", "drip", "water management"],
-    "sustainable-materials":["packaging", "bioplastic", "algae", "biodegradable"],
+    "carbon-capture":        ["co2 capture", "carbon capture", "ccs", "dac", "direct air"],
+    "low-carbon-cement":     ["cement", "concrete", "clinker", "calcite", "cementitious"],
+    "battery":               ["battery", "lithium", "cell", "bess", "energy storage"],
+    "long-duration-storage": ["iron air", "long duration", "ldes"],
+    "solid-state-battery":   ["solid state", "solid-state", "solid electrolyte"],
+    "grid":                  ["grid", "microgrid", "transmission", "utility"],
+    "solar":                 ["solar", "photovoltaic", "pv"],
+    "hydrogen":              ["hydrogen", "electrolyzer", "fuel cell", "h2"],
+    "geothermal":            ["geothermal", "enhanced geothermal", "egs"],
+    "agritech":              ["agriculture", "crop", "farm", "irrigation", "precision ag"],
+    "bioengineering":        ["crispr", "gene edit", "genomic", "synthetic biology"],
+    "co2-to-fuels":          ["saf", "sustainable aviation", "e-fuel", "syngas"],
+    "datacenter-cooling":    ["cooling", "hvac", "data center", "datacenter", "thermal"],
+    "waste-to-energy":       ["waste", "biogas", "landfill", "anaerobic"],
+    "climate-risk-saas":     ["climate risk", "climate analytics", "esg platform"],
+    "carbon-credits":        ["carbon credit", "carbon market", "offset"],
+    "soil-carbon":           ["soil carbon", "microbial", "soil sequestration"],
+    "irrigation":            ["irrigation", "drip", "water management"],
+    "sustainable-materials": ["packaging", "bioplastic", "algae", "biodegradable"],
 }
 
 
 def _infer_tags(text: str) -> list[str]:
-    text_lower = text.lower()
-    return [
-        tag for tag, keywords in TAG_KEYWORDS.items()
-        if any(kw in text_lower for kw in keywords)
-    ]
+    t = text.lower()
+    return [tag for tag, kws in TAG_KEYWORDS.items() if any(k in t for k in kws)]
 
 
-# ── Master enrichment function ────────────────────────────────────────────────
+# ─── Public API ───────────────────────────────────────────────────────────────
 
 async def enrich_company(
     company_name: str,
-    website: str | None = None,
+    company_record: dict | None = None,
     existing_tags: list[str] | None = None,
-    existing_category: str | None = None,
-) -> dict:
+) -> EnrichmentResult:
     """
-    Full enrichment for a company. Returns enriched data dict.
-    Caller is responsible for persisting to Supabase.
+    Full async enrichment. Runs Wikipedia + Crunchbase concurrently;
+    adds Bundesanzeiger if company is likely German-registered and private.
 
-    Returns:
-      {
-        name, description, wikipedia_url, crunchbase_url,
-        funding_hint_mn, stage_hint,
-        tags, tam, supply_chain,
-        enriched_at
-      }
+    Returns EnrichmentResult — caller persists to Supabase.
     """
-    logger.info("Enriching company: %s", company_name)
-
-    # Run non-TAM scrapes (can run concurrently in Phase 2 with asyncio.gather)
-    wiki    = await _fetch_wikipedia(company_name)
-    cb      = await _fetch_crunchbase(company_name)
-    web     = await _fetch_website_description(website)
-
-    # Build description from best available source
-    description = (
-        wiki.get("description")
-        or cb.get("crunchbase_description")
-        or web.get("website_description")
-        or ""
+    company_record = company_record or {}
+    is_listed = (
+        company_record.get("investment_path") == "IPO-direkt"
+        or company_record.get("ipo_potential") == "IPO erfolgt"
     )
 
-    # Infer tags from description + existing
-    inferred_tags = _infer_tags(description)
-    all_tags = list(set((existing_tags or []) + inferred_tags))
+    result = EnrichmentResult(name=company_name)
 
-    # TAM lookup (uses curated dataset first, then web extraction)
-    from src.services.tam import get_tam, COMPANY_PRIMARY_TAG
-    tam_data = await get_tam(company_name, existing_category)
+    # Concurrent: Wikipedia + Crunchbase
+    wiki, cb = await asyncio.gather(
+        _fetch_wikipedia(company_name),
+        _fetch_crunchbase(company_name),
+        return_exceptions=True,
+    )
 
-    # Supply chain
-    from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
-    tags_for_sc = COMPANY_TAGS.get(company_name, all_tags)
-    supply_chain = get_supply_chain(tags_for_sc)
+    if isinstance(wiki, dict):
+        result.description   = wiki.get("description")
+        result.wikipedia_url = wiki.get("wikipedia_url")
+        result.founded_year  = wiki.get("founded_year")
 
-    return {
-        "name": company_name,
-        "description": description[:500] or None,
-        "wikipedia_url": wiki.get("wikipedia_url"),
-        "crunchbase_url": cb.get("crunchbase_url"),
-        "funding_hint_mn": cb.get("funding_hint_mn"),
-        "stage_hint": cb.get("stage_hint"),
-        "tags": all_tags,
-        "tam": tam_data,
-        "supply_chain": supply_chain,
-        "enriched_at": datetime.now(timezone.utc).isoformat(),
-    }
+    if isinstance(cb, CrunchbaseData):
+        result.crunchbase    = cb
+        result.description   = result.description or cb.description
+        result.founded_year  = result.founded_year or cb.founded_year
+        result.headquarters  = cb.headquarters
+        result.employee_count= cb.employee_count
+        result.investors     = list(cb.investors)
+        result.funding_rounds= list(cb.funding_rounds)
+
+    # Bundesanzeiger: private DE companies only
+    if not is_listed and _is_likely_german(company_record):
+        ba = await _fetch_bundesanzeiger(company_name)
+        result.bundesanzeiger = ba
+        known = {inv.name.lower() for inv in result.investors}
+        for sh in ba.shareholders:
+            if sh.name.lower() not in known:
+                result.investors.append(sh)
+
+    # Tags
+    text_for_tags = " ".join(filter(None, [
+        result.description,
+        company_record.get("category", ""),
+        company_record.get("industry", ""),
+    ]))
+    result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
+
+    return result
