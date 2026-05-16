@@ -25,8 +25,8 @@ app.add_middleware(
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Health check braucht keinen Key
-        if request.url.path == "/health":
+        # Health check + CORS Preflight durchlassen
+        if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
 
         api_key = request.headers.get("X-API-Key")
