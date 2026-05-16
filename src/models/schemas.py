@@ -77,6 +77,7 @@ class CompanyListItem(BaseModel):
     id: str
     name: str
     category: str | None = None
+    industry: str | None = None
     potential: str | None = None
     risk: str | None = None
     ipo_potential: str | None = None
