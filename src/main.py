@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from src.routes.analyze import router as analyze_router
 from src.routes.companies import router as companies_router
 from src.routes.search import router as search_router
@@ -35,7 +36,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             raise RuntimeError("API_KEY environment variable not set")
 
         if api_key != expected:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         return await call_next(request)
 
