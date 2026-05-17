@@ -10,6 +10,7 @@ Changes vs v2.0:
 """
 
 import logging
+import asyncio
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -380,22 +381,34 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
 
     # 2. is_listed — robust (B-05)
     is_listed = _resolve_is_listed(company)
+    proxy = company.get("proxy_ticker")
 
-    # 3. Enrichment
-    enrichment: EnrichmentResult = await enrich_company(
-        company_name=company_name,
-        company_record=company,
-    )
-
-    # 4. TAM
+    # 3. TAM first (needed for intro) — then run enrichment + yahoo + intro in parallel
     tam = await get_tam(company_name, company.get("category"))
 
-    # 5. Intro
-    intro = await _generate_intro(company, tam)
+    # 4. Parallel: enrichment (with timeout) + yahoo + intro
+    async def _safe_enrichment():
+        try:
+            return await asyncio.wait_for(
+                enrich_company(company_name=company_name, company_record=company),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Enrichment timeout for %s — using empty result", company_name)
+            from src.services.enrichment import EnrichmentResult
+            return EnrichmentResult(name=company_name)
+        except Exception as e:
+            logger.warning("Enrichment failed for %s: %s", company_name, e)
+            from src.services.enrichment import EnrichmentResult
+            return EnrichmentResult(name=company_name)
 
-    # 6. Fundamentals
-    proxy = company.get("proxy_ticker")
-    yahoo = await _fetch_yahoo(proxy if is_listed else None)
+    enrichment, yahoo, intro = await asyncio.gather(
+        _safe_enrichment(),
+        _fetch_yahoo(proxy if is_listed else None),
+        _generate_intro(company, tam),
+    )
+
+    # 5. Fundamentals
     fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy)
 
     # 7. Ownership
