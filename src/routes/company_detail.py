@@ -1,14 +1,11 @@
 """
-GET /api/v1/company/{name}  —  v2.2
+GET /api/v1/company/{name}  —  v2.3
 
-Changes vs v2.1:
-  - _resolve_is_listed(): investment_path == 'IPO' nicht mehr als listed gewertet
-    (IPO = pre-IPO Kandidat, nicht gelistet)
-  - _resolve_investment_path(): neue Funktion mit Zustandslogik:
-      listed     → DB-Pfad (nie 'IPO'); Fallback 'Käufer-Proxy' wenn DB noch 'IPO' hat
-      pre_ipo_*  → immer 'IPO'
-      kein Status → DB-Pfad
-  - investment_path in Response via _resolve_investment_path() statt direktem DB-Wert
+Changes vs v2.2:
+  - funding_rounds aus DB (funding_rounds-Tabelle via fetch_funding_rounds())
+    statt aus Enrichment-Pipeline — Crunchbase vollständig gedropt (BUG-04)
+  - Enrichment-FundingRoundItem als Fallback entfernt
+  - DB-Rounds haben: date, type, amount_usd_mn, lead_investor, co_investors[], notes
 """
 
 import logging
@@ -17,7 +14,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from src.integrations.supabase import fetch_companies, fetch_buyers
+from src.integrations.supabase import fetch_companies, fetch_buyers, fetch_funding_rounds
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.tam import get_tam
 from src.pipelines.scoring import compute_scores
@@ -42,10 +39,13 @@ class OwnershipItem(BaseModel):
 
 
 class FundingRoundItem(BaseModel):
-    round_name: str
-    amount_mn: float | None = None
     date: str | None = None
-    investors: list[str] = []
+    type: str | None = None
+    amount_usd_mn: float | None = None
+    lead_investor: str | None = None
+    co_investors: list[str] = []
+    source: str | None = None
+    notes: str | None = None
 
 
 class FundamentalsData(BaseModel):
@@ -451,11 +451,19 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         )]
         warnings.append("Ownership data not available in public sources.")
 
-    # 8. Funding rounds
+    # 8. Funding rounds — aus DB (migration_004)
+    db_rounds = fetch_funding_rounds(company["id"]) if company.get("id") else []
     funding_rounds = [
-        FundingRoundItem(round_name=r.round_name, amount_mn=r.amount_mn,
-                         date=r.date, investors=r.investors)
-        for r in enrichment.funding_rounds
+        FundingRoundItem(
+            date=str(r["date"]) if r.get("date") else None,
+            type=r.get("type"),
+            amount_usd_mn=r.get("amount_usd_mn"),
+            lead_investor=r.get("lead_investor"),
+            co_investors=r.get("co_investors") or [],
+            source=r.get("source"),
+            notes=r.get("notes"),
+        )
+        for r in db_rounds
     ]
 
     # 9. Scoring

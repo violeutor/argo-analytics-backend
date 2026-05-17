@@ -44,6 +44,19 @@ def fetch_company_by_name(name: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+# ── Funding Rounds ────────────────────────────────────────────────────────────
+
+def fetch_funding_rounds(company_id: str) -> list[dict]:
+    """
+    Gibt alle Funding Rounds einer Company zurück, chronologisch absteigend.
+    """
+    db = get_supabase()
+    result = db.table("funding_rounds").select(
+        "id, date, type, amount_usd_mn, lead_investor, co_investors, source, notes"
+    ).eq("company_id", company_id).order("date", desc=True).execute()
+    return result.data or []
+
+
 # ── Buyers ───────────────────────────────────────────────────────────────────
 
 def fetch_buyers(limit: int = 50) -> list[dict]:
