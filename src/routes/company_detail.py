@@ -164,23 +164,23 @@ def _resolve_investment_path(company: dict) -> str | None:
     """
     Investitionspfad-Logik basierend auf ipo_status:
 
-    - listed       → kein IPO-Pfad mehr; DB-Wert verwenden (Käufer-Proxy, ETF-Proxy, etc.)
-    - pre_ipo_*    → immer 'IPO', unabhängig vom DB-Wert
-    - kein Status  → DB-Wert als Fallback
+    - pre_ipo_*  → immer 'IPO' (direkter Einstieg vor Börsengang ist der primäre Pfad)
+    - listed     → DB-Wert; 'listed' ist ein Faktum der Company, nicht der Pfad.
+                   Pfad beschreibt wie man indirekt investiert (Käufer-Proxy, ETF-Proxy etc.)
+                   Fallback auf 'Käufer-Proxy' falls DB noch 'IPO' stehen hat.
+    - kein Status → DB-Wert
     """
     ipo_status = company.get("ipo_status")
     db_path = company.get("investment_path")
 
-    if ipo_status == "listed":
-        # IPO bereits eingetreten — IPO als Pfad entfernen
-        if db_path == "IPO":
-            return "Käufer-Proxy"   # sinnvoller Default für gelistete Companies
-        return db_path
-
     if ipo_status in ("pre_ipo_high", "pre_ipo_medium", "pre_ipo_low"):
         return "IPO"
 
-    return db_path  # kein ipo_status gesetzt — DB-Wert
+    # listed oder kein Status — DB-Wert; 'IPO' als Pfad wäre hier falsch
+    if db_path == "IPO":
+        return "Käufer-Proxy"  # Fallback bis DB-Wert korrigiert (D-07)
+
+    return db_path
 
 
 
