@@ -1,11 +1,11 @@
 """
-GET /api/v1/company/{name}  —  v2.3
+GET /api/v1/company/{name}  —  v2.4
 
-Changes vs v2.2:
-  - funding_rounds aus DB (funding_rounds-Tabelle via fetch_funding_rounds())
-    statt aus Enrichment-Pipeline — Crunchbase vollständig gedropt (BUG-04)
-  - Enrichment-FundingRoundItem als Fallback entfernt
-  - DB-Rounds haben: date, type, amount_usd_mn, lead_investor, co_investors[], notes
+Changes vs v2.3:
+  - _generate_intro: httpx timeout 20s → 8s
+  - _safe_intro wrapper mit asyncio.wait_for(10s) + Fallback
+  - asyncio.gather nutzt _safe_intro statt _generate_intro direkt
+  - Gesamtbudget für alle parallelen Calls: ~10s → Railway-safe
 """
 
 import logging
@@ -289,7 +289,7 @@ Path: {company.get('investment_path','')} | {listing_context}
 TAM 2035: ${tam.get('tam_usd_bn',100)}B"""
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"Content-Type": "application/json"},
@@ -427,10 +427,23 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
             from src.services.enrichment import EnrichmentResult
             return EnrichmentResult(name=company_name)
 
+    async def _safe_intro():
+        try:
+            return await asyncio.wait_for(
+                _generate_intro(company, tam),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Intro timeout for %s — using fallback", company_name)
+            return f"{company_name} — no description available."
+        except Exception as e:
+            logger.warning("Intro failed for %s: %s", company_name, e)
+            return f"{company_name} — no description available."
+
     enrichment, yahoo, intro = await asyncio.gather(
         _safe_enrichment(),
         _fetch_yahoo(proxy if is_listed else None),
-        _generate_intro(company, tam),
+        _safe_intro(),
     )
 
     # 5. Fundamentals
