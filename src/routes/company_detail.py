@@ -1,12 +1,14 @@
 """
-GET /api/v1/company/{name}  —  v2.1
+GET /api/v1/company/{name}  —  v2.2
 
-Changes vs v2.0:
-  - ipo_status (listed/pre_ipo_*) aus DB gelesen
-  - is_listed basiert auf ipo_status == 'listed' ODER investment_path == 'IPO'
-    mit bekanntem proxy_ticker — robust, kein hartkodierter String-Vergleich
-  - ipo_status in Response durchgereicht
-  - ipo_potential bleibt für Kompatibilität erhalten
+Changes vs v2.1:
+  - _resolve_is_listed(): investment_path == 'IPO' nicht mehr als listed gewertet
+    (IPO = pre-IPO Kandidat, nicht gelistet)
+  - _resolve_investment_path(): neue Funktion mit Zustandslogik:
+      listed     → DB-Pfad (nie 'IPO'); Fallback 'Käufer-Proxy' wenn DB noch 'IPO' hat
+      pre_ipo_*  → immer 'IPO'
+      kein Status → DB-Pfad
+  - investment_path in Response via _resolve_investment_path() statt direktem DB-Wert
 """
 
 import logging
@@ -143,22 +145,45 @@ class CompanyDetailResponse(BaseModel):
 
 def _resolve_is_listed(company: dict) -> bool:
     """
-    Robust listing detection — B-05.
-    A company is considered listed if ANY of:
-      1. ipo_status == 'listed'  (new canonical field)
+    Robust listing detection — v2.2.
+    A company is considered listed if:
+      1. ipo_status == 'listed'  (canonical field, migration_003)
       2. ipo_potential == 'IPO erfolgt'  (legacy fallback)
-      3. investment_path == 'IPO' AND proxy_ticker is set  (has a real ticker)
+
+    NOTE: investment_path == 'IPO' deliberately NOT used here —
+    that value means pre-IPO candidate, not yet listed.
     """
     if company.get("ipo_status") == "listed":
         return True
     if company.get("ipo_potential") == "IPO erfolgt":
         return True
-    if company.get("investment_path") == "IPO" and company.get("proxy_ticker"):
-        return True
     return False
 
 
-def _ipo_probability(ipo_status: str | None, ipo_potential: str | None) -> int | None:
+def _resolve_investment_path(company: dict) -> str | None:
+    """
+    Investitionspfad-Logik basierend auf ipo_status:
+
+    - listed       → kein IPO-Pfad mehr; DB-Wert verwenden (Käufer-Proxy, ETF-Proxy, etc.)
+    - pre_ipo_*    → immer 'IPO', unabhängig vom DB-Wert
+    - kein Status  → DB-Wert als Fallback
+    """
+    ipo_status = company.get("ipo_status")
+    db_path = company.get("investment_path")
+
+    if ipo_status == "listed":
+        # IPO bereits eingetreten — IPO als Pfad entfernen
+        if db_path == "IPO":
+            return "Käufer-Proxy"   # sinnvoller Default für gelistete Companies
+        return db_path
+
+    if ipo_status in ("pre_ipo_high", "pre_ipo_medium", "pre_ipo_low"):
+        return "IPO"
+
+    return db_path  # kein ipo_status gesetzt — DB-Wert
+
+
+
     """Map ipo_status → probability pct. Falls back to ipo_potential for legacy data."""
     status_map = {
         "listed":          100,
@@ -496,7 +521,7 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         tam_usd_bn=tam["tam_usd_bn"],
         tam_source=tam.get("source",""),
         tam_confidence=tam.get("confidence","medium"),
-        investment_path=company.get("investment_path"),
+        investment_path=_resolve_investment_path(company),
         proxy_ticker=proxy,
         funding_total_usd_mn=company.get("funding_total_usd_mn"),
         funding_last_round=company.get("funding_last_round"),
