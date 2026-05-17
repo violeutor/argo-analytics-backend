@@ -184,6 +184,7 @@ def _resolve_investment_path(company: dict) -> str | None:
 
 
 
+def _ipo_probability(ipo_status: str | None, ipo_potential: str | None) -> int | None:
     """Map ipo_status → probability pct. Falls back to ipo_potential for legacy data."""
     status_map = {
         "listed":          100,
