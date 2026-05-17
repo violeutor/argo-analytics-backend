@@ -80,7 +80,8 @@ class CompanyListItem(BaseModel):
     industry: str | None = None
     potential: str | None = None
     risk: str | None = None
-    ipo_potential: str | None = None
+    ipo_potential: str | None = None          # legacy — bleibt für Kompatibilität
+    ipo_status: str | None = None             # neu: pre_ipo_low/medium/high/listed
     investment_path: str | None = None
     proxy_ticker: str | None = None
     funding_total_usd_mn: float | None = None

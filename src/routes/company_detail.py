@@ -1,11 +1,12 @@
 """
-GET /api/v1/company/{name}  —  v2.0
+GET /api/v1/company/{name}  —  v2.1
 
-Changes vs v1:
-  - industry: FIXED (was incorrectly returning category)
-  - Ownership: dynamic via enrichment.py (Crunchbase + Bundesanzeiger)
-  - Fundamentals: Yahoo Finance for listed; Bundesanzeiger for private DE
-  - Static _KNOWN_INVESTORS kept as curated override layer
+Changes vs v2.0:
+  - ipo_status (listed/pre_ipo_*) aus DB gelesen
+  - is_listed basiert auf ipo_status == 'listed' ODER investment_path == 'IPO'
+    mit bekanntem proxy_ticker — robust, kein hartkodierter String-Vergleich
+  - ipo_status in Response durchgereicht
+  - ipo_potential bleibt für Kompatibilität erhalten
 """
 
 import logging
@@ -93,7 +94,7 @@ class ScoringDetail(BaseModel):
 class CompanyDetailResponse(BaseModel):
     name: str
     category: str | None
-    industry: str | None        # from industry column (not category)
+    industry: str | None
     core_technology: str | None
     website: str | None
     founded: str | None
@@ -103,28 +104,78 @@ class CompanyDetailResponse(BaseModel):
     crunchbase_url: str | None
     headquarters: str | None
     employee_count: str | None
+    # IPO
+    ipo_status: str | None          # listed | pre_ipo_high | pre_ipo_medium | pre_ipo_low
+    ipo_potential: str | None       # legacy label für Frontend-Anzeige
+    ipo_probability_pct: int | None
+    # Market
     tam_usd_bn: float
     tam_source: str
     tam_confidence: str
-    ipo_potential: str | None
-    ipo_probability_pct: int | None
     investment_path: str | None
     proxy_ticker: str | None
+    # Funding
     funding_total_usd_mn: float | None
     funding_last_round: str | None
     funding_stage: str | None
     funding_rounds: list[FundingRoundItem]
+    # Ownership
     ownership: list[OwnershipItem]
+    # Fundamentals
     fundamentals: FundamentalsData
+    # Scoring
     scorings: list[ScoringDetail]
+    # Supply chain
     supply_chain_upstream: list[dict]
     supply_chain_downstream: list[dict]
     supply_chain_etfs: list[dict]
+    # Signal
     last_signal: str | None
     last_signal_date: str | None
+    # Meta
     technology_tags: list[str]
     is_known: bool
     warnings: list[str]
+
+
+# ── is_listed logic (B-05) ────────────────────────────────────────────────────
+
+def _resolve_is_listed(company: dict) -> bool:
+    """
+    Robust listing detection — B-05.
+    A company is considered listed if ANY of:
+      1. ipo_status == 'listed'  (new canonical field)
+      2. ipo_potential == 'IPO erfolgt'  (legacy fallback)
+      3. investment_path == 'IPO' AND proxy_ticker is set  (has a real ticker)
+    """
+    if company.get("ipo_status") == "listed":
+        return True
+    if company.get("ipo_potential") == "IPO erfolgt":
+        return True
+    if company.get("investment_path") == "IPO" and company.get("proxy_ticker"):
+        return True
+    return False
+
+
+def _ipo_probability(ipo_status: str | None, ipo_potential: str | None) -> int | None:
+    """Map ipo_status → probability pct. Falls back to ipo_potential for legacy data."""
+    status_map = {
+        "listed":          100,
+        "pre_ipo_high":     70,
+        "pre_ipo_medium":   40,
+        "pre_ipo_low":      10,
+    }
+    if ipo_status and ipo_status in status_map:
+        return status_map[ipo_status]
+    # legacy fallback
+    legacy_map = {
+        "IPO erfolgt":  100,
+        "Hoch":          75,
+        "Mittel-hoch":   55,
+        "Mittel":        35,
+        "Niedrig":       10,
+    }
+    return legacy_map.get(ipo_potential or "")
 
 
 # ── Curated ownership overrides ───────────────────────────────────────────────
@@ -195,7 +246,10 @@ _TR_WEIGHTS = {
 # ── Claude intro ──────────────────────────────────────────────────────────────
 
 async def _generate_intro(company: dict, tam: dict) -> str:
-    prompt = f"""Morning Briefing entry for a Climate Tech investment platform.
+    is_listed = _resolve_is_listed(company)
+    listing_context = "Already publicly listed." if is_listed else f"IPO potential: {company.get('ipo_potential','')}"
+
+    prompt = f"""Morning Briefing entry for a cross-industry investment intelligence platform.
 Write 3-4 sentences (~80 words) for a VC/PE audience. Direct, no hype.
 Lead with differentiation. Include TAM context. End with investment angle.
 Write in English, flowing prose only.
@@ -205,7 +259,7 @@ Sector: {company.get('category','')} / {company.get('industry','')}
 Technology: {company.get('core_technology','') or company.get('summary','')}
 Funding: {company.get('funding_last_round','')}
 Signal: {company.get('last_signal','')}
-Path: {company.get('investment_path','')} | IPO: {company.get('ipo_potential','')}
+Path: {company.get('investment_path','')} | {listing_context}
 TAM 2035: ${tam.get('tam_usd_bn',100)}B"""
 
     try:
@@ -274,7 +328,12 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
         return {"ticker": symbol}
 
 
-def _build_fundamentals(is_listed: bool, yahoo: dict, ba: BundesanzeigerData | None, proxy: str | None) -> FundamentalsData:
+def _build_fundamentals(
+    is_listed: bool,
+    yahoo: dict,
+    ba: BundesanzeigerData | None,
+    proxy: str | None,
+) -> FundamentalsData:
     if is_listed:
         return FundamentalsData(
             is_listed=True,
@@ -294,6 +353,9 @@ def _build_fundamentals(is_listed: bool, yahoo: dict, ba: BundesanzeigerData | N
         fd.ba_source_url=ba.source_url
     return fd
 
+
+# ── Supabase query ────────────────────────────────────────────────────────────
+# supabase.py fetch_companies muss ipo_status selektieren — siehe unten
 
 # ── Main route ────────────────────────────────────────────────────────────────
 
@@ -316,28 +378,27 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
 
     company_name = company["name"]
 
-    # 2. Enrichment
+    # 2. is_listed — robust (B-05)
+    is_listed = _resolve_is_listed(company)
+
+    # 3. Enrichment
     enrichment: EnrichmentResult = await enrich_company(
         company_name=company_name,
         company_record=company,
     )
 
-    # 3. TAM
+    # 4. TAM
     tam = await get_tam(company_name, company.get("category"))
 
-    # 4. Intro
+    # 5. Intro
     intro = await _generate_intro(company, tam)
 
-    # 5. Fundamentals
-    proxy     = company.get("proxy_ticker")
-    is_listed = (
-        company.get("investment_path") == "IPO-direkt"
-        or company.get("ipo_potential") == "IPO erfolgt"
-    )
-    yahoo        = await _fetch_yahoo(proxy if is_listed else None)
+    # 6. Fundamentals
+    proxy = company.get("proxy_ticker")
+    yahoo = await _fetch_yahoo(proxy if is_listed else None)
     fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy)
 
-    # 6. Ownership — curated override → Crunchbase → BA → placeholder
+    # 7. Ownership
     if company_name in _OWNERSHIP_OVERRIDES:
         ownership = _OWNERSHIP_OVERRIDES[company_name]
     elif enrichment.investors:
@@ -352,13 +413,14 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         )]
         warnings.append("Ownership data not available in public sources.")
 
-    # 7. Funding rounds
+    # 8. Funding rounds
     funding_rounds = [
-        FundingRoundItem(round_name=r.round_name, amount_mn=r.amount_mn, date=r.date, investors=r.investors)
+        FundingRoundItem(round_name=r.round_name, amount_mn=r.amount_mn,
+                         date=r.date, investors=r.investors)
         for r in enrichment.funding_rounds
     ]
 
-    # 8. Scoring
+    # 9. Scoring
     buyers = fetch_buyers(limit=50)
     scorings: list[ScoringDetail] = []
     for buyer in buyers:
@@ -393,21 +455,19 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
 
     scorings.sort(key=lambda x: -x.deal_success_score)
 
-    # 9. Supply chain
+    # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
     sc = get_supply_chain(sc_tags)
-
-    # 10. IPO probability
-    ipo_map = {"Hoch":75,"Mittel-hoch":55,"Mittel":35,"Niedrig":10,"IPO erfolgt":100}
-    ipo_pct = ipo_map.get(company.get("ipo_potential",""))
 
     if tam.get("method") == "fallback":
         warnings.append("TAM uses sector median fallback — verify with primary source.")
 
+    ipo_status = company.get("ipo_status")
+
     return CompanyDetailResponse(
         name=company_name,
         category=company.get("category"),
-        industry=company.get("industry"),           # ← FIXED
+        industry=company.get("industry"),
         core_technology=company.get("core_technology"),
         website=company.get("website"),
         founded=enrichment.founded_year,
@@ -417,11 +477,12 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         crunchbase_url=enrichment.crunchbase.url if enrichment.crunchbase else None,
         headquarters=enrichment.headquarters,
         employee_count=enrichment.employee_count,
+        ipo_status=ipo_status,
+        ipo_potential=company.get("ipo_potential"),
+        ipo_probability_pct=_ipo_probability(ipo_status, company.get("ipo_potential")),
         tam_usd_bn=tam["tam_usd_bn"],
         tam_source=tam.get("source",""),
         tam_confidence=tam.get("confidence","medium"),
-        ipo_potential=company.get("ipo_potential"),
-        ipo_probability_pct=ipo_pct,
         investment_path=company.get("investment_path"),
         proxy_ticker=proxy,
         funding_total_usd_mn=company.get("funding_total_usd_mn"),
