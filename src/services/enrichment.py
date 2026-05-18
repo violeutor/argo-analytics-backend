@@ -97,6 +97,7 @@ class EnrichmentResult:
     name: str
     description: str | None = None
     wikipedia_url: str | None = None
+    website: str | None = None
     founded_year: str | None = None
     headquarters: str | None = None
     employee_count: str | None = None
@@ -274,9 +275,21 @@ async def _fetch_wikipedia(company: str) -> dict:
                                 m = re.search(pat, wikitext, re.I)
                                 if m:
                                     raw = m.group(1).strip()
-                                    # Nur wenn sinnvoller Wert (enthält Zahl)
                                     if re.search(r"\d", raw):
                                         out["employee_count"] = re.sub(r"<[^>]+>", "", raw).strip()
+                                    break
+
+                        # website
+                        if not out.get("website"):
+                            for pat in [
+                                r"\|\s*(?:website|url|homepage)\s*=\s*(?:\{\{URL\|)?([^\|\n\}\]]{5,80})",
+                            ]:
+                                m = re.search(pat, wikitext, re.I)
+                                if m:
+                                    url = m.group(1).strip().strip("{}").strip()
+                                    url = re.sub(r"^https?://", "", url).strip("/")
+                                    if "." in url and len(url) < 60:
+                                        out["website"] = "https://" + url
                                     break
             except Exception as e:
                 logger.debug("Wikipedia Wikitext fallback failed for '%s': %s", company, e)
@@ -723,6 +736,7 @@ async def enrich_company(
     if isinstance(wiki, dict):
         result.description    = wiki.get("description")
         result.wikipedia_url  = wiki.get("wikipedia_url")
+        result.website        = wiki.get("website")
         result.founded_year   = wiki.get("founded_year")
         result.headquarters   = wiki.get("headquarters")
         result.employee_count = wiki.get("employee_count")
@@ -738,10 +752,12 @@ async def enrich_company(
         result.funding_rounds = list(cb.funding_rounds)
 
     # Company-Website: Headcount-Fallback wenn Wikipedia + Crunchbase leer
-    if not result.employee_count and company_record.get("website"):
+    # Website-URL: aus DB-Record ODER aus Wikipedia-Wikitext extrahiert
+    _website_url = company_record.get("website") or result.website
+    if not result.employee_count and _website_url:
         try:
             website_data = await asyncio.wait_for(
-                _fetch_company_website(company_record["website"]),
+                _fetch_company_website(_website_url),
                 timeout=6.0,
             )
             if website_data.get("employee_count"):
