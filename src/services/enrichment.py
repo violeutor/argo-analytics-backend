@@ -599,7 +599,11 @@ async def enrich_company(
 
     result = EnrichmentResult(name=company_name)
 
-    # Concurrent: Wikipedia + Crunchbase
+    # Concurrent: Wikipedia (primär) + Crunchbase (opportunistisch)
+    # Crunchbase liefert keine strukturierten Daten mehr via SSR (JS-Rendering, BUG-04).
+    # JSON-LD gelegentlich noch brauchbar für foundingDate + numberOfEmployees.
+    # Wikipedia Wikitext-Infobox ist primäre Quelle für founded_year, headquarters, headcount.
+    # Crunchbase-Timeout: 12s — wird via return_exceptions abgefangen, blockiert nicht.
     wiki, cb = await asyncio.gather(
         _fetch_wikipedia(company_name),
         _fetch_crunchbase(company_name),
