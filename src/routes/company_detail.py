@@ -11,6 +11,7 @@ Changes vs v2.5:
 import logging
 import asyncio
 import httpx
+from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
@@ -350,7 +351,11 @@ TAM 2035: ${tam.get('tam_usd_bn',100)}B"""
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": 200,

@@ -17,6 +17,7 @@ import json
 import re
 import logging
 from datetime import datetime, timedelta, timezone
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,11 @@ JSON format:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": 200,
