@@ -80,7 +80,6 @@ HEADERS = {
 
 async def _google_search_snippets(query: str, num: int = 5) -> list[str]:
     """Fetch top Google result snippets for a query."""
-    url = f"https://www.google.com/search?q={httpx.URL(query=query).query.decode()}&num={num}&hl=en"
     try:
         async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
             resp = await client.get(
