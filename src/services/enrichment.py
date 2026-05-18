@@ -145,16 +145,27 @@ async def _fetch_wikipedia(company: str) -> dict:
     Holt Wikipedia Summary + Wikidata-Infobox-Felder.
     Zwei Requests:
       1. /api/rest_v1/page/summary/{name}  → description, founded_year (aus Extract)
+         Fallback: company + " Technologies" wenn 404.
       2. /w/api.php?action=query&prop=revisions (Wikitext) → founding year, HQ, employees
          als Fallback wenn Summary-Regex nichts findet.
     """
     out: dict = {}
+
+    async def _summary_request(client: httpx.AsyncClient, title: str) -> httpx.Response:
+        return await client.get(
+            "https://en.wikipedia.org/api/rest_v1/page/summary/" + title.replace(" ", "_"),
+        )
+
     try:
         async with httpx.AsyncClient(timeout=8, headers=HEADERS) as client:
-            resp = await client.get(
-                "https://en.wikipedia.org/api/rest_v1/page/summary/" +
-                company.replace(" ", "_"),
-            )
+            resp = await _summary_request(client, company)
+            # Fallback 1: "Company Technologies"
+            if resp.status_code == 404 and not company.lower().endswith("technologies"):
+                resp = await _summary_request(client, company + " Technologies")
+            # Fallback 2: "Company Inc"
+            if resp.status_code == 404:
+                resp = await _summary_request(client, company + " Inc")
+
         if resp.status_code != 200:
             return out
 
@@ -165,15 +176,17 @@ async def _fetch_wikipedia(company: str) -> dict:
 
         # ── Founding year — erweitertes Muster ───────────────────────────────
         year_patterns = [
+            r"(?:was\s+)?founded\s+in\s+(\d{4})",
+            r"(?:was\s+)?established\s+in\s+(\d{4})",
+            r"(?:was\s+)?incorporated\s+in\s+(\d{4})",
+            r"(?:was\s+)?launched\s+in\s+(\d{4})",
+            r"(?:was\s+)?started\s+in\s+(\d{4})",
+            r"(?:was\s+)?formed\s+in\s+(\d{4})",
             r"founded\s+in\s+(\d{4})",
-            r"established\s+in\s+(\d{4})",
-            r"incorporated\s+in\s+(\d{4})",
-            r"launched\s+in\s+(\d{4})",
-            r"started\s+in\s+(\d{4})",
-            r"formed\s+in\s+(\d{4})",
             r"(\d{4})[,\s]+(?:as\s+a\s+)?(?:startup|company|corporation|venture)",
             r"in\s+(\d{4})[,\s]+(?:the\s+)?company",
             r"in\s+(\d{4})[,\s]+\w+\s+(?:founded|established|launched|started)",
+            r"company\s+(?:was\s+)?founded\s+in\s+(\d{4})",
         ]
         for pat in year_patterns:
             m = re.search(pat, desc, re.I)
