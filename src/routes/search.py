@@ -19,7 +19,7 @@ from src.integrations.supabase import (
 )
 from src.services.enrichment import enrich_company
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
-from src.services.tam import get_tam, COMPANY_PRIMARY_TAG
+from src.services.tam import get_tam
 from src.pipelines.scoring import compute_scores
 from src.models.schemas import AnalyzeRequest
 
