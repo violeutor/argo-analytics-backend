@@ -608,12 +608,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     _claude_infer_category(company_name, _desc_for_claude),
                     timeout=6.0,
                 )
-                if inferred_cat:
-                    logger.info("Claude category inferred for %s: %s / %s", company_name, inferred_cat, inferred_ind)
+                logger.warning("Claude category result for %s: cat=%s ind=%s", company_name, inferred_cat, inferred_ind)
             except asyncio.TimeoutError:
-                logger.debug("Claude category inference timeout for %s", company_name)
+                logger.warning("Claude category inference TIMEOUT for %s", company_name)
             except Exception as e:
-                logger.debug("Claude category inference failed for %s: %s", company_name, e)
+                logger.warning("Claude category inference FAILED for %s: %s — %s", company_name, type(e).__name__, e)
 
         if inferred_cat and not company.get("category"):
             upsert_payload["category"] = inferred_cat
