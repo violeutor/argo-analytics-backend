@@ -621,6 +621,66 @@ def _infer_tags(text: str) -> list[str]:
     return [tag for tag, kws in TAG_KEYWORDS.items() if any(k in t for k in kws)]
 
 
+# ─── Website-URL Heuristik ───────────────────────────────────────────────────
+
+def _guess_website_candidates(company_name: str) -> list[str]:
+    """
+    Leitet wahrscheinliche Website-URLs aus dem Company-Namen ab.
+    Gibt Liste von Kandidaten zurück — erster der antwortet wird verwendet.
+    """
+    name = company_name.lower().strip()
+    # Suffixe entfernen für slug-Variante
+    short = name
+    for suffix in [" technologies", " technology", " energy", " systems",
+                   " solutions", " analytics", " sciences", " materials",
+                   " ag", " inc", " gmbh", " ltd", " corp", " se", " plc", " llc"]:
+        short = short.replace(suffix, "").strip()
+
+    slug       = re.sub(r"[^a-z0-9]", "", short)
+    slug_full  = re.sub(r"[^a-z0-9]", "", name)
+    slug_dash  = re.sub(r"[^a-z0-9]+", "-", short).strip("-")
+
+    candidates = []
+    for s in [slug, slug_dash, slug_full]:
+        if s:
+            candidates += [f"https://{s}.com", f"https://{s}.io"]
+    # Deduplizieren, Reihenfolge erhalten
+    seen = set()
+    result = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+async def _resolve_website(company_name: str, known_url: str | None = None) -> str | None:
+    """
+    Gibt die erste erreichbare Website-URL zurück.
+    Prüft zuerst bekannte URL, dann Heuristik-Kandidaten.
+    """
+    candidates = []
+    if known_url:
+        candidates.append(known_url)
+    candidates += _guess_website_candidates(company_name)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=5, headers=HEADERS, follow_redirects=True
+        ) as client:
+            for url in candidates:
+                try:
+                    r = await client.head(url)
+                    if r.status_code < 400:
+                        logger.debug("Website resolved for %s: %s", company_name, url)
+                        return str(r.url)  # finale URL nach Redirect
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug("Website resolution failed for %s: %s", company_name, e)
+    return None
+
+
 # ─── Company Website ─────────────────────────────────────────────────────────
 
 async def _fetch_company_website(website: str) -> dict:
@@ -752,16 +812,23 @@ async def enrich_company(
         result.funding_rounds = list(cb.funding_rounds)
 
     # Company-Website: Headcount-Fallback wenn Wikipedia + Crunchbase leer
-    # Website-URL: aus DB-Record ODER aus Wikipedia-Wikitext extrahiert
-    _website_url = company_record.get("website") or result.website
-    if not result.employee_count and _website_url:
+    # Priorität: DB-URL → Wikipedia-Wikitext-URL → Heuristik aus Company-Name
+    _known_url = company_record.get("website") or result.website
+    if not result.employee_count:
         try:
-            website_data = await asyncio.wait_for(
-                _fetch_company_website(_website_url),
+            _website_url = await asyncio.wait_for(
+                _resolve_website(company_name, _known_url),
                 timeout=6.0,
             )
-            if website_data.get("employee_count"):
-                result.employee_count = website_data["employee_count"]
+            if _website_url:
+                # URL in result speichern damit Upsert sie in DB schreibt
+                result.website = result.website or _website_url
+                website_data = await asyncio.wait_for(
+                    _fetch_company_website(_website_url),
+                    timeout=6.0,
+                )
+                if website_data.get("employee_count"):
+                    result.employee_count = website_data["employee_count"]
         except asyncio.TimeoutError:
             logger.debug("Company website timeout for %s", company_name)
         except Exception as e:
