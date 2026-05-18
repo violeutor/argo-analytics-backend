@@ -264,8 +264,9 @@ async def _fetch_wikipedia(company: str) -> dict:
                                     # Wikitext-Markup entfernen
                                     hq = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", hq)
                                     hq = re.sub(r"\{\{[^}]+\}\}", "", hq)
-                                    # <ref>...</ref> und übrige HTML-Tags entfernen
+                                    # <ref>...</ref> — geschlossen und nicht-geschlossen entfernen
                                     hq = re.sub(r"<ref[^>]*>.*?</ref>", "", hq, flags=re.S)
+                                    hq = re.sub(r"<ref[^>]*/?>.*", "", hq, flags=re.S)
                                     hq = re.sub(r"<[^>]+>", "", hq)
                                     hq = hq.strip(" ,\n")
                                     if hq and len(hq) < 60:
