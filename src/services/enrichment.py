@@ -141,28 +141,119 @@ def _classify_role(context: str) -> str:
 # ─── Wikipedia ───────────────────────────────────────────────────────────────
 
 async def _fetch_wikipedia(company: str) -> dict:
+    """
+    Holt Wikipedia Summary + Wikidata-Infobox-Felder.
+    Zwei Requests:
+      1. /api/rest_v1/page/summary/{name}  → description, founded_year (aus Extract)
+      2. /w/api.php?action=query&prop=revisions (Wikitext) → founding year, HQ, employees
+         als Fallback wenn Summary-Regex nichts findet.
+    """
+    out: dict = {}
     try:
         async with httpx.AsyncClient(timeout=8, headers=HEADERS) as client:
             resp = await client.get(
                 "https://en.wikipedia.org/api/rest_v1/page/summary/" +
                 company.replace(" ", "_"),
             )
-        if resp.status_code == 200:
-            data = resp.json()
-            desc = data.get("extract", "")
-            year_m = re.search(
-                r"founded in (\d{4})|established in (\d{4})|(\d{4})\s+(?:startup|company|founded)",
-                desc, re.I,
-            )
-            year = next((g for g in (year_m.groups() if year_m else []) if g), None)
-            return {
-                "description": desc[:500],
-                "wikipedia_url": data.get("content_urls", {}).get("desktop", {}).get("page"),
-                "founded_year": year,
-            }
+        if resp.status_code != 200:
+            return out
+
+        data = resp.json()
+        desc = data.get("extract", "")
+        out["description"]   = desc[:500] if desc else None
+        out["wikipedia_url"] = data.get("content_urls", {}).get("desktop", {}).get("page")
+
+        # ── Founding year — erweitertes Muster ───────────────────────────────
+        year_patterns = [
+            r"founded\s+in\s+(\d{4})",
+            r"established\s+in\s+(\d{4})",
+            r"incorporated\s+in\s+(\d{4})",
+            r"launched\s+in\s+(\d{4})",
+            r"started\s+in\s+(\d{4})",
+            r"formed\s+in\s+(\d{4})",
+            r"(\d{4})[,\s]+(?:as\s+a\s+)?(?:startup|company|corporation|venture)",
+            r"in\s+(\d{4})[,\s]+(?:the\s+)?company",
+            r"in\s+(\d{4})[,\s]+\w+\s+(?:founded|established|launched|started)",
+        ]
+        for pat in year_patterns:
+            m = re.search(pat, desc, re.I)
+            if m:
+                out["founded_year"] = m.group(1)
+                break
+
+        # ── Wikitext-Fallback: Infobox parsen ─────────────────────────────────
+        # Nur wenn founding_year noch fehlt oder HQ/Mitarbeiter gebraucht werden
+        if not out.get("founded_year") or not out.get("headquarters"):
+            try:
+                async with httpx.AsyncClient(timeout=6, headers=HEADERS) as client:
+                    wt = await client.get(
+                        "https://en.wikipedia.org/w/api.php",
+                        params={
+                            "action": "query",
+                            "titles": company.replace(" ", "_"),
+                            "prop": "revisions",
+                            "rvprop": "content",
+                            "rvslots": "main",
+                            "formatversion": "2",
+                            "format": "json",
+                        },
+                    )
+                if wt.status_code == 200:
+                    pages = wt.json().get("query", {}).get("pages", [])
+                    wikitext = ""
+                    for page in pages:
+                        wikitext = (
+                            page.get("revisions", [{}])[0]
+                            .get("slots", {}).get("main", {}).get("content", "")
+                        )
+                        break
+
+                    if wikitext:
+                        # founded — Infobox-Felder
+                        if not out.get("founded_year"):
+                            for pat in [
+                                r"\|\s*(?:founded|foundation|formation)\s*=\s*(?:.*?(\d{4}))",
+                                r"\|\s*founding_year\s*=\s*(\d{4})",
+                                r"\|\s*start_date\s*=.*?(\d{4})",
+                            ]:
+                                m = re.search(pat, wikitext, re.I)
+                                if m:
+                                    out["founded_year"] = m.group(1)
+                                    break
+
+                        # headquarters
+                        if not out.get("headquarters"):
+                            for pat in [
+                                r"\|\s*(?:headquarters|hq_location|location_city)\s*=\s*([^\|\n\]]{3,80})",
+                                r"\|\s*location\s*=\s*([^\|\n\]]{3,80})",
+                            ]:
+                                m = re.search(pat, wikitext, re.I)
+                                if m:
+                                    # Wikitext-Markup entfernen
+                                    hq = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", m.group(1))
+                                    hq = re.sub(r"\{\{[^}]+\}\}", "", hq).strip(" ,")
+                                    if hq:
+                                        out["headquarters"] = hq
+                                    break
+
+                        # employees
+                        if not out.get("employee_count"):
+                            for pat in [
+                                r"\|\s*(?:num_employees|employees|employee_count)\s*=\s*([^\|\n\]]{1,30})",
+                            ]:
+                                m = re.search(pat, wikitext, re.I)
+                                if m:
+                                    raw = m.group(1).strip()
+                                    # Nur wenn sinnvoller Wert (enthält Zahl)
+                                    if re.search(r"\d", raw):
+                                        out["employee_count"] = re.sub(r"<[^>]+>", "", raw).strip()
+                                    break
+            except Exception as e:
+                logger.debug("Wikipedia Wikitext fallback failed for '%s': %s", company, e)
+
     except Exception as e:
         logger.debug("Wikipedia failed for '%s': %s", company, e)
-    return {}
+    return out
 
 
 # ─── Crunchbase ───────────────────────────────────────────────────────────────
@@ -516,18 +607,21 @@ async def enrich_company(
     )
 
     if isinstance(wiki, dict):
-        result.description   = wiki.get("description")
-        result.wikipedia_url = wiki.get("wikipedia_url")
-        result.founded_year  = wiki.get("founded_year")
+        result.description    = wiki.get("description")
+        result.wikipedia_url  = wiki.get("wikipedia_url")
+        result.founded_year   = wiki.get("founded_year")
+        result.headquarters   = wiki.get("headquarters")
+        result.employee_count = wiki.get("employee_count")
 
     if isinstance(cb, CrunchbaseData):
-        result.crunchbase    = cb
-        result.description   = result.description or cb.description
-        result.founded_year  = result.founded_year or cb.founded_year
-        result.headquarters  = cb.headquarters
-        result.employee_count= cb.employee_count
-        result.investors     = list(cb.investors)
-        result.funding_rounds= list(cb.funding_rounds)
+        result.crunchbase     = cb
+        result.description    = result.description or cb.description
+        result.founded_year   = result.founded_year or cb.founded_year
+        # Crunchbase-Werte überschreiben Wikipedia nur wenn vorhanden
+        result.headquarters   = cb.headquarters or result.headquarters
+        result.employee_count = cb.employee_count or result.employee_count
+        result.investors      = list(cb.investors)
+        result.funding_rounds = list(cb.funding_rounds)
 
     # Bundesanzeiger: private DE companies only
     if not is_listed and _is_likely_german(company_record):
