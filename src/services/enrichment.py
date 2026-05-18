@@ -738,13 +738,15 @@ JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
                 },
             )
         if resp.status_code != 200:
+            logger.warning("_claude_infer_category HTTP %s for %s: %s", resp.status_code, company, resp.text[:200])
             return None, None
         raw = resp.json()["content"][0]["text"].strip()
+        logger.warning("_claude_infer_category RAW for %s: %r", company, raw[:200])
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
         parsed = json.loads(raw)
         return parsed.get("category"), parsed.get("industry")
     except Exception as e:
-        logger.debug("Claude category inference failed for %s: %s", company, e)
+        logger.warning("_claude_infer_category EXCEPTION for %s: %s — %s", company, type(e).__name__, e)
         return None, None
 
 
