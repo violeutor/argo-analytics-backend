@@ -14,7 +14,14 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from src.integrations.supabase import fetch_companies, fetch_buyers, fetch_funding_rounds
+from src.integrations.supabase import (
+    fetch_companies,
+    fetch_buyers,
+    fetch_funding_rounds,
+    upsert_company_enrichment,
+    upsert_tam_cache,
+    fetch_tam_cache,
+)
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.tam import get_tam
 from src.pipelines.scoring import compute_scores
@@ -139,6 +146,37 @@ class CompanyDetailResponse(BaseModel):
     technology_tags: list[str]
     is_known: bool
     warnings: list[str]
+
+
+def _parse_year(value: str | None) -> int | None:
+    """Konvertiert Enrichment-Jahresstring ('2009', 'Founded 2009') → int."""
+    if not value:
+        return None
+    try:
+        import re
+        match = re.search(r"\b(19|20)\d{2}\b", str(value))
+        return int(match.group()) if match else None
+    except Exception:
+        return None
+
+
+def _parse_headcount(value: str | None) -> int | None:
+    """Konvertiert Enrichment-Mitarbeiterstring ('~200', '100-500') → int (Mittelwert)."""
+    if not value:
+        return None
+    try:
+        import re
+        # Range: "100-500" → 300
+        match = re.search(r"(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)", str(value))
+        if match:
+            lo = int(match.group(1).replace(",", ""))
+            hi = int(match.group(2).replace(",", ""))
+            return (lo + hi) // 2
+        # Einzelzahl: "~200" → 200
+        match = re.search(r"\d[\d,]*", str(value))
+        return int(match.group().replace(",", "")) if match else None
+    except Exception:
+        return None
 
 
 # ── is_listed logic (B-05) ────────────────────────────────────────────────────
@@ -409,8 +447,27 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
     is_listed = _resolve_is_listed(company)
     proxy = company.get("proxy_ticker")
 
-    # 3. TAM first (needed for intro) — then run enrichment + yahoo + intro in parallel
-    tam = await get_tam(company_name, company.get("category"))
+    # 3. TAM — erst DB-Cache prüfen, dann scrapen, Ergebnis persistieren
+    company_id = company.get("id")
+    tam_cached = fetch_tam_cache(company_id) if company_id else None
+    if tam_cached and tam_cached.get("tam_2035_usd_bn"):
+        tam = {
+            "tam_usd_bn":  float(tam_cached["tam_2035_usd_bn"]),
+            "source":      tam_cached.get("source", "cache"),
+            "confidence":  "high",
+            "method":      "cache",
+        }
+        logger.debug("TAM from cache for %s: %.1f Bn", company_name, tam["tam_usd_bn"])
+    else:
+        tam = await get_tam(company_name, company.get("category"))
+        # Ergebnis persistieren für nächsten Aufruf
+        if company_id and tam.get("tam_usd_bn"):
+            upsert_tam_cache(
+                company_id=company_id,
+                tam_usd_bn=tam["tam_usd_bn"],
+                cagr_pct=tam.get("cagr_pct"),
+                source=tam.get("source", "scrape"),
+            )
 
     # 4. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
@@ -446,6 +503,22 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         _fetch_yahoo(proxy if is_listed else None),
         _safe_intro(),
     )
+
+    # 4b. Enrichment-Ergebnisse in DB persistieren (nur wenn Werte vorhanden)
+    #     DB-Werte als Fallback wenn Enrichment leer (z.B. bei Timeout)
+    if company_id:
+        upsert_company_enrichment(company_id, {
+            "founding_year": _parse_year(enrichment.founded_year),
+            "headquarters":  enrichment.headquarters or None,
+            "headcount":     _parse_headcount(enrichment.employee_count),
+            "description":   enrichment.description or None,
+        })
+
+    # DB-Werte als Fallback wenn Enrichment-Felder leer
+    founded_display   = enrichment.founded_year   or (str(company.get("founding_year")) if company.get("founding_year") else None)
+    headquarters_disp = enrichment.headquarters   or company.get("headquarters")
+    headcount_disp    = enrichment.employee_count or (str(company.get("headcount")) if company.get("headcount") else None)
+    description_disp  = enrichment.description    or company.get("description")
 
     # 5. Fundamentals
     fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy)
@@ -530,13 +603,13 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
         industry=company.get("industry"),
         core_technology=company.get("core_technology"),
         website=company.get("website"),
-        founded=enrichment.founded_year,
+        founded=founded_display,
         intro=intro,
-        description=enrichment.description,
+        description=description_disp,
         wikipedia_url=enrichment.wikipedia_url,
         crunchbase_url=enrichment.crunchbase.url if enrichment.crunchbase else None,
-        headquarters=enrichment.headquarters,
-        employee_count=enrichment.employee_count,
+        headquarters=headquarters_disp,
+        employee_count=headcount_disp,
         ipo_status=ipo_status,
         ipo_potential=company.get("ipo_potential"),
         ipo_probability_pct=_ipo_probability(ipo_status, company.get("ipo_potential")),
