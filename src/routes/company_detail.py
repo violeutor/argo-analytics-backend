@@ -588,8 +588,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         # category / industry nur schreiben wenn DB noch leer + Enrichment hat Wert
         if enrichment.category and not company.get("category"):
             upsert_payload["category"] = enrichment.category
-            company["category"] = enrichment.category   # lokales Dict aktualisieren
-            logger.info("One-Click category inferred for %s: %s", company_name, enrichment.category)
+            company["category"] = enrichment.category   # lokales Dict sofort aktualisieren
+            logger.info("category inferred for %s: %s", company_name, enrichment.category)
         if enrichment.industry and not company.get("industry"):
             upsert_payload["industry"] = enrichment.industry
             company["industry"] = enrichment.industry
@@ -601,7 +601,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         tam_retry = await get_tam(company_name, company["category"])
         if tam_retry.get("method") != "fallback":
             tam = tam_retry
-            # Neues Ergebnis auch cachen
             if company_id and tam.get("tam_usd_bn"):
                 upsert_tam_cache(
                     company_id=company_id,

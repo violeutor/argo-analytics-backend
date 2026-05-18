@@ -101,8 +101,8 @@ class EnrichmentResult:
     founded_year: str | None = None
     headquarters: str | None = None
     employee_count: str | None = None
-    category: str | None = None   # abgeleitet aus Tags — für One-Click-Insert
-    industry: str | None = None   # abgeleitet aus Tags — für One-Click-Insert
+    category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
+    industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     crunchbase: CrunchbaseData | None = None
     bundesanzeiger: BundesanzeigerData | None = None
     investors: list[InvestorEntry] = field(default_factory=list)
@@ -635,13 +635,11 @@ def _infer_tags(text: str) -> list[str]:
 
 
 # ── Tag → category / industry Mapping ────────────────────────────────────────
-# Übersetzt den besten inferred Tag in Argo-Datenbank-Felder.
-# category = feingranulares Label (wie in companies-Tabelle).
-# industry = 12-Sektoren-Feld (migration_002 Enum).
 
 _TAG_TO_CATEGORY: dict[str, str] = {
     "carbon-capture":        "Carbon Removal (DAC)",
     "direct-air-capture":    "Carbon Removal (DAC)",
+    "ocean-cdr":             "Ocean CDR",
     "low-carbon-cement":     "Low-Carbon Cement",
     "sustainable-materials": "Sustainable Materials",
     "battery":               "Battery / Energy Storage",
@@ -663,7 +661,6 @@ _TAG_TO_CATEGORY: dict[str, str] = {
     "carbon-credits":        "Carbon Credits",
     "irrigation":            "Irrigation",
     "water-tech":            "AI × Water / Cooling",
-    "ocean-cdr":             "Ocean CDR",
 }
 
 _TAG_TO_INDUSTRY: dict[str, str] = {
@@ -695,17 +692,60 @@ _TAG_TO_INDUSTRY: dict[str, str] = {
 
 
 def infer_category_industry(tags: list[str]) -> tuple[str | None, str | None]:
-    """
-    Leitet category und industry aus den inferred Tags ab.
-    Gibt (category, industry) zurück — beide können None sein.
-    Nimmt den ersten Tag der ein Mapping hat (Tags sind nach Treffsicherheit geordnet).
-    """
+    """Leitet category/industry aus Tags ab. Gibt (None, None) wenn kein Treffer."""
     for tag in tags:
-        category = _TAG_TO_CATEGORY.get(tag)
-        industry = _TAG_TO_INDUSTRY.get(tag)
-        if category or industry:
-            return category, industry
+        cat = _TAG_TO_CATEGORY.get(tag)
+        ind = _TAG_TO_INDUSTRY.get(tag)
+        if cat or ind:
+            return cat, ind
     return None, None
+
+
+async def _claude_infer_category(company: str, description: str) -> tuple[str | None, str | None]:
+    """
+    Claude-Fallback wenn TAG_KEYWORDS keinen Treffer liefert.
+    Klassifiziert die Company in category + industry anhand der Description.
+    Wird nur aufgerufen wenn tags leer — daher kein Timeout-Problem im Hauptpfad.
+    """
+    if not description:
+        return None, None
+
+    industries = [
+        "Carbon Removal", "Industrial Decarbonization", "Energy Storage",
+        "Grid & Infrastructure", "Renewable Energy", "Agriculture & Food",
+        "Fuels & Chemicals", "Digital Infrastructure", "Climate Intelligence",
+        "Carbon Markets", "Water & Irrigation", "Diversified Industrial",
+    ]
+    prompt = f"""Classify this company for an investment database. Return ONLY valid JSON, no preamble.
+
+Company: {company}
+Description: {description[:400]}
+
+Pick the best fit from these industries: {", ".join(industries)}
+Also provide a short category (5-40 chars, e.g. "Grid Software / Infrastructure", "Industrial Automation", "Hydrogen Electrolysis").
+
+JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 80,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+        if resp.status_code != 200:
+            return None, None
+        raw = resp.json()["content"][0]["text"].strip()
+        raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+        parsed = json.loads(raw)
+        return parsed.get("category"), parsed.get("industry")
+    except Exception as e:
+        logger.debug("Claude category inference failed for %s: %s", company, e)
+        return None, None
 
 
 # ─── Website-URL Heuristik ───────────────────────────────────────────────────
@@ -940,9 +980,18 @@ async def enrich_company(
     ]))
     result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
 
-    # category / industry aus Tags ableiten (nur wenn DB noch leer)
+    # category / industry ableiten — nur wenn DB noch leer
     if not company_record.get("category") or not company_record.get("industry"):
         inferred_cat, inferred_ind = infer_category_industry(result.tags)
+
+        # Claude-Fallback wenn TAG_KEYWORDS keinen Treffer hat
+        if not inferred_cat and result.description:
+            inferred_cat, inferred_ind = await _claude_infer_category(
+                company_name, result.description
+            )
+            if inferred_cat:
+                logger.info("Claude category inferred for %s: %s / %s", company_name, inferred_cat, inferred_ind)
+
         result.category = inferred_cat if not company_record.get("category") else None
         result.industry = inferred_ind if not company_record.get("industry") else None
 
