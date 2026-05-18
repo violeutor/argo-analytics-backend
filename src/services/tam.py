@@ -66,54 +66,6 @@ CURATED_TAM: dict[str, dict] = {
     "water-tech":              {"tam_usd_bn": 40,   "source": "Global Water Intelligence 2024",            "confidence": "medium"},
 }
 
-# Company → primary tag mapping (for TAM lookup)
-COMPANY_PRIMARY_TAG: dict[str, str] = {
-    "Climeworks":          "direct-air-capture",
-    "Charm Industrial":    "carbon-capture",
-    "Heirloom":            "carbon-capture",
-    "Twelve":              "co2-to-fuels",
-    "LanzaTech":           "co2-to-fuels",
-    "CarbonCure":          "low-carbon-cement",
-    "Running Tide":        "ocean-cdr",
-    "Living Carbon":       "bioengineering",
-    "Verdox":              "carbon-capture",
-    "Noya":                "carbon-capture",
-    "Remora":              "carbon-capture",
-    "Carbon Clean":        "carbon-capture",
-    "Brimstone":           "low-carbon-cement",
-    "Sublime Systems":     "low-carbon-cement",
-    "Solugen":             "bio-based-chemicals",
-    "CropX":               "agritech",
-    "AppHarvest":          "agritech",
-    "Brightmark":          "waste-to-energy",
-    "Indigo Ag":           "carbon-credits",
-    "Pairwise":            "bioengineering",
-    "Agmatix":             "agritech",
-    "Micropep":            "bioengineering",
-    "Amini":               "climate-risk-saas",
-    "Loam Bio":            "soil-carbon",
-    "12Tree":              "carbon-capture",
-    "ClimateAi":           "climate-risk-saas",
-    "Netafim":             "irrigation",
-    "Enapter":             "hydrogen",
-    "Notpla":              "sustainable-materials",
-    "SunCulture":          "solar",
-    "Emerald AI":          "ai-grid-software",
-    "GRST":                "battery",
-    "VoltaGrid":           "grid",
-    "Base Power":          "battery",
-    "HT Materials Science":"datacenter-cooling",
-    "Beehive":             "climate-risk-saas",
-    "Relectrify":          "battery",
-    "WAVR Technologies":   "water-tech",
-    "Factorial Energy":    "solid-state-battery",
-    "Syzygy Plasmonics":   "co2-to-fuels",
-    "Ore Energy":          "long-duration-storage",
-    "Fervo Energy":        "geothermal",
-    "Moment Energy":       "battery",
-}
-
-
 # ── Google Search Scraper ─────────────────────────────────────────────────────
 
 HEADERS = {
@@ -198,20 +150,14 @@ async def get_tam(company_name: str, sector: str | None = None) -> dict:
     Returns TAM estimate for a company.
 
     Priority:
-    1. Curated dataset (by company name → primary tag)
-    2. Curated dataset (by sector tag)
-    3. Google + Claude extraction
-    4. Sector-median fallback (100B)
-    """
-    # 1. Company-level curated lookup
-    primary_tag = COMPANY_PRIMARY_TAG.get(company_name)
-    if primary_tag and primary_tag in CURATED_TAM:
-        result = CURATED_TAM[primary_tag].copy()
-        result["method"] = "curated"
-        result["tag"] = primary_tag
-        return result
+    1. Curated dataset (by sector tag derived from sector/category)
+    2. Google + Claude extraction
+    3. Sector-median fallback (100B)
 
-    # 2. Sector-level curated lookup
+    One-Click-Prinzip: funktioniert für jede Company weltweit —
+    kein manuelles Mapping, kein Whitelist-Denken.
+    """
+    # 1. Sector-level curated lookup — aus sector/category ableiten
     if sector:
         sector_tag = sector.lower().replace(" ", "-").replace("/", "-")
         for tag, data in CURATED_TAM.items():
@@ -221,7 +167,7 @@ async def get_tam(company_name: str, sector: str | None = None) -> dict:
                 result["tag"] = tag
                 return result
 
-    # 3. Google + Claude extraction
+    # 2. Google + Claude extraction
     logger.info("TAM not in curated dataset for '%s' — trying web extraction", company_name)
     query = f"{company_name} {sector or 'market'} total addressable market size 2030 2035 billion USD"
     snippets = await _google_search_snippets(query)
@@ -234,7 +180,7 @@ async def get_tam(company_name: str, sector: str | None = None) -> dict:
             extracted["method"] = "web_extracted"
             return extracted
 
-    # 4. Fallback
+    # 3. Fallback
     logger.warning("TAM fallback for '%s' — using sector median 100B", company_name)
     return {
         "tam_usd_bn": 100,

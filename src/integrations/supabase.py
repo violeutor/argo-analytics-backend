@@ -128,6 +128,51 @@ def upsert_tam_cache(company_id: str, tam_usd_bn: float, cagr_pct: float | None,
         logger.warning("upsert_tam_cache failed for %s: %s", company_id, e)
 
 
+# ── Market Data ──────────────────────────────────────────────────────────────
+
+def fetch_market_data(company_id: str) -> dict | None:
+    """Gibt market_data-Row zurück wenn vorhanden."""
+    db = get_supabase()
+    try:
+        result = db.table("market_data").select("*").eq("company_id", company_id).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_market_data failed for %s: %s", company_id, e)
+        return None
+
+
+def upsert_market_data(company_id: str, data: dict) -> None:
+    """
+    Schreibt Market-Data-Ergebnisse in market_data (INSERT OR UPDATE).
+    Nur non-None Werte werden geschrieben — kein Overwrite vorhandener DB-Werte.
+    Felder: tam_2035_usd_bn, cagr_pct, tam_source, tam_segments, regional_breakdown,
+            growth_drivers, sam_usd_bn, sam_confidence, sam_note, sam_geo_factor,
+            sam_tech_filter, competition_score, competition_note,
+            market_cycle, market_cycle_note, regional_sources, enriched_at
+    """
+    db = get_supabase()
+    payload = {k: v for k, v in data.items() if v is not None}
+    if not payload:
+        return
+    payload["company_id"] = company_id
+
+    try:
+        db.table("market_data").upsert(payload, on_conflict="company_id").execute()
+        logger.debug("upsert_market_data OK: %s → %s", company_id, list(payload.keys()))
+    except Exception as e:
+        logger.warning("upsert_market_data FAILED for %s: %s", company_id, e)
+
+
+def set_enrichment_status(company_id: str, status: str) -> None:
+    """Setzt companies.enrichment_status — pending | running | done | error."""
+    db = get_supabase()
+    try:
+        db.table("companies").update({"enrichment_status": status}).eq("id", company_id).execute()
+        logger.debug("enrichment_status %s → %s", company_id, status)
+    except Exception as e:
+        logger.warning("set_enrichment_status FAILED for %s: %s", company_id, e)
+
+
 # ── Deals ────────────────────────────────────────────────────────────────────
 
 def insert_deal(request, company_id: str | None, buyer_id: str | None) -> str:
