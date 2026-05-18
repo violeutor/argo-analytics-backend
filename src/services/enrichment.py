@@ -274,10 +274,15 @@ async def _fetch_wikipedia(company: str) -> dict:
                             ]:
                                 m = re.search(pat, wikitext, re.I)
                                 if m:
-                                    raw = m.group(1).strip()
-                                    if re.search(r"\d", raw):
-                                        out["employee_count"] = re.sub(r"<[^>]+>", "", raw).strip()
-                                    break
+                                    raw = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                                    # Zahlen extrahieren, Template-Markup ({{…}}) ignorieren
+                                    raw_clean = re.sub(r"\{\{[^}]*\}\}", "", raw).strip(" ,+~")
+                                    digits = re.sub(r"[,\.]", "", raw_clean)
+                                    if digits.isdigit():
+                                        n = int(digits)
+                                        if 1 <= n <= 100_000:
+                                            out["employee_count"] = str(n)
+                                break
 
                         # website
                         if not out.get("website"):
@@ -745,12 +750,14 @@ async def _fetch_company_website(website: str) -> dict:
         for pat in headcount_patterns:
             m = re.search(pat, text, re.I)
             if m:
-                # Gruppe 1 oder 2 je nach Pattern
-                val = m.group(1) if m.lastindex == 1 or not m.group(2) else m.group(2)
-                # Plausibilitätscheck: zwischen 1 und 100.000
+                # Sicher die erste nicht-leere Gruppe nehmen
+                val = next((m.group(i) for i in range(1, (m.lastindex or 0) + 1) if m.group(i)), None)
+                if not val:
+                    continue
+                # Plausibilitätscheck: zwischen 1 und 100.000, explizit 0 ausschließen
                 try:
                     n = int(val.replace(",", "").replace(".", ""))
-                    if 1 <= n <= 100000:
+                    if 1 <= n <= 100_000:
                         out["employee_count"] = str(n)
                         return out
                 except ValueError:
