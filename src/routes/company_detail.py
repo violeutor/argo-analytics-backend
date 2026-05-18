@@ -38,6 +38,7 @@ from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
     enrich_company,
     infer_category_industry,
+    _claude_infer_category,
     BundesanzeigerData,
     EnrichmentResult,
 )
@@ -585,14 +586,32 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
         }
-        # category / industry nur schreiben wenn DB noch leer + Enrichment hat Wert
-        if enrichment.category and not company.get("category"):
-            upsert_payload["category"] = enrichment.category
-            company["category"] = enrichment.category   # lokales Dict sofort aktualisieren
-            logger.info("category inferred for %s: %s", company_name, enrichment.category)
-        if enrichment.industry and not company.get("industry"):
-            upsert_payload["industry"] = enrichment.industry
-            company["industry"] = enrichment.industry
+        # category / industry — erst Tag-Inferenz (aus enrichment), dann Claude-Fallback
+        inferred_cat  = enrichment.category
+        inferred_ind  = enrichment.industry
+
+        # Claude-Fallback: nur wenn Tags keinen Treffer hatten + description vorhanden
+        # Läuft mit eigenem Timeout — unabhängig vom 8s-Enrichment-Timeout
+        if not inferred_cat and enrichment.description and not company.get("category"):
+            try:
+                inferred_cat, inferred_ind = await asyncio.wait_for(
+                    _claude_infer_category(company_name, enrichment.description),
+                    timeout=6.0,
+                )
+                if inferred_cat:
+                    logger.info("Claude category inferred for %s: %s / %s", company_name, inferred_cat, inferred_ind)
+            except asyncio.TimeoutError:
+                logger.debug("Claude category inference timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("Claude category inference failed for %s: %s", company_name, e)
+
+        if inferred_cat and not company.get("category"):
+            upsert_payload["category"] = inferred_cat
+            company["category"] = inferred_cat
+        if inferred_ind and not company.get("industry"):
+            upsert_payload["industry"] = inferred_ind
+            company["industry"] = inferred_ind
+
         upsert_company_enrichment(company_id, upsert_payload)
 
     # TAM-Re-Lookup: wenn erster TAM-Call Fallback war und jetzt category bekannt

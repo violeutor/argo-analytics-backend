@@ -980,18 +980,10 @@ async def enrich_company(
     ]))
     result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
 
-    # category / industry ableiten — nur wenn DB noch leer
+    # category / industry aus Tags — schnell, kein I/O, bleibt im 8s-Timeout
+    # Claude-Fallback läuft separat in company_detail.py mit eigenem Timeout
     if not company_record.get("category") or not company_record.get("industry"):
         inferred_cat, inferred_ind = infer_category_industry(result.tags)
-
-        # Claude-Fallback wenn TAG_KEYWORDS keinen Treffer hat
-        if not inferred_cat and result.description:
-            inferred_cat, inferred_ind = await _claude_infer_category(
-                company_name, result.description
-            )
-            if inferred_cat:
-                logger.info("Claude category inferred for %s: %s / %s", company_name, inferred_cat, inferred_ind)
-
         result.category = inferred_cat if not company_record.get("category") else None
         result.industry = inferred_ind if not company_record.get("industry") else None
 
