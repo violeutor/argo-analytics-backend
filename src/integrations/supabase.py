@@ -27,8 +27,9 @@ def fetch_companies(limit: int = 100, source: str | None = None) -> list[dict]:
     db = get_supabase()
     query = db.table("companies").select(
         "id, name, category, industry, potential, risk, ipo_potential, ipo_status, "
-        "investment_path, proxy_ticker, funding_total_usd_mn, "
-        "funding_last_round, last_signal, last_signal_date, source"
+        "investment_path, proxy_ticker, funding_total_usd_mn, funding_stage, "
+        "funding_last_round, last_signal, last_signal_date, source, "
+        "founding_year, headquarters, headcount, description, peers, region"
     ).limit(limit).order("name")
 
     if source:
@@ -71,6 +72,60 @@ def fetch_buyer_by_name(name: str) -> dict | None:
     db = get_supabase()
     result = db.table("buyers").select("*").ilike("name", name).limit(1).execute()
     return result.data[0] if result.data else None
+
+
+# ── Company Enrichment Upsert ────────────────────────────────────────────────
+
+def upsert_company_enrichment(company_id: str, data: dict) -> None:
+    """
+    Schreibt Enrichment-Ergebnisse zurück in die companies-Tabelle.
+    Nur Felder die tatsächlich einen Wert haben werden geschrieben
+    (keine None-Overwrites auf bereits vorhandene DB-Werte).
+
+    Felder: founding_year, headquarters, headcount, description
+    Aufgerufen von: company_detail.py nach _safe_enrichment()
+    """
+    db = get_supabase()
+
+    payload = {k: v for k, v in data.items() if v is not None}
+    if not payload:
+        return
+
+    try:
+        db.table("companies").update(payload).eq("id", company_id).execute()
+        logger.debug("upsert_company_enrichment: %s → %s", company_id, list(payload.keys()))
+    except Exception as e:
+        logger.warning("upsert_company_enrichment failed for %s: %s", company_id, e)
+
+
+# ── TAM Cache ────────────────────────────────────────────────────────────────
+
+def fetch_tam_cache(company_id: str) -> dict | None:
+    """Gibt gecachten TAM-Wert zurück wenn vorhanden."""
+    db = get_supabase()
+    try:
+        result = db.table("tam_cache").select(
+            "tam_2035_usd_bn, cagr_pct, source, scraped_at"
+        ).eq("company_id", company_id).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_tam_cache failed: %s", e)
+        return None
+
+
+def upsert_tam_cache(company_id: str, tam_usd_bn: float, cagr_pct: float | None, source: str) -> None:
+    """Persistiert TAM-Scraping-Ergebnis in tam_cache (INSERT OR UPDATE)."""
+    db = get_supabase()
+    try:
+        db.table("tam_cache").upsert({
+            "company_id":       company_id,
+            "tam_2035_usd_bn":  tam_usd_bn,
+            "cagr_pct":         cagr_pct,
+            "source":           source,
+        }, on_conflict="company_id").execute()
+        logger.debug("upsert_tam_cache: %s tam=%.1f", company_id, tam_usd_bn)
+    except Exception as e:
+        logger.warning("upsert_tam_cache failed for %s: %s", company_id, e)
 
 
 # ── Deals ────────────────────────────────────────────────────────────────────
