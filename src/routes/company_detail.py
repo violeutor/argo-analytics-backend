@@ -468,14 +468,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             result = db.table("companies").insert({
                 "name": name,
                 "investment_path": "Beobachten",
-                "source": "one_click",
                 "enrichment_status": "pending",
             }).execute()
             company = result.data[0] if result.data else {"name": name}
             warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
         except Exception as e:
-            logger.warning("Could not create company '%s': %s", name, e)
-            raise HTTPException(status_code=404, detail=f"Company '{name}' not found and could not be created.")
+            logger.warning("Could not create company '%s': %s — %s", name, type(e).__name__, e)
+            raise HTTPException(status_code=404, detail=f"Company '{name}' not found and could not be created: {e}")
 
     company_name = company["name"]
 
@@ -508,37 +507,34 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 4. Market Data — Cache prüfen, bei Bedarf Background-Enrichment anstoßen (MD-B07)
     market_data_cached = fetch_market_data(company_id) if company_id else None
     if company_id and not market_data_cached:
-        def _market_enrichment_bg():
-            import asyncio
-            async def _run():
-                try:
-                    set_enrichment_status(company_id, "running")
-                    async_result = await enrich_market_data(
-                        company_id=company_id,
-                        company_name=company_name,
-                        category=company.get("category"),
-                        sector_tag=None,
-                        tam_usd_bn=tam.get("tam_usd_bn"),
-                        tech_readiness=None,
-                    )
-                    all_companies = fetch_companies(limit=500)
-                    all_rounds = fetch_all_funding_rounds()
-                    sync_result = enrich_market_data_sync_wrapper(
-                        company_id=company_id,
-                        company_name=company_name,
-                        category=company.get("category"),
-                        sector_tag=None,
-                        tam_usd_bn=tam.get("tam_usd_bn"),
-                        all_companies=all_companies,
-                        all_funding_rounds=all_rounds,
-                    )
-                    upsert_market_data(company_id, {**async_result, **sync_result})
-                    set_enrichment_status(company_id, "done")
-                    logger.info("Market enrichment done for %s", company_name)
-                except Exception as e:
-                    set_enrichment_status(company_id, "error")
-                    logger.warning("Market enrichment failed for %s: %s", company_name, e)
-            asyncio.run(_run())
+        async def _market_enrichment_bg():
+            try:
+                set_enrichment_status(company_id, "running")
+                async_result = await enrich_market_data(
+                    company_id=company_id,
+                    company_name=company_name,
+                    category=company.get("category"),
+                    sector_tag=None,
+                    tam_usd_bn=tam.get("tam_usd_bn"),
+                    tech_readiness=None,
+                )
+                all_companies = fetch_companies(limit=500)
+                all_rounds = fetch_all_funding_rounds()
+                sync_result = enrich_market_data_sync_wrapper(
+                    company_id=company_id,
+                    company_name=company_name,
+                    category=company.get("category"),
+                    sector_tag=None,
+                    tam_usd_bn=tam.get("tam_usd_bn"),
+                    all_companies=all_companies,
+                    all_funding_rounds=all_rounds,
+                )
+                upsert_market_data(company_id, {**async_result, **sync_result})
+                set_enrichment_status(company_id, "done")
+                logger.info("Market enrichment done for %s", company_name)
+            except Exception as e:
+                set_enrichment_status(company_id, "error")
+                logger.warning("Market enrichment failed for %s: %s", company_name, e)
 
         background_tasks.add_task(_market_enrichment_bg)
         logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
