@@ -260,10 +260,15 @@ async def _fetch_wikipedia(company: str) -> dict:
                             ]:
                                 m = re.search(pat, wikitext, re.I)
                                 if m:
+                                    hq = m.group(1)
                                     # Wikitext-Markup entfernen
-                                    hq = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", m.group(1))
-                                    hq = re.sub(r"\{\{[^}]+\}\}", "", hq).strip(" ,")
-                                    if hq:
+                                    hq = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", hq)
+                                    hq = re.sub(r"\{\{[^}]+\}\}", "", hq)
+                                    # <ref>...</ref> und übrige HTML-Tags entfernen
+                                    hq = re.sub(r"<ref[^>]*>.*?</ref>", "", hq, flags=re.S)
+                                    hq = re.sub(r"<[^>]+>", "", hq)
+                                    hq = hq.strip(" ,\n")
+                                    if hq and len(hq) < 60:
                                         out["headquarters"] = hq
                                     break
 
