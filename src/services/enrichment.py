@@ -101,6 +101,8 @@ class EnrichmentResult:
     founded_year: str | None = None
     headquarters: str | None = None
     employee_count: str | None = None
+    category: str | None = None   # abgeleitet aus Tags — für One-Click-Insert
+    industry: str | None = None   # abgeleitet aus Tags — für One-Click-Insert
     crunchbase: CrunchbaseData | None = None
     bundesanzeiger: BundesanzeigerData | None = None
     investors: list[InvestorEntry] = field(default_factory=list)
@@ -632,6 +634,80 @@ def _infer_tags(text: str) -> list[str]:
     return [tag for tag, kws in TAG_KEYWORDS.items() if any(k in t for k in kws)]
 
 
+# ── Tag → category / industry Mapping ────────────────────────────────────────
+# Übersetzt den besten inferred Tag in Argo-Datenbank-Felder.
+# category = feingranulares Label (wie in companies-Tabelle).
+# industry = 12-Sektoren-Feld (migration_002 Enum).
+
+_TAG_TO_CATEGORY: dict[str, str] = {
+    "carbon-capture":        "Carbon Removal (DAC)",
+    "direct-air-capture":    "Carbon Removal (DAC)",
+    "low-carbon-cement":     "Low-Carbon Cement",
+    "sustainable-materials": "Sustainable Materials",
+    "battery":               "Battery / Energy Storage",
+    "long-duration-storage": "Long-Duration Storage",
+    "solid-state-battery":   "Solid-State Battery",
+    "grid":                  "Grid Software / Infrastructure",
+    "ai-grid-software":      "AI × Grid Software",
+    "solar":                 "Solar Energy",
+    "hydrogen":              "Hydrogen",
+    "geothermal":            "Geothermal / EGS",
+    "waste-to-energy":       "Waste-to-Energy",
+    "agritech":              "Agritech",
+    "bioengineering":        "Bioengineering",
+    "soil-carbon":           "Soil Carbon",
+    "co2-to-fuels":          "CO₂-to-Fuels / SAF",
+    "bio-based-chemicals":   "Bio-based Chemicals",
+    "datacenter-cooling":    "Datacenter Cooling / HVAC",
+    "climate-risk-saas":     "Climate-Risk SaaS",
+    "carbon-credits":        "Carbon Credits",
+    "irrigation":            "Irrigation",
+    "water-tech":            "AI × Water / Cooling",
+    "ocean-cdr":             "Ocean CDR",
+}
+
+_TAG_TO_INDUSTRY: dict[str, str] = {
+    "carbon-capture":        "Carbon Removal",
+    "direct-air-capture":    "Carbon Removal",
+    "ocean-cdr":             "Carbon Removal",
+    "low-carbon-cement":     "Industrial Decarbonization",
+    "sustainable-materials": "Industrial Decarbonization",
+    "bio-based-chemicals":   "Industrial Decarbonization",
+    "waste-to-energy":       "Industrial Decarbonization",
+    "battery":               "Energy Storage",
+    "long-duration-storage": "Energy Storage",
+    "solid-state-battery":   "Energy Storage",
+    "grid":                  "Grid & Infrastructure",
+    "ai-grid-software":      "Grid & Infrastructure",
+    "solar":                 "Renewable Energy",
+    "hydrogen":              "Renewable Energy",
+    "geothermal":            "Renewable Energy",
+    "agritech":              "Agriculture & Food",
+    "bioengineering":        "Agriculture & Food",
+    "soil-carbon":           "Agriculture & Food",
+    "co2-to-fuels":          "Fuels & Chemicals",
+    "datacenter-cooling":    "Digital Infrastructure",
+    "climate-risk-saas":     "Climate Intelligence",
+    "carbon-credits":        "Carbon Markets",
+    "irrigation":            "Water & Irrigation",
+    "water-tech":            "Water & Irrigation",
+}
+
+
+def infer_category_industry(tags: list[str]) -> tuple[str | None, str | None]:
+    """
+    Leitet category und industry aus den inferred Tags ab.
+    Gibt (category, industry) zurück — beide können None sein.
+    Nimmt den ersten Tag der ein Mapping hat (Tags sind nach Treffsicherheit geordnet).
+    """
+    for tag in tags:
+        category = _TAG_TO_CATEGORY.get(tag)
+        industry = _TAG_TO_INDUSTRY.get(tag)
+        if category or industry:
+            return category, industry
+    return None, None
+
+
 # ─── Website-URL Heuristik ───────────────────────────────────────────────────
 
 def _guess_website_candidates(company_name: str) -> list[str]:
@@ -863,5 +939,11 @@ async def enrich_company(
         company_record.get("industry", ""),
     ]))
     result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
+
+    # category / industry aus Tags ableiten (nur wenn DB noch leer)
+    if not company_record.get("category") or not company_record.get("industry"):
+        inferred_cat, inferred_ind = infer_category_industry(result.tags)
+        result.category = inferred_cat if not company_record.get("category") else None
+        result.industry = inferred_ind if not company_record.get("industry") else None
 
     return result

@@ -99,7 +99,8 @@ def upsert_company_enrichment(company_id: str, data: dict) -> None:
     Nur Felder die tatsächlich einen Wert haben werden geschrieben
     (keine None-Overwrites auf bereits vorhandene DB-Werte).
 
-    Felder: founding_year, headquarters, headcount, description
+    Felder: founding_year, headquarters, headcount, description, website,
+            category, industry  ← neu: aus Tag-Inferenz für One-Click-Companies
     Aufgerufen von: company_detail.py nach _safe_enrichment()
     """
     db = get_supabase()

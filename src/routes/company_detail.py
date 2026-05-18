@@ -37,6 +37,7 @@ from src.pipelines.scoring import compute_scores
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
     enrich_company,
+    infer_category_industry,
     BundesanzeigerData,
     EnrichmentResult,
 )
@@ -577,13 +578,37 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 4b. Enrichment-Ergebnisse in DB persistieren (nur wenn Werte vorhanden)
     #     DB-Werte als Fallback wenn Enrichment leer (z.B. bei Timeout)
     if company_id:
-        upsert_company_enrichment(company_id, {
+        upsert_payload = {
             "founding_year": _parse_year(enrichment.founded_year),
             "headquarters":  enrichment.headquarters or None,
             "headcount":     _parse_headcount(enrichment.employee_count),
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
-        })
+        }
+        # category / industry nur schreiben wenn DB noch leer + Enrichment hat Wert
+        if enrichment.category and not company.get("category"):
+            upsert_payload["category"] = enrichment.category
+            company["category"] = enrichment.category   # lokales Dict aktualisieren
+            logger.info("One-Click category inferred for %s: %s", company_name, enrichment.category)
+        if enrichment.industry and not company.get("industry"):
+            upsert_payload["industry"] = enrichment.industry
+            company["industry"] = enrichment.industry
+        upsert_company_enrichment(company_id, upsert_payload)
+
+    # TAM-Re-Lookup: wenn erster TAM-Call Fallback war und jetzt category bekannt
+    if tam.get("method") == "fallback" and company.get("category"):
+        logger.info("TAM re-lookup with inferred category '%s' for %s", company["category"], company_name)
+        tam_retry = await get_tam(company_name, company["category"])
+        if tam_retry.get("method") != "fallback":
+            tam = tam_retry
+            # Neues Ergebnis auch cachen
+            if company_id and tam.get("tam_usd_bn"):
+                upsert_tam_cache(
+                    company_id=company_id,
+                    tam_usd_bn=tam["tam_usd_bn"],
+                    cagr_pct=tam.get("cagr_pct"),
+                    source=tam.get("source", "scrape"),
+                )
 
     # DB-Werte als Fallback wenn Enrichment-Felder leer
     founded_display   = enrichment.founded_year   or (str(company.get("founding_year")) if company.get("founding_year") else None)
