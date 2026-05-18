@@ -439,11 +439,16 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
     # 1. Lookup
     companies = fetch_companies(limit=500)
     q = name.lower().replace("-"," ").replace("_"," ")
+    def _proxy_match(c: dict, ticker: str) -> bool:
+        # proxy_ticker format: "FRVO · Nasdaq" or "LNZA · Nasdaq"
+        proxy = c.get("proxy_ticker") or c.get("proxy") or ""
+        return proxy.upper().startswith(ticker.upper())
     company = next(
         (c for c in companies if
          c.get("name","").lower()==q or
          q in c.get("name","").lower() or
-         c.get("name","").lower().replace(" ","-")==name.lower()),
+         c.get("name","").lower().replace(" ","-")==name.lower() or
+         _proxy_match(c, name)),
         None,
     )
     if not company:
