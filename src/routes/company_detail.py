@@ -506,20 +506,14 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
 
     # 4b. Enrichment-Ergebnisse in DB persistieren (nur wenn Werte vorhanden)
     #     DB-Werte als Fallback wenn Enrichment leer (z.B. bei Timeout)
-    logger.warning(
-        "ENRICHMENT DEBUG %s — founded_year=%r headquarters=%r employee_count=%r company_id=%r",
-        company_name, enrichment.founded_year, enrichment.headquarters,
-        enrichment.employee_count, company_id,
-    )
     if company_id:
-        upsert_payload = {
+        upsert_company_enrichment(company_id, {
             "founding_year": _parse_year(enrichment.founded_year),
             "headquarters":  enrichment.headquarters or None,
             "headcount":     _parse_headcount(enrichment.employee_count),
             "description":   enrichment.description or None,
-        }
-        logger.warning("UPSERT PAYLOAD %s — %s", company_name, upsert_payload)
-        upsert_company_enrichment(company_id, upsert_payload)
+            "website":       enrichment.website or None,
+        })
 
     # DB-Werte als Fallback wenn Enrichment-Felder leer
     founded_display   = enrichment.founded_year   or (str(company.get("founding_year")) if company.get("founding_year") else None)
