@@ -161,7 +161,9 @@ def _parse_year(value: str | None) -> int | None:
 
 
 def _parse_headcount(value: str | None) -> int | None:
-    """Konvertiert Enrichment-Mitarbeiterstring ('~200', '100-500') → int (Mittelwert)."""
+    """Konvertiert Enrichment-Mitarbeiterstring ('~200', '100-500') → int (Mittelwert).
+    Gibt None zurück wenn Wert 0 oder außerhalb [1, 100_000] — verhindert headcount=0 in DB.
+    """
     if not value:
         return None
     try:
@@ -171,12 +173,18 @@ def _parse_headcount(value: str | None) -> int | None:
         if match:
             lo = int(match.group(1).replace(",", ""))
             hi = int(match.group(2).replace(",", ""))
-            return (lo + hi) // 2
-        # Einzelzahl: "~200" → 200
-        match = re.search(r"\d[\d,]*", str(value))
-        return int(match.group().replace(",", "")) if match else None
+            n = (lo + hi) // 2
+        else:
+            # Einzelzahl: "~200" → 200
+            match = re.search(r"\d[\d,]*", str(value))
+            if not match:
+                return None
+            n = int(match.group().replace(",", ""))
+        # Plausibilitätscheck — 0 und Werte > 100.000 ausschließen
+        return n if 1 <= n <= 100_000 else None
     except Exception:
         return None
+
 
 
 # ── is_listed logic (B-05) ────────────────────────────────────────────────────
