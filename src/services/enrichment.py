@@ -608,6 +608,86 @@ def _infer_tags(text: str) -> list[str]:
     return [tag for tag, kws in TAG_KEYWORDS.items() if any(k in t for k in kws)]
 
 
+# ─── Company Website ─────────────────────────────────────────────────────────
+
+async def _fetch_company_website(website: str) -> dict:
+    """
+    Scrapt die Company-Website nach Headcount-Angaben.
+    Sucht in JSON-LD (numberOfEmployees) und im Seitentext.
+    Wird aufgerufen wenn Wikipedia + Crunchbase keinen Headcount liefern.
+    """
+    out: dict = {}
+    if not website:
+        return out
+    # Normalisieren
+    if not website.startswith("http"):
+        website = "https://" + website
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, headers=HEADERS, follow_redirects=True
+        ) as client:
+            resp = await client.get(website)
+        if resp.status_code != 200:
+            return out
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 1. JSON-LD — numberOfEmployees (Schema.org Organization)
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if not isinstance(data, dict):
+                    continue
+                emp = data.get("numberOfEmployees")
+                if emp:
+                    val = emp.get("value", emp) if isinstance(emp, dict) else emp
+                    out["employee_count"] = str(val)
+                    return out
+            except Exception:
+                pass
+
+        # 2. Meta-Tags (og:description, description)
+        for attr in [{"name": "description"}, {"property": "og:description"}]:
+            tag = soup.find("meta", attrs=attr)
+            if tag:
+                content_val = tag.get("content", "")
+                m = re.search(
+                    r"(\d[\d,\.]*)\s*\+?\s*(?:employees?|team members?|people|Mitarbeiter|collaborators?)",
+                    content_val, re.I,
+                )
+                if m:
+                    out["employee_count"] = m.group(1).replace(",", "").replace(".", "")
+                    return out
+
+        # 3. Seitentext — Patterns für "X employees", "team of X", "X people"
+        text = soup.get_text(" ", strip=True)[:8000]
+        headcount_patterns = [
+            r"(\d[\d,\.]*)\s*\+?\s*(?:full[- ]time\s+)?employees",
+            r"(\d[\d,\.]*)\s*\+?\s*team\s+members",
+            r"team\s+of\s+(?:over\s+|more\s+than\s+)?(\d[\d,\.]*)",
+            r"(\d[\d,\.]*)\s*\+?\s*people\s+(?:strong|worldwide|globally|across)",
+            r"(?:over|more than|nearly|about|approximately)\s+(\d[\d,\.]*)\s+(?:employees|people|staff)",
+            r"(\d[\d,\.]*)\s*(?:Mitarbeiter|Beschäftigte)",
+        ]
+        for pat in headcount_patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                # Gruppe 1 oder 2 je nach Pattern
+                val = m.group(1) if m.lastindex == 1 or not m.group(2) else m.group(2)
+                # Plausibilitätscheck: zwischen 1 und 100.000
+                try:
+                    n = int(val.replace(",", "").replace(".", ""))
+                    if 1 <= n <= 100000:
+                        out["employee_count"] = str(n)
+                        return out
+                except ValueError:
+                    pass
+
+    except Exception as e:
+        logger.debug("Company website headcount scrape failed for %s: %s", website, e)
+    return out
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 async def enrich_company(
@@ -656,6 +736,20 @@ async def enrich_company(
         result.employee_count = cb.employee_count or result.employee_count
         result.investors      = list(cb.investors)
         result.funding_rounds = list(cb.funding_rounds)
+
+    # Company-Website: Headcount-Fallback wenn Wikipedia + Crunchbase leer
+    if not result.employee_count and company_record.get("website"):
+        try:
+            website_data = await asyncio.wait_for(
+                _fetch_company_website(company_record["website"]),
+                timeout=6.0,
+            )
+            if website_data.get("employee_count"):
+                result.employee_count = website_data["employee_count"]
+        except asyncio.TimeoutError:
+            logger.debug("Company website timeout for %s", company_name)
+        except Exception as e:
+            logger.debug("Company website failed for %s: %s", company_name, e)
 
     # Bundesanzeiger: private DE companies only
     if not is_listed and _is_likely_german(company_record):
