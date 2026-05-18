@@ -5,16 +5,17 @@ Changes vs v2.5:
   - Market Data Enrichment Trigger (MD-B07): nach TAM-Block
   - fetch_market_data() Cache-Check — Background-Task wenn leer
   - set_enrichment_status() — pending → running → done/error
-  - enrich_market_data() async, non-blocking via asyncio.create_task
+  - enrich_market_data() non-blocking via FastAPI BackgroundTasks
 """
 
 import logging
 import asyncio
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from src.integrations.supabase import (
+    get_supabase,
     fetch_companies,
     fetch_buyers,
     fetch_funding_rounds,
@@ -441,14 +442,13 @@ def _build_fundamentals(
 # ── Main route ────────────────────────────────────────────────────────────────
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> CompanyDetailResponse:
     warnings: list[str] = []
 
     # 1. Lookup
     companies = fetch_companies(limit=500)
     q = name.lower().replace("-"," ").replace("_"," ")
     def _proxy_match(c: dict, ticker: str) -> bool:
-        # proxy_ticker format: "FRVO · Nasdaq" or "LNZA · Nasdaq"
         proxy = c.get("proxy_ticker") or c.get("proxy") or ""
         return proxy.upper().startswith(ticker.upper())
     company = next(
@@ -459,8 +459,23 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
          _proxy_match(c, name)),
         None,
     )
+
+    # 1b. One-Click: unbekannte Company anlegen + anreichern
     if not company:
-        raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
+        logger.info("Unknown company '%s' — creating DB entry + enriching", name)
+        try:
+            db = get_supabase()
+            result = db.table("companies").insert({
+                "name": name,
+                "investment_path": "Beobachten",
+                "source": "one_click",
+                "enrichment_status": "pending",
+            }).execute()
+            company = result.data[0] if result.data else {"name": name}
+            warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
+        except Exception as e:
+            logger.warning("Could not create company '%s': %s", name, e)
+            raise HTTPException(status_code=404, detail=f"Company '{name}' not found and could not be created.")
 
     company_name = company["name"]
 
@@ -493,41 +508,40 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
     # 4. Market Data — Cache prüfen, bei Bedarf Background-Enrichment anstoßen (MD-B07)
     market_data_cached = fetch_market_data(company_id) if company_id else None
     if company_id and not market_data_cached:
-        # Noch nicht angereichert — Background-Task starten, non-blocking
-        async def _market_enrichment_task():
-            try:
-                set_enrichment_status(company_id, "running")
-                # Async-Teil: TAM-Scraping + World Bank + SAM
-                async_result = await enrich_market_data(
-                    company_id=company_id,
-                    company_name=company_name,
-                    category=company.get("category"),
-                    sector_tag=None,
-                    tam_usd_bn=tam.get("tam_usd_bn"),
-                    tech_readiness=None,  # wird nachgezogen sobald TechReadiness-Formular vorhanden
-                )
-                # Sync-Teil: Competition Score + Market Cycle aus DB
-                all_companies = fetch_companies(limit=500)
-                all_rounds = fetch_all_funding_rounds()
-                sync_result = enrich_market_data_sync_wrapper(
-                    company_id=company_id,
-                    company_name=company_name,
-                    category=company.get("category"),
-                    sector_tag=None,
-                    tam_usd_bn=tam.get("tam_usd_bn"),
-                    all_companies=all_companies,
-                    all_funding_rounds=all_rounds,
-                )
-                merged = {**async_result, **sync_result}
-                upsert_market_data(company_id, merged)
-                set_enrichment_status(company_id, "done")
-                logger.info("Market enrichment done for %s", company_name)
-            except Exception as e:
-                set_enrichment_status(company_id, "error")
-                logger.warning("Market enrichment failed for %s: %s", company_name, e)
+        def _market_enrichment_bg():
+            import asyncio
+            async def _run():
+                try:
+                    set_enrichment_status(company_id, "running")
+                    async_result = await enrich_market_data(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        sector_tag=None,
+                        tam_usd_bn=tam.get("tam_usd_bn"),
+                        tech_readiness=None,
+                    )
+                    all_companies = fetch_companies(limit=500)
+                    all_rounds = fetch_all_funding_rounds()
+                    sync_result = enrich_market_data_sync_wrapper(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        sector_tag=None,
+                        tam_usd_bn=tam.get("tam_usd_bn"),
+                        all_companies=all_companies,
+                        all_funding_rounds=all_rounds,
+                    )
+                    upsert_market_data(company_id, {**async_result, **sync_result})
+                    set_enrichment_status(company_id, "done")
+                    logger.info("Market enrichment done for %s", company_name)
+                except Exception as e:
+                    set_enrichment_status(company_id, "error")
+                    logger.warning("Market enrichment failed for %s: %s", company_name, e)
+            asyncio.run(_run())
 
-        asyncio.create_task(_market_enrichment_task())
-        logger.info("Market enrichment triggered (background) for %s", company_name)
+        background_tasks.add_task(_market_enrichment_bg)
+        logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
 
     # 5. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
