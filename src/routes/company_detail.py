@@ -590,12 +590,15 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         inferred_cat  = enrichment.category
         inferred_ind  = enrichment.industry
 
+        # description: enrichment-Wert oder DB-Fallback (falls Timeout)
+        _desc_for_claude = enrichment.description or company.get("description")
+
         # Claude-Fallback: nur wenn Tags keinen Treffer hatten + description vorhanden
         # Läuft mit eigenem Timeout — unabhängig vom 8s-Enrichment-Timeout
-        if not inferred_cat and enrichment.description and not company.get("category"):
+        if not inferred_cat and _desc_for_claude and not company.get("category"):
             try:
                 inferred_cat, inferred_ind = await asyncio.wait_for(
-                    _claude_infer_category(company_name, enrichment.description),
+                    _claude_infer_category(company_name, _desc_for_claude),
                     timeout=6.0,
                 )
                 if inferred_cat:
