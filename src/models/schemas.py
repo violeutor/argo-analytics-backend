@@ -85,10 +85,18 @@ class CompanyListItem(BaseModel):
     investment_path: str | None = None
     proxy_ticker: str | None = None
     funding_total_usd_mn: float | None = None
+    funding_stage: str | None = None
     funding_last_round: str | None = None
     last_signal: str | None = None
     last_signal_date: str | None = None
     source: str | None = None
+    # migration_005 — Basisdaten
+    founding_year: int | None = None
+    headquarters: str | None = None
+    headcount: int | None = None
+    description: str | None = None
+    peers: list[str] = []
+    region: str | None = None
 
 
 class BuyerListItem(BaseModel):
