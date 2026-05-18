@@ -92,10 +92,10 @@ def upsert_company_enrichment(company_id: str, data: dict) -> None:
         return
 
     try:
-        db.table("companies").update(payload).eq("id", company_id).execute()
-        logger.debug("upsert_company_enrichment: %s → %s", company_id, list(payload.keys()))
+        result = db.table("companies").update(payload).eq("id", company_id).execute()
+        logger.warning("upsert_company_enrichment OK: %s → %s rows=%s", company_id, list(payload.keys()), len(result.data or []))
     except Exception as e:
-        logger.warning("upsert_company_enrichment failed for %s: %s", company_id, e)
+        logger.warning("upsert_company_enrichment FAILED: %s — %s", company_id, e)
 
 
 # ── TAM Cache ────────────────────────────────────────────────────────────────
