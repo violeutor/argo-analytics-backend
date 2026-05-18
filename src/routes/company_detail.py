@@ -154,6 +154,8 @@ class CompanyDetailResponse(BaseModel):
     # Signal
     last_signal: str | None
     last_signal_date: str | None
+    # Market Data (gecacht, optional)
+    market_data: dict | None = None
     # Meta
     technology_tags: list[str]
     is_known: bool
@@ -758,6 +760,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         supply_chain_etfs=sc.get("etfs",[]),
         last_signal=company.get("last_signal"),
         last_signal_date=str(company.get("last_signal_date")) if company.get("last_signal_date") else None,
+        market_data=market_data_cached,
         technology_tags=enrichment.tags,
         is_known=True,
         warnings=warnings,
