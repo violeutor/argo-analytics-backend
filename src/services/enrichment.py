@@ -194,6 +194,19 @@ async def _fetch_wikipedia(company: str) -> dict:
                 out["founded_year"] = m.group(1)
                 break
 
+        # ── HQ aus Summary-Text extrahieren (Fallback vor Wikitext) ─────────────
+        if not out.get("headquarters") and desc:
+            hq_patterns = [
+                r"headquartered\s+in\s+([A-Z][\w\s,]+?)(?:\.|,\s+(?:Canada|US|USA|Germany|UK|France|Switzerland|Australia))",
+                r"headquarters\s+(?:are\s+|is\s+)?(?:located\s+)?in\s+([A-Z][\w\s,]+?)(?:\.|,\s*[A-Z])",
+                r"based\s+in\s+([A-Z][\w\s,]+?)(?:\.|,\s+(?:Canada|US|USA|Germany|UK|France|Switzerland|Australia))",
+            ]
+            for pat in hq_patterns:
+                m = re.search(pat, desc)
+                if m:
+                    out["headquarters"] = m.group(1).strip().rstrip(",")
+                    break
+
         # ── Wikitext-Fallback: Infobox parsen ─────────────────────────────────
         # Nur wenn founding_year noch fehlt oder HQ/Mitarbeiter gebraucht werden
         if not out.get("founded_year") or not out.get("headquarters"):
