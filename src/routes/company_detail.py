@@ -1,11 +1,11 @@
 """
-GET /api/v1/company/{name}  —  v2.4
+GET /api/v1/company/{name}  —  v2.6
 
-Changes vs v2.3:
-  - _generate_intro: httpx timeout 20s → 8s
-  - _safe_intro wrapper mit asyncio.wait_for(10s) + Fallback
-  - asyncio.gather nutzt _safe_intro statt _generate_intro direkt
-  - Gesamtbudget für alle parallelen Calls: ~10s → Railway-safe
+Changes vs v2.5:
+  - Market Data Enrichment Trigger (MD-B07): nach TAM-Block
+  - fetch_market_data() Cache-Check — Background-Task wenn leer
+  - set_enrichment_status() — pending → running → done/error
+  - enrich_market_data() async, non-blocking via asyncio.create_task
 """
 
 import logging
@@ -18,12 +18,20 @@ from src.integrations.supabase import (
     fetch_companies,
     fetch_buyers,
     fetch_funding_rounds,
+    fetch_all_funding_rounds,
     upsert_company_enrichment,
     upsert_tam_cache,
     fetch_tam_cache,
+    fetch_market_data,
+    upsert_market_data,
+    set_enrichment_status,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.tam import get_tam
+from src.services.market_data_enrichment import (
+    enrich_market_data,
+    enrich_market_data_sync_wrapper,
+)
 from src.pipelines.scoring import compute_scores
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
@@ -482,7 +490,46 @@ async def get_company_detail(name: str) -> CompanyDetailResponse:
                 source=tam.get("source", "scrape"),
             )
 
-    # 4. Parallel: enrichment (with timeout) + yahoo + intro
+    # 4. Market Data — Cache prüfen, bei Bedarf Background-Enrichment anstoßen (MD-B07)
+    market_data_cached = fetch_market_data(company_id) if company_id else None
+    if company_id and not market_data_cached:
+        # Noch nicht angereichert — Background-Task starten, non-blocking
+        async def _market_enrichment_task():
+            try:
+                set_enrichment_status(company_id, "running")
+                # Async-Teil: TAM-Scraping + World Bank + SAM
+                async_result = await enrich_market_data(
+                    company_id=company_id,
+                    company_name=company_name,
+                    category=company.get("category"),
+                    sector_tag=None,
+                    tam_usd_bn=tam.get("tam_usd_bn"),
+                    tech_readiness=None,  # wird nachgezogen sobald TechReadiness-Formular vorhanden
+                )
+                # Sync-Teil: Competition Score + Market Cycle aus DB
+                all_companies = fetch_companies(limit=500)
+                all_rounds = fetch_all_funding_rounds()
+                sync_result = enrich_market_data_sync_wrapper(
+                    company_id=company_id,
+                    company_name=company_name,
+                    category=company.get("category"),
+                    sector_tag=None,
+                    tam_usd_bn=tam.get("tam_usd_bn"),
+                    all_companies=all_companies,
+                    all_funding_rounds=all_rounds,
+                )
+                merged = {**async_result, **sync_result}
+                upsert_market_data(company_id, merged)
+                set_enrichment_status(company_id, "done")
+                logger.info("Market enrichment done for %s", company_name)
+            except Exception as e:
+                set_enrichment_status(company_id, "error")
+                logger.warning("Market enrichment failed for %s: %s", company_name, e)
+
+        asyncio.create_task(_market_enrichment_task())
+        logger.info("Market enrichment triggered (background) for %s", company_name)
+
+    # 5. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
         try:
             return await asyncio.wait_for(

@@ -58,6 +58,23 @@ def fetch_funding_rounds(company_id: str) -> list[dict]:
     return result.data or []
 
 
+def fetch_all_funding_rounds() -> list[dict]:
+    """
+    Gibt alle Funding Rounds aller Companies zurück.
+    Wird von market_data_enrichment für Competition Score + Market Cycle genutzt.
+    Felder: company_id, date, amount_usd_mn — nur was die Pipeline braucht.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("funding_rounds").select(
+            "company_id, date, amount_usd_mn, type"
+        ).order("date", desc=True).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_all_funding_rounds failed: %s", e)
+        return []
+
+
 # ── Buyers ───────────────────────────────────────────────────────────────────
 
 def fetch_buyers(limit: int = 50) -> list[dict]:
