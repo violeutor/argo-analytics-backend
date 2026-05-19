@@ -7,6 +7,7 @@ from src.routes.companies import router as companies_router
 from src.routes.search import router as search_router
 from src.routes.company_detail import router as detail_router
 from src.routes.market import router as market_router
+from src.routes.ownership import router as ownership_router
 import os
 
 app = FastAPI(
@@ -49,6 +50,7 @@ app.include_router(companies_router)
 app.include_router(search_router)
 app.include_router(detail_router)
 app.include_router(market_router)
+app.include_router(ownership_router)
 
 
 @app.get("/health")
