@@ -491,6 +491,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     is_listed = _resolve_is_listed(company)
     proxy = company.get("proxy_ticker")
 
+    # Für selbst-börsennotierte Companies (is_listed, kein proxy_ticker):
+    # eigenen Ticker aus companies.ticker verwenden → Yahoo Finance Lookup
+    if is_listed and not proxy and company.get("ticker"):
+        ticker_raw = company["ticker"]
+        exchange_raw = company.get("exchange", "")
+        proxy = f"{ticker_raw} · {exchange_raw}".strip(" ·") if exchange_raw else ticker_raw
+
     # 3. TAM — erst DB-Cache prüfen, dann scrapen, Ergebnis persistieren
     company_id = company.get("id")
     tam_cached = fetch_tam_cache(company_id) if company_id else None
