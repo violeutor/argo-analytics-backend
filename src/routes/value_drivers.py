@@ -97,9 +97,23 @@ async def get_value_drivers(name: str) -> ValueDriversResponse:
     if not vd:
         return ValueDriversResponse(status="pending", company_name=company_name)
 
-    enablers     = vd.get("enablers", [])
-    contributors = vd.get("contributors", [])
-    etfs         = vd.get("etfs", [])
+    # Supabase gibt JSONB-Felder manchmal als JSON-String zurück — sicher parsen
+    import json
+
+    def _parse_jsonb(val) -> list:
+        if isinstance(val, list):
+            return val
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return []
+
+    enablers     = _parse_jsonb(vd.get("enablers", []))
+    contributors = _parse_jsonb(vd.get("contributors", []))
+    etfs         = _parse_jsonb(vd.get("etfs", []))
 
     if not enablers and not contributors:
         return ValueDriversResponse(status="empty", company_name=company_name)
