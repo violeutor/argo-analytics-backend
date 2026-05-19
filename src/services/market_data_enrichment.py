@@ -21,7 +21,6 @@ import re
 from datetime import datetime, timezone
 
 import httpx
-from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +76,9 @@ Rules:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": settings.anthropic_api_key,
-                    "anthropic-version": "2023-06-01",
-                },
+                headers={"Content-Type": "application/json"},
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "claude-sonnet-4-20250514",
                     "max_tokens": 600,
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -267,10 +262,15 @@ def compute_sam(
         tr_note = f"TechReadiness {tech_readiness:.2f} < 0.5 — pre-commercial"
 
     sam = round(tam_usd_bn * geo_factor * tech_filter, 1)
-    note = (
-        f"SAM = TAM ${tam_usd_bn}B × geo_factor {geo_factor} ({geo_scope}) "
-        f"× tech_filter {tech_filter} ({tr_note})"
-    )
+
+    # Geo-Scope leserlich machen
+    geo_labels = {
+        "global": "Global", "us_eu": "USA + Europa",
+        "us_only": "USA", "eu_only": "Europa", "emerging": "Emerging Markets"
+    }
+    geo_label = geo_labels.get(geo_scope, geo_scope)
+
+    note = f"Serviceable Addressable Market für {geo_label}. {tr_note}."
 
     return {
         "sam_usd_bn":     sam,
