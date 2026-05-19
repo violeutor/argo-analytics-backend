@@ -14,6 +14,15 @@ class AnalyzeRequest(BaseModel):
     target_funding_usd_mn: float = Field(0.0, description="Target total funding raised in USD millions")
     target_stage: Literal["seed", "series_a", "series_b", "series_c", "series_d_plus", "public"] = "series_b"
     tech_readiness_inputs: "TechReadinessInputs | None" = None
+    # v1.1 — Auto-TR: vorberechneter Wert aus compute_auto_tech_readiness()
+    # Hat Vorrang vor tech_readiness_inputs wenn gesetzt.
+    # Wird auch für User-Overrides (CD-F02) verwendet — dann mit confidence='user'.
+    tech_readiness_override: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Vorberechneter TR-Wert (Auto oder User-Override). Überschreibt interne Berechnung.",
+    )
     url: str | None = None
 
 

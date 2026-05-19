@@ -1,11 +1,11 @@
 """
-GET /api/v1/company/{name}  —  v2.6
+GET /api/v1/company/{name}  —  v2.7
 
-Changes vs v2.5:
-  - Market Data Enrichment Trigger (MD-B07): nach TAM-Block
-  - fetch_market_data() Cache-Check — Background-Task wenn leer
-  - set_enrichment_status() — pending → running → done/error
-  - enrich_market_data() non-blocking via FastAPI BackgroundTasks
+Changes vs v2.6:
+  - Auto TechReadiness (v1.1): compute_auto_tech_readiness() ersetzt pauschalen 0.5-Fallback
+  - is_listed Gate: TR wird nur für private Companies berechnet + im Frontend angezeigt
+  - TechReadinessDetail: confidence-Feld (auto_low | auto_medium | auto_high | user | listed)
+  - Scoring-Loop: tech_readiness_override aus Auto-TR in AnalyzeRequest
 """
 
 import logging
@@ -34,7 +34,7 @@ from src.services.market_data_enrichment import (
     enrich_market_data,
     enrich_market_data_sync_wrapper,
 )
-from src.pipelines.scoring import compute_scores
+from src.pipelines.scoring import compute_scores, compute_auto_tech_readiness
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
     enrich_company,
@@ -112,6 +112,7 @@ class TechReadinessDetail(BaseModel):
     inputs_provided: bool
     factors: dict[str, float]
     factor_weights: dict[str, float]
+    confidence: str = "auto_medium"  # listed | auto_low | auto_medium | auto_high | user
 
 
 class ScoringDetail(BaseModel):
@@ -823,6 +824,26 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 9. Scoring
     buyers = fetch_buyers(limit=50)
     scorings: list[ScoringDetail] = []
+
+    # Auto-TR einmalig berechnen — gilt für alle Buyer-Loops
+    # is_listed Gate: für börsennotierte Companies keinen TR berechnen
+    # (Markt hat TR bereits eingepreist — Kurs/Multiples sind der Konsens-TR)
+    if is_listed:
+        auto_tr = 0.5          # wird im Frontend nicht angezeigt
+        tr_confidence = "listed"
+    else:
+        auto_tr, tr_confidence = compute_auto_tech_readiness(
+            stage=company.get("funding_stage"),
+            category=company.get("category"),
+            funding_total_usd_mn=company.get("funding_total_usd_mn"),
+            funding_last_round=company.get("funding_last_round"),
+        )
+        logger.info(
+            "Auto-TR for %s: %.3f (confidence=%s, stage=%s, category=%s)",
+            company_name, auto_tr, tr_confidence,
+            company.get("funding_stage"), company.get("category"),
+        )
+
     for buyer in buyers:
         if not buyer.get("market_cap_usd_bn"):
             continue
@@ -835,6 +856,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 buyer_debt_ebitda=buyer.get("debt_ebitda") or 1.5,
                 target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
                 target_stage=company.get("funding_stage") or "series_b",
+                tech_readiness_override=auto_tr,
             )
             scores = compute_scores(req)
             scorings.append(ScoringDetail(
@@ -842,10 +864,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 srr_value=scores.srr.value, srr_category=scores.srr.category,
                 mfr_value=scores.mfr.value, mfr_signal=scores.mfr.signal,
                 tech_readiness=TechReadinessDetail(
-                    overall=scores.tech_readiness.value,
-                    inputs_provided=scores.tech_readiness.value != 0.5,
+                    overall=auto_tr,
+                    inputs_provided=tr_confidence == "user",
                     factors=scores.tech_readiness.factor_scores,
                     factor_weights=_TR_WEIGHTS,
+                    confidence=tr_confidence,
                 ),
                 deal_success_score=scores.deal_success_score,
                 rating=scores.rating, execution_warning=scores.srr.execution_warning,

@@ -6,6 +6,11 @@ Implements:
   - MFR  (M&A Feasibility Ratio)       = f(cash, debt/EBITDA, target valuation)
   - TechReadiness                       = weighted mean of 7 Amazon/Google-style factors
   - DealSuccessScore                    = SRR_norm × MFR_norm × TechReadiness
+
+v1.1 — Auto TechReadiness:
+  - compute_auto_tech_readiness(): berechnet TR-Basiswert aus Stage, Kategorie, Funding-Pace
+  - Ersetzt pauschalen 0.5-Fallback für private Companies
+  - tech_readiness_override in AnalyzeRequest: wenn gesetzt, überschreibt compute_tech_readiness()
 """
 
 import math
@@ -20,17 +25,15 @@ from src.models.schemas import (
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Stage-based valuation multiplier applied to total funding to estimate EV
 _STAGE_MULTIPLIERS = {
     "seed": 8.0,
     "series_a": 6.0,
     "series_b": 5.0,
     "series_c": 4.0,
     "series_d_plus": 3.5,
-    "public": 1.0,  # use funding as proxy only; real EV should be supplied
+    "public": 1.0,
 }
 
-# TechReadiness factor weights (sum = 1.0) — Amazon/Google framework
 _TR_WEIGHTS = {
     "tech_stack_fit": 0.20,
     "gtm_fit": 0.15,
@@ -41,18 +44,128 @@ _TR_WEIGHTS = {
     "strategic_coherence": 0.10,
 }
 
-# MFR normalization bounds
 _MFR_FEASIBLE_THRESHOLD = 0.15
 _MFR_WATCH_THRESHOLD = 0.50
 
-# SRR thresholds
 _SRR_HIGH_STRATEGIC = 0.15
 _SRR_TRANSFORMATIONAL = 0.50
 _SRR_TRANSFORMATIONAL_PP = 1.0
 
-# Execution warning: low cap + high SRR is a false positive risk
 _LOW_CAP_THRESHOLD_BN = 10.0
 _HIGH_SRR_WARNING = 5.0
+
+
+# ── Auto TechReadiness ────────────────────────────────────────────────────────
+
+# Stage → TR-Basiswert (dominanter Faktor)
+_STAGE_TR: dict[str, float] = {
+    "seed":          0.28,
+    "series_a":      0.40,
+    "series_b":      0.53,
+    "series_c":      0.64,
+    "series_d_plus": 0.73,
+    "pre_ipo":       0.80,
+    "public":        1.00,  # Gate — wird im Frontend nicht angezeigt
+}
+
+# Kategorie → Branchenspezifischer Boost/Abzug
+# Reife Kategorien: höherer Basis-TR / Frühe oder risikoreiche: Abzug
+_CATEGORY_TR_DELTA: dict[str, float] = {
+    "Agritech SaaS":                     +0.10,
+    "AI × Grid Software":                +0.08,
+    "CO₂-to-Fuels":                      +0.08,
+    "Solar Irrigation":                  +0.07,
+    "Low-Carbon Concrete":               +0.06,
+    "Electrified Cement":                +0.06,
+    "Distributed Power Infrastructure":  +0.06,
+    "Climate-Risk SaaS":                 +0.06,
+    "Irrigation":                        +0.05,
+    "Industrial Capture":                +0.04,
+    "Bio-based Chemicals":               +0.04,
+    "Distributed Battery / Grid":        +0.04,
+    "Carbon Credits":                    +0.03,
+    "Geothermal / EGS":                  +0.02,
+    "Long-Duration Storage":             +0.02,
+    # Frühe / risikoreiche Kategorien
+    "Ocean CDR":                         -0.10,
+    "Bioengineering":                    -0.08,
+    "Mineralization":                    -0.06,
+    "Modular Capture":                   -0.06,
+    "Solid-State Battery":               -0.05,
+    "Mobile Capture":                    -0.05,
+    "Electrochemical Capture":           -0.04,
+    "Biomass CDR":                       -0.03,
+}
+
+# Funding-Pace → Marktsignal-Boost
+_FUNDING_PACE_DELTA: dict[str, float] = {
+    "fast":   +0.05,   # > $100M Funding-Total
+    "medium":  0.00,
+    "slow":   -0.04,   # < $10M oder nicht öffentlich
+}
+
+
+def compute_auto_tech_readiness(
+    stage: str | None,
+    category: str | None,
+    funding_total_usd_mn: float | None,
+    funding_last_round: str | None,
+) -> tuple[float, str]:
+    """
+    Berechnet automatischen TechReadiness-Basiswert für private Companies.
+    Gibt (tr_value: float, confidence: str) zurück.
+
+    confidence-Werte:
+      'auto_high'   — Stage + Kategorie beide im Mapping → verlässliche Schätzung
+      'auto_medium' — nur Stage bekannt
+      'auto_low'    — weder Stage noch Kategorie bekannt → generischer Fallback
+
+    Logik:
+      1. Stage  → Basiswert (dominanter Faktor, ~60% Gewicht)
+      2. Kategorie → branchenspezifischer Delta
+      3. Funding-Pace → Marktsignal-Delta
+
+    Wird nur für is_listed=False aufgerufen.
+    Kann durch User-Inputs (CD-F02) überschrieben werden → confidence='user'.
+    """
+    # 1. Stage normalisieren
+    stage_key = (stage or "").lower().replace(" ", "_").replace("-", "_")
+    # Aliase abfangen
+    if stage_key in ("series_d", "series_d+", "series_e", "late"):
+        stage_key = "series_d_plus"
+    if stage_key in ("series_a_1", "series_a_2"):
+        stage_key = "series_a"
+
+    base = _STAGE_TR.get(stage_key)
+    known_stage = base is not None
+    if base is None:
+        base = 0.50  # generischer Fallback
+
+    # 2. Kategorie-Delta
+    cat_delta = _CATEGORY_TR_DELTA.get(category or "", 0.0)
+    known_category = (category or "") in _CATEGORY_TR_DELTA
+
+    # 3. Funding-Pace
+    if funding_total_usd_mn and funding_total_usd_mn > 100:
+        pace = "fast"
+    elif not funding_total_usd_mn or funding_total_usd_mn < 10:
+        pace = "slow"
+    else:
+        pace = "medium"
+    pace_delta = _FUNDING_PACE_DELTA[pace]
+
+    # Finaler Wert, geclampt auf [0.10, 0.92]
+    tr = round(min(max(base + cat_delta + pace_delta, 0.10), 0.92), 3)
+
+    # Konfidenz
+    if known_stage and known_category:
+        confidence = "auto_high"
+    elif known_stage:
+        confidence = "auto_medium"
+    else:
+        confidence = "auto_low"
+
+    return tr, confidence
 
 
 # ── SRR ──────────────────────────────────────────────────────────────────────
@@ -79,9 +192,7 @@ def compute_srr(tam_usd_bn: float, buyer_market_cap_usd_bn: float) -> SRRResult:
     else:
         cap_segment = "high"
 
-    execution_warning = (
-        cap_segment == "low" and srr > _HIGH_SRR_WARNING
-    )
+    execution_warning = cap_segment == "low" and srr > _HIGH_SRR_WARNING
 
     return SRRResult(
         value=round(srr, 4),
@@ -100,21 +211,11 @@ def compute_mfr(
     target_funding_usd_mn: float,
     target_stage: str,
 ) -> MFRResult:
-    """
-    MFR = estimated target EV / buyer market cap
-
-    Thresholds (from validated M&A dataset):
-      Feasible   < 0.15
-      Watch      0.15 – 0.50
-      Overstretch > 0.50
-    """
     multiplier = _STAGE_MULTIPLIERS.get(target_stage, 5.0)
-    estimated_ev_usd_mn = target_funding_usd_mn * multiplier
-    estimated_ev_usd_bn = estimated_ev_usd_mn / 1000
+    estimated_ev_usd_bn = (target_funding_usd_mn * multiplier) / 1000
 
     mfr = estimated_ev_usd_bn / buyer_market_cap_usd_bn if buyer_market_cap_usd_bn > 0 else 999
 
-    # Adjust for leverage headroom: high debt/EBITDA tightens feasibility
     if buyer_debt_ebitda > 3.0:
         mfr = mfr * (1 + (buyer_debt_ebitda - 3.0) * 0.1)
 
@@ -130,24 +231,36 @@ def compute_mfr(
 
 # ── TechReadiness ─────────────────────────────────────────────────────────────
 
-def compute_tech_readiness(inputs: TechReadinessInputs | None) -> TechReadinessResult:
+def compute_tech_readiness(
+    inputs: TechReadinessInputs | None,
+    override: float | None = None,
+) -> TechReadinessResult:
     """
-    Weighted mean across 7 factors (Amazon/Google M&A readiness framework).
-    If inputs are not provided, returns a neutral midpoint (0.5) with a flag.
+    Weighted mean across 7 factors.
+
+    Priorität:
+      1. override (float) — von compute_auto_tech_readiness() oder User-DB-Wert
+      2. inputs (TechReadinessInputs) — manuelles CD-F02 Formular
+      3. Fallback 0.5 — nur noch für listed Companies (wird im Frontend nicht angezeigt)
     """
+    if override is not None:
+        # Override: Faktor-Scores gleichmäßig auf override-Wert skalieren
+        # (proportional zur jeweiligen Gewichtung — kein pauschales 0.5)
+        factor_scores = {k: round(override, 4) for k in _TR_WEIGHTS}
+        return TechReadinessResult(value=round(override, 4), factor_scores=factor_scores)
+
     if inputs is None:
-        # Neutral fallback — caller should warn user
         factor_scores = {k: 0.5 for k in _TR_WEIGHTS}
         return TechReadinessResult(value=0.5, factor_scores=factor_scores)
 
     factor_scores = {
-        "tech_stack_fit": inputs.tech_stack_fit,
-        "gtm_fit": inputs.gtm_fit,
-        "integration_capacity": inputs.integration_capacity,
-        "rd_intensity": inputs.rd_intensity,
+        "tech_stack_fit":            inputs.tech_stack_fit,
+        "gtm_fit":                   inputs.gtm_fit,
+        "integration_capacity":      inputs.integration_capacity,
+        "rd_intensity":              inputs.rd_intensity,
         "capital_deployment_velocity": inputs.capital_deployment_velocity,
-        "regulatory_readiness": inputs.regulatory_readiness,
-        "strategic_coherence": inputs.strategic_coherence,
+        "regulatory_readiness":      inputs.regulatory_readiness,
+        "strategic_coherence":       inputs.strategic_coherence,
     }
 
     score = sum(v * _TR_WEIGHTS[k] for k, v in factor_scores.items())
@@ -161,39 +274,23 @@ def compute_tech_readiness(inputs: TechReadinessInputs | None) -> TechReadinessR
 # ── Normalization helpers ─────────────────────────────────────────────────────
 
 def _normalize_srr(srr_value: float) -> float:
-    """Map SRR to 0–1 using log-scaling to dampen extreme values (e.g. 28x)."""
     if srr_value <= 0:
         return 0.0
-    # log(1 + srr) / log(1 + ceiling) — ceiling at 10x
     ceiling = 10.0
     return min(math.log1p(srr_value) / math.log1p(ceiling), 1.0)
 
 
 def _normalize_mfr(mfr_value: float) -> float:
-    """Invert MFR: lower ratio = more feasible = higher score.
-    
-    Feasible (<0.15) → 1.0
-    Watch (0.15–0.50) → 0.5–0.7
-    Overstretch (>0.50) → approaches 0
-    Uses a floor of 0.4 for Feasible cases so DealSuccessScore stays meaningful.
-    """
     if mfr_value <= 0:
         return 1.0
     if mfr_value < _MFR_FEASIBLE_THRESHOLD:
-        return 1.0  # Comfortably feasible — full score
+        return 1.0
     return max(0.0, 1.0 - min(mfr_value / _MFR_WATCH_THRESHOLD, 1.0))
 
 
 # ── Rating & Quadrant ─────────────────────────────────────────────────────────
 
 def _derive_rating(srr: SRRResult, mfr: MFRResult, tr: TechReadinessResult) -> str:
-    """
-    Rating matrix aligned with PROJEKT-MASTER framework:
-      A · No-Brainer  — Transformational++ + Feasible + TR ≥ 0.6
-      B · Solide       — Transformational   + Feasible/Watch + TR ≥ 0.5
-      C · Abwägen     — High Strategic or Watch + moderate TR
-      D · Uninteressant — Low Strategic or Overstretch
-    """
     if srr.category == "Transformational++" and mfr.signal == "Feasible" and tr.value >= 0.6:
         return "A · No-Brainer"
     if srr.category in ("Transformational++", "Transformational") and mfr.signal in ("Feasible", "Watch") and tr.value >= 0.5:
@@ -227,7 +324,10 @@ def compute_scores(request: AnalyzeRequest) -> ScoreResult:
         target_funding_usd_mn=request.target_funding_usd_mn,
         target_stage=request.target_stage,
     )
-    tr = compute_tech_readiness(request.tech_readiness_inputs)
+    tr = compute_tech_readiness(
+        inputs=request.tech_readiness_inputs,
+        override=request.tech_readiness_override,
+    )
 
     srr_norm = _normalize_srr(srr.value)
     mfr_norm = _normalize_mfr(mfr.value)
