@@ -27,7 +27,7 @@ def fetch_companies(limit: int = 100, source: str | None = None) -> list[dict]:
     db = get_supabase()
     query = db.table("companies").select(
         "id, name, category, industry, potential, risk, ipo_potential, ipo_status, "
-        "investment_path, proxy_ticker, funding_total_usd_mn, funding_stage, "
+        "investment_path, proxy_ticker, ticker, exchange, funding_total_usd_mn, funding_stage, "
         "funding_last_round, last_signal, last_signal_date, source, "
         "founding_year, headquarters, headcount, description, peers, region"
     ).limit(limit).order("name")
