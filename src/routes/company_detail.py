@@ -514,6 +514,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             )
 
     # 4. Market Data — Cache prüfen, bei Bedarf Background-Enrichment anstoßen (MD-B07)
+    # _tr_ref: Closure-Container für tech_readiness — wird nach Scoring-Block gefüllt
+    # (Schritt 9). Background-Task läuft nach Response-Aufbau, liest dann den echten Wert.
+    _tr_ref: list[float | None] = [None]
+
     market_data_cached = fetch_market_data(company_id) if company_id else None
     if company_id and not market_data_cached:
         async def _market_enrichment_bg():
@@ -525,7 +529,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     category=company.get("category"),
                     sector_tag=None,
                     tam_usd_bn=tam.get("tam_usd_bn"),
-                    tech_readiness=None,
+                    tech_readiness=_tr_ref[0],   # gesetzt nach Scoring-Block
                 )
                 all_companies = fetch_companies(limit=500)
                 all_rounds = fetch_all_funding_rounds()
@@ -717,6 +721,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             logger.debug("Scoring failed %s/%s: %s", company_name, buyer["name"], e)
 
     scorings.sort(key=lambda x: -x.deal_success_score)
+
+    # tech_readiness für Market-Enrichment nachreichen (bester Scoring-Wert)
+    # Background-Task läuft nach Response-Aufbau → _tr_ref[0] ist dann gesetzt
+    if scorings:
+        _tr_ref[0] = scorings[0].tech_readiness.overall
+        logger.debug("_tr_ref set to %.2f for %s", _tr_ref[0], company_name)
 
     # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
