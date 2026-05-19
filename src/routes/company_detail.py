@@ -382,10 +382,28 @@ TAM 2035: ${tam.get('tam_usd_bn',100)}B"""
 
 # ── Yahoo Finance ─────────────────────────────────────────────────────────────
 
+# Exchange → Yahoo-Suffix Mapping für internationale Börsen
+_EXCHANGE_SUFFIX: dict[str, str] = {
+    "xetra": ".DE", "frankfurt": ".F", "fse": ".F",
+    "euronext": ".PA", "euronext paris": ".PA", "euronext amsterdam": ".AS",
+    "london": ".L", "lse": ".L",
+    "swiss": ".SW", "six": ".SW",
+    "bmv": ".MX", "milan": ".MI",
+    "tsx": ".TO", "asx": ".AX",
+    "hkex": ".HK", "tokyo": ".T",
+}
+
 async def _fetch_yahoo(ticker: str | None) -> dict:
     if not ticker:
         return {}
-    symbol = ticker.split("·")[0].split("→")[-1].strip()
+    parts = ticker.split("·")
+    symbol = parts[0].split("→")[-1].strip()
+    # Exchange-Suffix ergänzen wenn kein Punkt im Symbol (kein US-Ticker)
+    if len(parts) > 1 and "." not in symbol:
+        exchange_key = parts[1].strip().lower()
+        suffix = _EXCHANGE_SUFFIX.get(exchange_key, "")
+        if suffix:
+            symbol = symbol + suffix
     try:
         async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as client:
             cr = await client.get(
