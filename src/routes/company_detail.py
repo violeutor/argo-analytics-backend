@@ -520,7 +520,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
     market_data_cached = fetch_market_data(company_id) if company_id else None
     # Leere Row (nur company_id, alle Felder NULL) gilt nicht als befüllt
-    _market_data_valid = bool(market_data_cached and market_data_cached.get("enriched_at"))
+    _market_data_valid = bool(
+        market_data_cached
+        and market_data_cached.get("enriched_at")
+        and market_data_cached.get("growth_drivers")  # leer = Fallback-Run, neu anreichern
+    )
     if company_id and not _market_data_valid:
         async def _market_enrichment_bg():
             try:
