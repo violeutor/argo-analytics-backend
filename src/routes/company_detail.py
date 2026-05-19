@@ -217,6 +217,9 @@ def _resolve_is_listed(company: dict) -> bool:
         return True
     if company.get("ipo_potential") == "IPO erfolgt":
         return True
+    # Fallback: eigener Ticker in DB gesetzt → Company ist selbst börsennotiert
+    if company.get("ticker"):
+        return True
     return False
 
 
