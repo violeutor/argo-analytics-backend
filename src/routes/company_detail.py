@@ -523,7 +523,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     _market_data_valid = bool(
         market_data_cached
         and market_data_cached.get("enriched_at")
-        and market_data_cached.get("growth_drivers")  # leer = Fallback-Run, neu anreichern
+        and market_data_cached.get("sam_usd_bn")  # SAM wird immer berechnet — zuverlässigstes Vollständigkeits-Signal
     )
     if company_id and not _market_data_valid:
         async def _market_enrichment_bg():
