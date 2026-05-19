@@ -737,7 +737,7 @@ JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
                     "anthropic-version": "2023-06-01",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 80,
                     "messages": [{"role": "user", "content": prompt}],
                 },
