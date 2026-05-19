@@ -547,7 +547,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 logger.info("Market enrichment done for %s", company_name)
             except Exception as e:
                 set_enrichment_status(company_id, "error")
-                logger.warning("Market enrichment failed for %s: %s", company_name, e)
+                logger.exception("Market enrichment TRACEBACK for %s", company_name)
 
         background_tasks.add_task(_market_enrichment_bg)
         logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)

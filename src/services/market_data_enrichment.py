@@ -21,6 +21,7 @@ import re
 from datetime import datetime, timezone
 
 import httpx
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +77,13 @@ Rules:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 600,
                     "messages": [{"role": "user", "content": prompt}],
                 },

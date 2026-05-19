@@ -176,7 +176,7 @@ def upsert_market_data(company_id: str, data: dict) -> None:
 
     try:
         db.table("market_data").upsert(payload, on_conflict="company_id").execute()
-        logger.debug("upsert_market_data OK: %s → %s", company_id, list(payload.keys()))
+        logger.warning("upsert_market_data OK: %s → %s", company_id, list(payload.keys()))
     except Exception as e:
         logger.warning("upsert_market_data FAILED for %s: %s", company_id, e)
 
