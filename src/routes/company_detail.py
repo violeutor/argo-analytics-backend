@@ -519,7 +519,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     _tr_ref: list[float | None] = [None]
 
     market_data_cached = fetch_market_data(company_id) if company_id else None
-    if company_id and not market_data_cached:
+    # Leere Row (nur company_id, alle Felder NULL) gilt nicht als befüllt
+    _market_data_valid = bool(market_data_cached and market_data_cached.get("enriched_at"))
+    if company_id and not _market_data_valid:
         async def _market_enrichment_bg():
             try:
                 set_enrichment_status(company_id, "running")
