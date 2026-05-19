@@ -1,16 +1,17 @@
 """
-Ownership Enrichment Pipeline — v1.0
+Ownership Enrichment Pipeline — v1.1
 =====================================
 Befüllt ownership_entries-Tabelle für jede Company vollautomatisch.
 
 Pipelines:
-  EN-02  SEC EDGAR Form D (US) → Investoren + Funding-Runden
-  EN-01  OpenRegister.de API (DE) → Gesellschafter, UBO, Kapitalstruktur
+  EN-02  SEC EDGAR Form D + SC 13G/13D (US) → Investoren
+  EN-01  Wikipedia Management-Extraktion (DE) → Gründer + Management
+         North Data (DE) → Gesellschafter/UBO — aktivieren wenn Revenue steht
   CAP    compute_cap_table_score() → Komplexitäts-Score on-demand
 
 Quellen:
-  - EDGAR:         efts.sec.gov/LATEST/search-index?...  (kostenlos, strukturiert)
-  - OpenRegister:  api.openregister.de (Free Tier, kein CC required)
+  - EDGAR:     efts.sec.gov/LATEST/search-index (kostenlos, strukturiert)
+  - Wikipedia: REST API (kostenlos, kein Key) — Infobox + Summary für DE-Mgmt
 
 Trigger: company_detail.py Background-Task bei One-Click oder erstem Tab-2-Aufruf.
 Persistenz: ownership_entries-Tabelle (migration_009, deployed).
@@ -19,7 +20,7 @@ Persistenz: ownership_entries-Tabelle (migration_009, deployed).
 import asyncio
 import logging
 import re
-from datetime import date, datetime
+from datetime import datetime
 
 import httpx
 
@@ -171,103 +172,172 @@ async def _edgar_fulltext_investors(company_name: str) -> list[dict]:
     return results
 
 
-# ── EN-01 · OpenRegister.de (DE) ─────────────────────────────────────────────
+# ── EN-01 · Wikipedia Management-Extraktion (DE) ─────────────────────────────
 
-OPENREGISTER_BASE = "https://api.openregister.de/v1"
+WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+WIKIPEDIA_REST = "https://en.wikipedia.org/api/rest_v1/page/summary"
+
+# Wikitext-Patterns für Management/Founder-Felder
+_WIKI_PEOPLE_FIELDS = [
+    "founder", "founders", "key_people", "chairman", "ceo",
+    "president", "director", "directors", "board_member",
+    "geschäftsführer", "gründer", "vorstand",
+]
 
 
-async def _fetch_openregister(company_name: str, api_key: str | None = None) -> list[dict]:
+async def _fetch_wikipedia_management(company_name: str) -> list[dict]:
     """
-    OpenRegister.de API — primäre DE-Quelle für Gesellschafter + UBO.
-    Free Tier: kein CC, API-Key via Registrierung.
-    Felder: shareholders, managing_directors, legal_form, registered_capital
+    EN-01 Fallback: Extrahiert Gründer + Management aus Wikipedia-Infobox.
+    Kostenlos, kein Key, kein Rate Limit für normale Nutzung.
 
-    Endpoint: GET /v1/companies/search?q={name}
-    Detail:   GET /v1/companies/{id}/shareholders
+    Strategie:
+      1. Wikipedia REST Summary → prüfen ob Infobox-Daten im Wikitext
+      2. MediaWiki API → Wikitext der Seite
+      3. Regex auf Infobox-Felder: founder, key_people, chairman, ceo etc.
+      4. Namen normalisieren + als ownership_entries zurückgeben
     """
     results: list[dict] = []
 
-    headers = {**HEADERS}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
     try:
-        async with httpx.AsyncClient(timeout=12, headers=headers) as client:
-            # Schritt 1: Company suchen
+        async with httpx.AsyncClient(timeout=12, headers={
+            "User-Agent": "ArgoAnalytics/1.0 (investment intelligence; contact@argo-analytics.io)",
+            "Accept": "application/json",
+        }) as client:
+
+            # Schritt 1: Seite finden via MediaWiki search
             search_resp = await client.get(
-                f"{OPENREGISTER_BASE}/companies/search",
-                params={"q": company_name, "country": "DE", "limit": 3},
+                WIKIPEDIA_API,
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": company_name,
+                    "srlimit": 3,
+                    "format": "json",
+                },
             )
-
-            if search_resp.status_code == 401:
-                logger.debug("OpenRegister: API key required for %s", company_name)
-                return []
             if search_resp.status_code != 200:
-                logger.debug("OpenRegister search HTTP %s for %s", search_resp.status_code, company_name)
                 return []
 
-            companies = search_resp.json().get("data", [])
-            if not companies:
-                logger.debug("OpenRegister: no match for %s", company_name)
+            search_results = search_resp.json().get("query", {}).get("search", [])
+            if not search_results:
+                logger.debug("Wikipedia: no results for %s", company_name)
                 return []
 
-            # Besten Treffer nehmen (erster = relevantester)
-            company = companies[0]
-            company_id = company.get("id")
-            legal_form = company.get("legal_form", "")
-            registered_capital = company.get("registered_capital")
+            # Besten Treffer nehmen — Titel muss Company-Name enthalten
+            page_title = None
+            for r in search_results:
+                title = r.get("title", "")
+                if any(w.lower() in title.lower() for w in company_name.split()):
+                    page_title = title
+                    break
+            if not page_title:
+                page_title = search_results[0].get("title", "")
 
-            if not company_id:
-                return []
-
-            # Schritt 2: Gesellschafter abrufen
-            sh_resp = await client.get(
-                f"{OPENREGISTER_BASE}/companies/{company_id}/shareholders",
+            # Schritt 2: Wikitext holen
+            wikitext_resp = await client.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query",
+                    "titles": page_title,
+                    "prop": "revisions",
+                    "rvprop": "content",
+                    "rvslots": "main",
+                    "format": "json",
+                },
             )
+            if wikitext_resp.status_code != 200:
+                return []
 
-            if sh_resp.status_code == 200:
-                shareholders = sh_resp.json().get("data", [])
-                for sh in shareholders[:10]:
-                    name = sh.get("name", "")
-                    if not name:
-                        continue
-                    share_pct = sh.get("share_percentage")
-                    sh_type = sh.get("type", "")  # 'person' | 'company'
-
-                    results.append({
-                        "name": name,
-                        "type": "individual" if sh_type == "person" else "corporate",
-                        "role": "shareholder",
-                        "share_pct": float(share_pct) if share_pct else None,
-                        "source": "openregister_de",
-                        "as_of_date": sh.get("as_of_date") or str(date.today()),
-                        "notes": f"{legal_form}" + (f" · Kapital: €{registered_capital:,.0f}" if registered_capital else ""),
-                    })
-
-            # Schritt 3: Geschäftsführer
-            mgmt_resp = await client.get(
-                f"{OPENREGISTER_BASE}/companies/{company_id}/managing-directors",
+            pages = wikitext_resp.json().get("query", {}).get("pages", {})
+            page = next(iter(pages.values()), {})
+            wikitext = (
+                page.get("revisions", [{}])[0]
+                .get("slots", {}).get("main", {})
+                .get("*", "")
             )
-            if mgmt_resp.status_code == 200:
-                directors = mgmt_resp.json().get("data", [])
-                for d in directors[:5]:
-                    name = d.get("name", "")
-                    if not name:
-                        continue
-                    results.append({
-                        "name": name,
-                        "type": "individual",
-                        "role": "managing_director",
-                        "share_pct": None,
-                        "source": "openregister_de",
-                        "as_of_date": str(date.today()),
-                        "notes": d.get("position", "Geschäftsführer"),
-                    })
+            if not wikitext:
+                return []
 
+            # Schritt 3: Infobox-Felder extrahieren
+            results.extend(_parse_infobox_people(wikitext, company_name))
+
+    except asyncio.TimeoutError:
+        logger.debug("Wikipedia timeout for %s", company_name)
     except Exception as e:
-        logger.debug("OpenRegister fetch failed for %s: %s", company_name, e)
+        logger.debug("Wikipedia management fetch failed for %s: %s", company_name, e)
 
     return results
+
+
+def _parse_infobox_people(wikitext: str, company_name: str) -> list[dict]:
+    """
+    Extrahiert Personen aus Wikipedia-Infobox-Feldern.
+    Patterns: | founder = [[Name]] oder | key_people = Name (Role)
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    for field in _WIKI_PEOPLE_FIELDS:
+        # Infobox-Zeile: | field = value (bis zur nächsten Zeile mit |)
+        pattern = rf"\|\s*{field}\s*=\s*([^\|{{}}]+?)(?=\n\s*\||\n\s*}}}})"
+        matches = re.findall(pattern, wikitext, re.IGNORECASE | re.DOTALL)
+
+        for match in matches:
+            # Wiki-Links entfernen: [[Name|Display]] → Display oder Name
+            text = re.sub(r"\[\[(?:[^\|\]]*\|)?([^\]]+)\]\]", r"\1", match)
+            # HTML + Refs raus
+            text = re.sub(r"<[^>]+>", "", text)
+            text = re.sub(r"\{\{[^}]+\}\}", "", text)  # Templates
+            text = re.sub(r"'''?", "", text)           # Bold/italic
+            text = text.strip()
+
+            # Mehrere Namen (durch <br>, Komma, Newline getrennt)
+            names_raw = re.split(r"[,\n]|<br\s*/?>", text)
+
+            for raw in names_raw:
+                # Klammern-Inhalt = Rolle
+                role_match = re.search(r"\(([^)]+)\)", raw)
+                role_hint = role_match.group(1).strip() if role_match else None
+                name = re.sub(r"\([^)]*\)", "", raw).strip()
+                name = re.sub(r"\s+", " ", name).strip()
+
+                # Qualitätsfilter: nur echte Namen (mind. 2 Wörter oder bekannte Struktur)
+                if not name or len(name) < 3 or name.lower() == company_name.lower():
+                    continue
+                # Keine Jahreszahlen, keine reinen Zahlen
+                if re.match(r"^\d+$", name) or re.search(r"\b(19|20)\d{2}\b", name):
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+
+                # Rolle aus Feldname ableiten wenn keine explizite Rolle
+                role = role_hint or _role_from_field(field)
+
+                results.append({
+                    "name": name,
+                    "type": "individual",
+                    "role": role,
+                    "share_pct": None,
+                    "source": "wikipedia_infobox",
+                    "as_of_date": None,
+                    "notes": f"Wikipedia: {field}",
+                })
+
+    return results[:10]  # Max 10 Einträge aus Wikipedia
+
+
+def _role_from_field(field: str) -> str:
+    """Mappt Infobox-Feldname auf strukturierte Rolle."""
+    mapping = {
+        "founder": "founder", "founders": "founder",
+        "ceo": "ceo", "chairman": "chairman", "president": "president",
+        "key_people": "key_person", "director": "board_member",
+        "directors": "board_member", "board_member": "board_member",
+        "geschäftsführer": "managing_director", "gründer": "founder",
+        "vorstand": "board_member",
+    }
+    return mapping.get(field.lower(), "key_person")
 
 
 # ── Klassifizierung ───────────────────────────────────────────────────────────
@@ -369,17 +439,21 @@ async def enrich_ownership(
     company: dict,
     existing_entries: list[dict],
     funding_rounds: list[dict],
-    openregister_api_key: str | None = None,
+    openregister_api_key: str | None = None,  # reserviert für North Data (Phase 3)
 ) -> dict:
     """
     Vollständige Ownership Enrichment Pipeline.
     Wird async aufgerufen — non-blocking.
 
+    US: EDGAR Form D + SC 13G/13D
+    DE: Wikipedia Infobox (Gründer, Management) — North Data wenn Revenue steht
+
     Returns:
       {
         "entries": list[dict],        # neue ownership_entries zum Upsert
         "cap_table": dict,            # Cap Table Score
-        "source_used": str,           # "edgar" | "openregister" | "none"
+        "source_used": str,           # "edgar" | "wikipedia" | "none"
+        "region": str,
         "enriched_at": str,
       }
     """
@@ -409,22 +483,23 @@ async def enrich_ownership(
             logger.debug("EDGAR failed for %s: %s", company_name, e)
 
     elif region == "DE":
-        # EN-01: OpenRegister
-        logger.info("Ownership enrichment via OpenRegister for %s (DE)", company_name)
+        # EN-01: Wikipedia Management-Extraktion
+        # North Data (Gesellschafter/UBO) → aktivieren wenn Revenue steht
+        logger.info("Ownership enrichment via Wikipedia for %s (DE)", company_name)
         try:
-            or_entries = await asyncio.wait_for(
-                _fetch_openregister(company_name, openregister_api_key), timeout=15.0
+            wiki_entries = await asyncio.wait_for(
+                _fetch_wikipedia_management(company_name), timeout=15.0
             )
-            for e in or_entries:
+            for e in wiki_entries:
                 if e.get("name", "").lower() not in existing_names:
                     new_entries.append(e)
                     existing_names.add(e.get("name", "").lower())
             if new_entries:
-                source_used = "openregister"
+                source_used = "wikipedia"
         except asyncio.TimeoutError:
-            logger.debug("OpenRegister timeout for %s", company_name)
+            logger.debug("Wikipedia timeout for %s", company_name)
         except Exception as e:
-            logger.debug("OpenRegister failed for %s: %s", company_name, e)
+            logger.debug("Wikipedia failed for %s: %s", company_name, e)
 
     # Cap Table Score — aus allen Einträgen (existing + new)
     all_entries = existing_entries + new_entries
