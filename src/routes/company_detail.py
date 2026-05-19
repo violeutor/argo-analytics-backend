@@ -424,14 +424,26 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
         if suffix:
             symbol = symbol + suffix
     try:
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=12, headers=headers, follow_redirects=True) as client:
             cr = await client.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
             )
+            # v8 quoteSummary — zuverlässiger für internationale Ticker
             sr = await client.get(
-                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                "?modules=summaryDetail,financialData,defaultKeyStatistics"
+                f"https://query1.finance.yahoo.com/v8/finance/quoteSummary/{symbol}"
+                "?modules=summaryDetail%2CfinancialData%2CdefaultKeyStatistics"
             )
+            # Fallback auf v11 wenn v8 leer
+            if sr.status_code != 200 or not sr.json().get("quoteSummary", {}).get("result"):
+                sr = await client.get(
+                    f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{symbol}"
+                    "?modules=summaryDetail,financialData,defaultKeyStatistics"
+                )
         meta = {}
         if cr.status_code == 200:
             meta = cr.json().get("chart",{}).get("result",[{}])[0].get("meta",{})
@@ -473,6 +485,16 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
                 out["ev_revenue"] = round(ev_raw / 1e9 / out["revenue_bn"], 1)
             if ev_raw and out.get("ebitda_bn"):
                 out["ev_ebitda"]  = round(ev_raw / 1e9 / out["ebitda_bn"], 1)
+            logger.warning(
+                "YAHOO_DEBUG %s — margin=%.1f%% rev_growth=%.1f%% fcf=%s ev=%s",
+                symbol,
+                out.get("gross_margin_pct") or 0,
+                out.get("revenue_growth_pct") or 0,
+                out.get("free_cashflow_bn"),
+                out.get("enterprise_value_bn"),
+            )
+        else:
+            logger.warning("YAHOO_DEBUG %s — quoteSummary HTTP %s", symbol, sr.status_code)
         return out
     except Exception as e:
         logger.warning("Yahoo Finance failed for %s: %s", symbol, e)
