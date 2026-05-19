@@ -27,6 +27,8 @@ from src.integrations.supabase import (
     fetch_market_data,
     upsert_market_data,
     set_enrichment_status,
+    fetch_value_drivers,
+    upsert_value_drivers,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.tam import get_tam
@@ -34,6 +36,7 @@ from src.services.market_data_enrichment import (
     enrich_market_data,
     enrich_market_data_sync_wrapper,
 )
+from src.services.value_drivers_enrichment import enrich_value_drivers
 from src.pipelines.scoring import compute_scores, compute_auto_tech_readiness
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
@@ -887,6 +890,25 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
     sc = get_supply_chain(sc_tags)
+
+    # 10b. Value Drivers — Background-Enrichment wenn noch nicht in DB
+    if company_id and sc_tags:
+        vd_cached = fetch_value_drivers(company_id)
+        if not vd_cached:
+            async def _value_drivers_bg():
+                try:
+                    vd_result = await enrich_value_drivers(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        tags=sc_tags,
+                    )
+                    upsert_value_drivers(company_id, vd_result)
+                    logger.info("Value drivers enrichment done for %s", company_name)
+                except Exception:
+                    logger.exception("Value drivers enrichment FAILED for %s", company_name)
+            background_tasks.add_task(_value_drivers_bg)
+            logger.info("Value drivers enrichment queued for %s", company_name)
 
     if tam.get("method") == "fallback":
         warnings.append("TAM uses sector median fallback — verify with primary source.")

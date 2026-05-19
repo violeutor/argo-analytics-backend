@@ -191,6 +191,59 @@ def set_enrichment_status(company_id: str, status: str) -> None:
         logger.warning("set_enrichment_status FAILED for %s: %s", company_id, e)
 
 
+# ── Value Drivers ────────────────────────────────────────────────────────────
+
+def fetch_value_drivers(company_id: str) -> dict | None:
+    """
+    Gibt Value Drivers aus value_drivers-Tabelle zurück.
+    Erwartet eine Row mit JSONB-Feldern: enablers, contributors, etfs, enriched_at.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("value_drivers").select(
+            "enablers, contributors, etfs, enriched_at"
+        ).eq("company_id", company_id).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_value_drivers failed for %s: %s", company_id, e)
+        return None
+
+
+def upsert_value_drivers(company_id: str, data: dict) -> None:
+    """
+    Persistiert Value Drivers in value_drivers-Tabelle (INSERT OR UPDATE).
+
+    Erwartet:
+      data = {
+        "enablers":     [...],   # Liste von Enabler-Dicts
+        "contributors": [...],   # Liste von Contributor-Dicts
+        "etfs":         [...],   # Liste von ETF-Dicts
+      }
+    """
+    import json
+    from datetime import datetime, timezone
+
+    db = get_supabase()
+    payload = {
+        "company_id":   company_id,
+        "enablers":     json.dumps(data.get("enablers", [])),
+        "contributors": json.dumps(data.get("contributors", [])),
+        "etfs":         json.dumps(data.get("etfs", [])),
+        "enriched_at":  datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        db.table("value_drivers").upsert(payload, on_conflict="company_id").execute()
+        logger.info(
+            "upsert_value_drivers OK: %s → %d enablers, %d contributors, %d etfs",
+            company_id,
+            len(data.get("enablers", [])),
+            len(data.get("contributors", [])),
+            len(data.get("etfs", [])),
+        )
+    except Exception as e:
+        logger.warning("upsert_value_drivers FAILED for %s: %s", company_id, e)
+
+
 # ── Deals ────────────────────────────────────────────────────────────────────
 
 def insert_deal(request, company_id: str | None, buyer_id: str | None) -> str:
