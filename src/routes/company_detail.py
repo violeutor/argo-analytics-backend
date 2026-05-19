@@ -412,32 +412,56 @@ def _pct(v: float | None) -> float | None:
     return round(v * 100, 1) if v is not None else None
 
 
+async def _get_yahoo_crumb(client: httpx.AsyncClient) -> tuple[str | None, dict]:
+    """
+    Holt Yahoo Finance Session-Cookie + Crumb für authentifizierte API-Calls.
+    Nötig für quoteSummary seit Yahoo's Auth-Änderung 2024.
+    """
+    try:
+        # Schritt 1: Session-Cookie holen
+        await client.get(
+            "https://fc.yahoo.com",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        # Schritt 2: Crumb holen
+        crumb_resp = await client.get(
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if crumb_resp.status_code == 200:
+            crumb = crumb_resp.text.strip()
+            return crumb, dict(client.cookies)
+    except Exception as e:
+        logger.debug("Yahoo crumb fetch failed: %s", e)
+    return None, {}
+
+
 async def _fetch_yahoo(ticker: str | None) -> dict:
     if not ticker:
         return {}
     parts = ticker.split("·")
     symbol = parts[0].split("→")[-1].strip()
-    # Exchange-Suffix ergänzen wenn kein Punkt im Symbol (kein US-Ticker)
     if len(parts) > 1 and "." not in symbol:
         exchange_key = parts[1].strip().lower()
         suffix = _EXCHANGE_SUFFIX.get(exchange_key, "")
         if suffix:
             symbol = symbol + suffix
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        timeout = httpx.Timeout(6.0, connect=3.0)  # aggressiv — hängende Calls töten
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            # Beide Calls parallel
-            cr, sr = await asyncio.gather(
-                client.get(
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
-                ),
-                client.get(
-                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                    "?modules=summaryDetail,financialData,defaultKeyStatistics"
-                ),
-                return_exceptions=True,
+        timeout = httpx.Timeout(8.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            # Crumb holen + Chart-Call parallel
+            crumb, _ = await _get_yahoo_crumb(client)
+            cr = await client.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
             )
+            # quoteSummary mit Crumb wenn vorhanden
+            qs_url = (
+                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                f"?modules=summaryDetail,financialData,defaultKeyStatistics"
+                + (f"&crumb={crumb}" if crumb else "")
+            )
+            sr = await client.get(qs_url)
+
         # Chart — Preis + Marktcap
         meta = {}
         if not isinstance(cr, Exception) and cr.status_code == 200:
@@ -490,7 +514,7 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             )
         else:
             sr_status = sr.status_code if not isinstance(sr, Exception) else repr(sr)
-            logger.warning("YAHOO_DEBUG %s — quoteSummary HTTP %s", symbol, sr_status)
+            logger.warning("YAHOO_DEBUG %s — quoteSummary HTTP %s crumb=%s", symbol, sr_status, bool(crumb))
         return out
     except Exception as e:
         logger.warning("Yahoo Finance failed for %s: %s", symbol, e)
