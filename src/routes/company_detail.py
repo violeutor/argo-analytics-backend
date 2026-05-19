@@ -457,7 +457,7 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             # quoteSummary mit Crumb wenn vorhanden
             qs_url = (
                 f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                f"?modules=summaryDetail,financialData,defaultKeyStatistics"
+                f"?modules=summaryDetail,financialData,defaultKeyStatistics,price"
                 + (f"&crumb={crumb}" if crumb else "")
             )
             sr = await client.get(qs_url)
@@ -478,6 +478,13 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             det = res.get("summaryDetail",{})
             fin = res.get("financialData",{})
             ks  = res.get("defaultKeyStatistics",{})
+            prc = res.get("price",{})
+            # Marktcap: price-Modul ist zuverlässiger für internationale Ticker
+            mc_raw = (prc.get("marketCap",{}).get("raw")
+                      or det.get("marketCap",{}).get("raw")
+                      or meta.get("marketCap"))
+            if mc_raw:
+                out["market_cap_bn"] = mc_raw / 1e9
             out["pe_ratio"]     = det.get("trailingPE",{}).get("raw")
             out["week_52_high"] = det.get("fiftyTwoWeekHigh",{}).get("raw")
             out["week_52_low"]  = det.get("fiftyTwoWeekLow",{}).get("raw")
