@@ -490,6 +490,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 2. is_listed — robust (B-05)
     is_listed = _resolve_is_listed(company)
     proxy = company.get("proxy_ticker")
+    logger.warning("TICKER_DEBUG %s — ticker=%s exchange=%s proxy_ticker=%s is_listed=%s", company_name, company.get("ticker"), company.get("exchange"), proxy, is_listed)
 
     # Für selbst-börsennotierte Companies (is_listed, kein proxy_ticker):
     # eigenen Ticker aus companies.ticker verwenden → Yahoo Finance Lookup
