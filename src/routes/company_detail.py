@@ -81,6 +81,20 @@ class FundamentalsData(BaseModel):
     week_52_high: float | None = None
     week_52_low: float | None = None
     currency: str | None = None
+    # Margen (%)
+    gross_margin_pct: float | None = None
+    operating_margin_pct: float | None = None
+    profit_margin_pct: float | None = None
+    # Growth
+    revenue_growth_pct: float | None = None
+    earnings_growth_pct: float | None = None
+    # Cashflow
+    free_cashflow_bn: float | None = None
+    operating_cashflow_bn: float | None = None
+    # Multiples (berechnet)
+    ev_revenue: float | None = None
+    ev_ebitda: float | None = None
+    enterprise_value_bn: float | None = None
     # Bundesanzeiger (private DE)
     ba_found: bool = False
     ba_legal_form: str | None = None
@@ -393,6 +407,11 @@ _EXCHANGE_SUFFIX: dict[str, str] = {
     "hkex": ".HK", "tokyo": ".T",
 }
 
+def _pct(v: float | None) -> float | None:
+    """Konvertiert Yahoo-Dezimalwert (0.23) → Prozent (23.0), None wenn fehlt."""
+    return round(v * 100, 1) if v is not None else None
+
+
 async def _fetch_yahoo(ticker: str | None) -> dict:
     if not ticker:
         return {}
@@ -411,7 +430,7 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             )
             sr = await client.get(
                 f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                "?modules=summaryDetail,financialData"
+                "?modules=summaryDetail,financialData,defaultKeyStatistics"
             )
         meta = {}
         if cr.status_code == 200:
@@ -427,6 +446,7 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             res = sr.json().get("quoteSummary",{}).get("result",[{}])[0]
             det = res.get("summaryDetail",{})
             fin = res.get("financialData",{})
+            ks  = res.get("defaultKeyStatistics",{})
             out["pe_ratio"]     = det.get("trailingPE",{}).get("raw")
             out["week_52_high"] = det.get("fiftyTwoWeekHigh",{}).get("raw")
             out["week_52_low"]  = det.get("fiftyTwoWeekLow",{}).get("raw")
@@ -434,6 +454,25 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             out["ebitda_bn"]    = (fin.get("ebitda",{}).get("raw") or 0) / 1e9 or None
             if out.get("ebitda_bn") and fin.get("totalDebt",{}).get("raw"):
                 out["debt_ebitda"] = (fin["totalDebt"]["raw"]/1e9) / out["ebitda_bn"]
+            # Margen
+            out["gross_margin_pct"]     = _pct(fin.get("grossMargins",{}).get("raw"))
+            out["operating_margin_pct"] = _pct(fin.get("operatingMargins",{}).get("raw"))
+            out["profit_margin_pct"]    = _pct(fin.get("profitMargins",{}).get("raw"))
+            # Growth
+            out["revenue_growth_pct"]   = _pct(fin.get("revenueGrowth",{}).get("raw"))
+            out["earnings_growth_pct"]  = _pct(fin.get("earningsGrowth",{}).get("raw"))
+            # Cashflow
+            fcf_raw = fin.get("freeCashflow",{}).get("raw")
+            ocf_raw = fin.get("operatingCashflow",{}).get("raw")
+            out["free_cashflow_bn"]     = fcf_raw / 1e9 if fcf_raw else None
+            out["operating_cashflow_bn"]= ocf_raw / 1e9 if ocf_raw else None
+            # Enterprise Value + Multiples
+            ev_raw = ks.get("enterpriseValue",{}).get("raw")
+            out["enterprise_value_bn"]  = ev_raw / 1e9 if ev_raw else None
+            if ev_raw and out.get("revenue_bn"):
+                out["ev_revenue"] = round(ev_raw / 1e9 / out["revenue_bn"], 1)
+            if ev_raw and out.get("ebitda_bn"):
+                out["ev_ebitda"]  = round(ev_raw / 1e9 / out["ebitda_bn"], 1)
         return out
     except Exception as e:
         logger.warning("Yahoo Finance failed for %s: %s", symbol, e)
@@ -455,6 +494,16 @@ def _build_fundamentals(
             revenue_bn=yahoo.get("revenue_bn"), ebitda_bn=yahoo.get("ebitda_bn"),
             debt_ebitda=yahoo.get("debt_ebitda"), week_52_high=yahoo.get("week_52_high"),
             week_52_low=yahoo.get("week_52_low"), currency=yahoo.get("currency"),
+            gross_margin_pct=yahoo.get("gross_margin_pct"),
+            operating_margin_pct=yahoo.get("operating_margin_pct"),
+            profit_margin_pct=yahoo.get("profit_margin_pct"),
+            revenue_growth_pct=yahoo.get("revenue_growth_pct"),
+            earnings_growth_pct=yahoo.get("earnings_growth_pct"),
+            free_cashflow_bn=yahoo.get("free_cashflow_bn"),
+            operating_cashflow_bn=yahoo.get("operating_cashflow_bn"),
+            ev_revenue=yahoo.get("ev_revenue"),
+            ev_ebitda=yahoo.get("ev_ebitda"),
+            enterprise_value_bn=yahoo.get("enterprise_value_bn"),
         )
     fd = FundamentalsData(is_listed=False)
     if ba and ba.found:
