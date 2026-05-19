@@ -73,17 +73,23 @@ Rules:
 - If data not available, return empty arrays/null values — never invent numbers
 """
     try:
+        from src.config import settings
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 600,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
         if resp.status_code != 200:
+            logger.warning("Claude market details HTTP %s for %s: %s", resp.status_code, company, resp.text[:200])
             return {}
         raw = resp.json()["content"][0]["text"].strip()
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
