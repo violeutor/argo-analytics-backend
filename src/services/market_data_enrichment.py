@@ -455,6 +455,19 @@ async def enrich_market_data(
     if market_details.get("cagr_pct"):
         result["cagr_pct"] = market_details["cagr_pct"]
 
+    # CAGR-Hochrechnung — Fallback wenn MD-B01 keinen CAGR geliefert hat
+    if not result.get("cagr_pct"):
+        from src.services.tam import compute_cagr
+        cagr_data = compute_cagr(sector, tam_usd_bn)
+        result["cagr_pct"]        = cagr_data["cagr_pct"]
+        result["cagr_source"]     = cagr_data["cagr_source"]
+        result["cagr_confidence"] = cagr_data["cagr_confidence"]
+        logger.debug(
+            "CAGR fallback for %s: %.1f%% (%s, %s)",
+            company_name, cagr_data["cagr_pct"],
+            cagr_data["cagr_source"], cagr_data["cagr_confidence"],
+        )
+
     geo_scope = market_details.get("geo_scope", "global")
 
     # ── 3. Regionale Verteilung — World Bank (MD-B02) ────────────────────────

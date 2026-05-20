@@ -67,6 +67,108 @@ CURATED_TAM: dict[str, dict] = {
     "water-tech":              {"tam_usd_bn": 40,   "source": "Global Water Intelligence 2024",            "confidence": "medium"},
 }
 
+# ── Curated CAGR dataset (%, 2024–2035) ──────────────────────────────────────
+# Konservative Mediane aus BNEF, IEA, McKinsey — gleiche Quellen wie TAM.
+# Ergänzt CURATED_TAM: wenn TAM aus Curated-Dataset kommt, CAGR direkt ablesen.
+
+CURATED_CAGR: dict[str, dict] = {
+    "carbon-capture":          {"cagr_pct": 28.0, "confidence": "high"},
+    "direct-air-capture":      {"cagr_pct": 35.0, "confidence": "high"},
+    "ocean-cdr":               {"cagr_pct": 20.0, "confidence": "medium"},
+    "low-carbon-cement":       {"cagr_pct": 12.0, "confidence": "high"},
+    "sustainable-materials":   {"cagr_pct": 10.0, "confidence": "medium"},
+    "battery":                 {"cagr_pct": 18.0, "confidence": "high"},
+    "long-duration-storage":   {"cagr_pct": 32.0, "confidence": "high"},
+    "solid-state-battery":     {"cagr_pct": 38.0, "confidence": "medium"},
+    "grid":                    {"cagr_pct": 9.0,  "confidence": "high"},
+    "solar":                   {"cagr_pct": 14.0, "confidence": "high"},
+    "hydrogen":                {"cagr_pct": 22.0, "confidence": "high"},
+    "geothermal":              {"cagr_pct": 11.0, "confidence": "high"},
+    "waste-to-energy":         {"cagr_pct": 7.0,  "confidence": "medium"},
+    "agritech":                {"cagr_pct": 13.0, "confidence": "high"},
+    "bioengineering":          {"cagr_pct": 16.0, "confidence": "medium"},
+    "soil-carbon":             {"cagr_pct": 24.0, "confidence": "medium"},
+    "co2-to-fuels":            {"cagr_pct": 26.0, "confidence": "high"},
+    "bio-based-chemicals":     {"cagr_pct": 11.0, "confidence": "medium"},
+    "datacenter-cooling":      {"cagr_pct": 15.0, "confidence": "medium"},
+    "ai-grid-software":        {"cagr_pct": 19.0, "confidence": "medium"},
+    "climate-risk-saas":       {"cagr_pct": 21.0, "confidence": "medium"},
+    "carbon-credits":          {"cagr_pct": 29.0, "confidence": "high"},
+    "irrigation":              {"cagr_pct": 8.0,  "confidence": "medium"},
+    "water-tech":              {"cagr_pct": 7.5,  "confidence": "medium"},
+}
+
+# Marktgröße heute (2024, USD Bn) — für mathematische CAGR-Hochrechnung als Fallback
+# CAGR = (TAM_2035 / BASE_2024) ^ (1/11) - 1
+MARKET_BASE_2024: dict[str, float] = {
+    "battery":           120.0,
+    "solar":             200.0,
+    "grid":              250.0,
+    "hydrogen":           50.0,
+    "carbon-capture":      5.0,
+    "direct-air-capture":  0.5,
+    "agritech":          100.0,
+    "co2-to-fuels":       15.0,
+    "geothermal":         35.0,
+    "carbon-credits":     20.0,
+}
+
+
+def compute_cagr(
+    sector_tag: str | None,
+    tam_usd_bn: float | None,
+    base_year: int = 2024,
+    target_year: int = 2035,
+) -> dict:
+    """
+    Berechnet CAGR für einen Sektor.
+
+    Priorität:
+    1. CURATED_CAGR — direkt ablesen wenn Sektor bekannt
+    2. Mathematische Hochrechnung: CAGR = (TAM_2035 / BASE_2024)^(1/n) - 1
+       wenn Basiswert in MARKET_BASE_2024 vorhanden
+    3. Konservativer Fallback: 12% (Median Climate Tech)
+
+    Returns:
+      {"cagr_pct": float, "cagr_source": str, "cagr_confidence": str}
+    """
+    n = target_year - base_year  # Anzahl Jahre
+
+    if sector_tag:
+        tag = sector_tag.lower().replace(" ", "-").replace("/", "-")
+
+        # 1. Curated CAGR — exakter Sektor-Match
+        for key, data in CURATED_CAGR.items():
+            if key in tag or tag in key:
+                return {
+                    "cagr_pct":        data["cagr_pct"],
+                    "cagr_source":     f"Curated · {key} (BNEF/IEA/McKinsey)",
+                    "cagr_confidence": data["confidence"],
+                }
+
+        # 2. Mathematische Hochrechnung aus TAM + Basiswert
+        if tam_usd_bn:
+            for key, base in MARKET_BASE_2024.items():
+                if key in tag or tag in key:
+                    try:
+                        cagr = ((tam_usd_bn / base) ** (1 / n) - 1) * 100
+                        cagr = round(min(max(cagr, 0.0), 80.0), 1)  # Cap: 0–80%
+                        return {
+                            "cagr_pct":        cagr,
+                            "cagr_source":     f"Berechnet: ({tam_usd_bn}B / {base}B)^(1/{n}) − 1",
+                            "cagr_confidence": "medium",
+                        }
+                    except Exception:
+                        pass
+
+    # 3. Fallback
+    return {
+        "cagr_pct":        12.0,
+        "cagr_source":     "Climate Tech Median-Fallback (BNEF 2024)",
+        "cagr_confidence": "low",
+    }
+
+
 # ── Google Search Scraper ─────────────────────────────────────────────────────
 
 HEADERS = {
