@@ -734,6 +734,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
         }
+        # EN-06: Ticker + Exchange nur für börsennotierte Companies schreiben
+        # Verhindert dass private Companies versehentlich einen Ticker bekommen
+        if is_listed:
+            if enrichment.ticker and not company.get("ticker"):
+                upsert_payload["ticker"] = enrichment.ticker
+            if enrichment.exchange and not company.get("exchange"):
+                upsert_payload["exchange"] = enrichment.exchange
         # category / industry — erst Tag-Inferenz (aus enrichment), dann Claude-Fallback
         inferred_cat  = enrichment.category
         inferred_ind  = enrichment.industry

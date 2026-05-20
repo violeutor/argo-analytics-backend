@@ -102,6 +102,8 @@ class EnrichmentResult:
     founded_year: str | None = None
     headquarters: str | None = None
     employee_count: str | None = None
+    ticker: str | None = None      # EN-06: Börsen-Ticker aus Wikipedia-Infobox
+    exchange: str | None = None    # EN-06: Börsenplatz aus Wikipedia-Infobox
     category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     crunchbase: CrunchbaseData | None = None
@@ -305,6 +307,46 @@ async def _fetch_wikipedia(company: str) -> dict:
                                     if "." in url and len(url) < 60:
                                         out["website"] = "https://" + url
                                     break
+
+                        # ticker + exchange (EN-06) — nur für listed companies
+                        # Infobox-Felder: traded_as, stock_code, symbol, nasdaq, nyse, …
+                        if not out.get("ticker"):
+                            # Muster 1: | traded_as = {{NASDAQ|FRVO}} oder {{NYSE|CRH}}
+                            m = re.search(
+                                r"\|\s*traded_as\s*=\s*(.*?)(?:\n\||\Z)",
+                                wikitext, re.I | re.S,
+                            )
+                            if m:
+                                block = m.group(1)
+                                # {{EXCHANGE|TICKER}} — z.B. {{Nasdaq|FRVO}}
+                                tm = re.search(
+                                    r"\{\{(NYSE|Nasdaq|NASDAQ|LSE|Euronext|BMV|Frankfurt|Xetra|SIX|TSX|ASX)\s*\|\s*([A-Z0-9\.\-]{1,12})\}\}",
+                                    block, re.I,
+                                )
+                                if tm:
+                                    out["exchange"] = tm.group(1).upper()
+                                    out["ticker"]   = tm.group(2).upper()
+
+                        # Muster 2: | symbol = FRVO  (einfaches Feld ohne Exchange-Template)
+                        if not out.get("ticker"):
+                            m = re.search(
+                                r"\|\s*(?:stock_symbol|symbol|ticker_symbol|stock_code)\s*=\s*([A-Z0-9\.\-]{1,12})\s*(?:\n|\|)",
+                                wikitext, re.I,
+                            )
+                            if m:
+                                out["ticker"] = m.group(1).strip().upper()
+
+                        # Muster 3: Exchange direkt als Infobox-Feld
+                        if out.get("ticker") and not out.get("exchange"):
+                            m = re.search(
+                                r"\|\s*(?:exchange|stock_exchange|listed_on)\s*=\s*([^\|\n\]]{2,40})",
+                                wikitext, re.I,
+                            )
+                            if m:
+                                raw_ex = re.sub(r"\{\{[^}]+\}\}", "", m.group(1)).strip()
+                                raw_ex = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", raw_ex).strip()
+                                if raw_ex and len(raw_ex) < 30:
+                                    out["exchange"] = raw_ex
             except Exception as e:
                 logger.debug("Wikipedia Wikitext fallback failed for '%s': %s", company, e)
 
@@ -936,6 +978,10 @@ async def enrich_company(
         result.founded_year   = wiki.get("founded_year")
         result.headquarters   = wiki.get("headquarters")
         result.employee_count = wiki.get("employee_count")
+        # EN-06: Ticker + Exchange nur für börsennotierte Companies
+        if is_listed:
+            result.ticker   = wiki.get("ticker")
+            result.exchange = wiki.get("exchange")
 
     if isinstance(cb, CrunchbaseData):
         result.crunchbase     = cb
