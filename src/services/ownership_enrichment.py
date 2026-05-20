@@ -483,23 +483,93 @@ async def enrich_ownership(
             logger.debug("EDGAR failed for %s: %s", company_name, e)
 
     elif region == "DE":
-        # EN-01: Wikipedia Management-Extraktion
-        # North Data (Gesellschafter/UBO) → aktivieren wenn Revenue steht
-        logger.info("Ownership enrichment via Wikipedia for %s (DE)", company_name)
+        # BA-05: BA-Bridge (primär) → Wikipedia (Fallback)
+        # BA-Bridge liefert Gesellschafter + Geschäftsführer aus Bundesanzeiger via Claude NER
+        logger.info("Ownership enrichment via BA-Bridge for %s (DE)", company_name)
+        ba_success = False
         try:
-            wiki_entries = await asyncio.wait_for(
-                _fetch_wikipedia_management(company_name), timeout=15.0
-            )
-            for e in wiki_entries:
-                if e.get("name", "").lower() not in existing_names:
-                    new_entries.append(e)
-                    existing_names.add(e.get("name", "").lower())
-            if new_entries:
-                source_used = "wikipedia"
+            from src.config import settings as argo_settings
+            bridge_url = getattr(argo_settings, "ba_bridge_url", None)
+            bridge_key = getattr(argo_settings, "ba_bridge_api_key", None)
+
+            if bridge_url:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    headers = {"X-API-Key": bridge_key} if bridge_key else {}
+                    resp = await client.get(
+                        f"{bridge_url.rstrip('/')}/ba/company/{company_name}",
+                        headers=headers,
+                    )
+
+                if resp.status_code == 200:
+                    ba_data = resp.json()
+                    # 202 = fetching, noch nicht im Cache → Fallback
+                    if ba_data.get("cached"):
+                        # Gesellschafter
+                        for sh in ba_data.get("shareholders", []):
+                            name = (sh.get("name") or "").strip()
+                            if not name or name.lower() in existing_names:
+                                continue
+                            new_entries.append({
+                                "name":       name,
+                                "type":       "corporate" if sh.get("is_company") else "individual",
+                                "role":       "shareholder",
+                                "share_pct":  sh.get("share_pct"),
+                                "source":     "ba_bridge",
+                                "as_of_date": None,
+                                "notes":      f"Anteil: {sh['share_pct']}%" if sh.get("share_pct") else None,
+                            })
+                            existing_names.add(name.lower())
+
+                        # Geschäftsführer / Aufsichtsrat
+                        for ex in ba_data.get("executives", []):
+                            name = (ex.get("name") or "").strip()
+                            if not name or name.lower() in existing_names:
+                                continue
+                            new_entries.append({
+                                "name":       name,
+                                "type":       "individual",
+                                "role":       ex.get("role", "executive"),
+                                "share_pct":  None,
+                                "source":     "ba_bridge",
+                                "as_of_date": None,
+                                "notes":      None,
+                            })
+                            existing_names.add(name.lower())
+
+                        if new_entries:
+                            source_used = "ba_bridge"
+                            ba_success = True
+                            logger.info(
+                                "BA-Bridge: %d Einträge für %s",
+                                len(new_entries), company_name,
+                            )
+
+                elif resp.status_code == 202:
+                    # Bridge fetcht gerade — beim nächsten Pipeline-Run verfügbar
+                    logger.info("BA-Bridge fetching %s — kein Cache noch", company_name)
+
         except asyncio.TimeoutError:
-            logger.debug("Wikipedia timeout for %s", company_name)
+            logger.debug("BA-Bridge timeout for %s", company_name)
         except Exception as e:
-            logger.debug("Wikipedia failed for %s: %s", company_name, e)
+            logger.debug("BA-Bridge failed for %s: %s", company_name, e)
+
+        # Fallback: Wikipedia Management-Extraktion
+        if not ba_success:
+            logger.info("Ownership fallback via Wikipedia for %s (DE)", company_name)
+            try:
+                wiki_entries = await asyncio.wait_for(
+                    _fetch_wikipedia_management(company_name), timeout=15.0
+                )
+                for e in wiki_entries:
+                    if e.get("name", "").lower() not in existing_names:
+                        new_entries.append(e)
+                        existing_names.add(e.get("name", "").lower())
+                if new_entries:
+                    source_used = "wikipedia"
+            except asyncio.TimeoutError:
+                logger.debug("Wikipedia timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("Wikipedia failed for %s: %s", company_name, e)
 
     # Cap Table Score — aus allen Einträgen (existing + new)
     all_entries = existing_entries + new_entries
