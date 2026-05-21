@@ -1,5 +1,5 @@
 """
-SE-01–SE-03 · signal_engine.py
+SE-01–SE-13 · signal_engine.py
 Pfad: argo-analytics-backend/src/services/signal_engine.py
 
 Signal-Engine — täglich via Cron (~06:00 UTC).
@@ -9,16 +9,31 @@ Quellen:
   - Google News RSS              → Funding, M&A, allg. News
   - TechCrunch RSS               → Funding-Runden EU/US
   - Interner Ownership-Vergleich → Ownership-Changes (DB-Diff)
+  - DB-Zustand                   → Abweichungs-Signale (SE-13)
 
 Pipeline je Company:
-  1. EDGAR-Parser   → strukturierte Events (S-1, 10-K, 8-K)
-  2. News-Parser    → NER via Keyword-Matching + Claude-Klassifikation
-  3. Ownership-Diff → Vergleich mit letztem DB-Stand
-  4. upsert_signals → Duplikat-sicher via UNIQUE INDEX
+  1. EDGAR-Parser         → strukturierte Events (S-1, 10-K, 8-K)
+  2. News-Parser          → NER via Keyword-Matching (SE-08: \b-Wortgrenzen)
+  3. Claude-NER Pass 2    → direction + signal_category (SE-09/SE-11/SE-12)
+  4. Ownership-Diff       → Vergleich mit letztem DB-Stand
+  5. Abweichungs-Check    → Risiken aus fehlendem DB-Zustand (SE-13)
+  6. upsert_signals       → Duplikat-sicher via UNIQUE CONSTRAINT
+
+Signal-Richtungen (SE-09):
+  positive  → Potenzial-Signal (Funding, Partnerschaft, positives Sentiment)
+  negative  → Risiko-Signal (Regulatorik, Insider-Verkauf, negatives Earnings)
+  neutral   → Informativ (Filing, Ownership-Eintrag ohne klare Richtung)
+
+Signal-Kategorien (SE-11/SE-12):
+  Potenzial: funding | partnership | ipo_progress | market_growth | patent | investor_entry
+  Risiko:    regulatory | negative_earnings | supply_chain | insider_selling | customer_concentration
+  Neutral:   filing | ownership_entry | general_news
 """
 
 import asyncio
+import json
 import logging
+import os
 import re
 from datetime import datetime, date, timezone, timedelta
 from typing import Literal
@@ -37,10 +52,27 @@ EventType = Literal[
 
 Severity = Literal["high", "medium", "low"]
 
+# SE-09: Signal-Richtung
+Direction = Literal["positive", "negative", "neutral"]
+
+# SE-11/SE-12: Signal-Kategorie (Potenzial / Risiko / Neutral)
+SignalCategory = Literal[
+    # Potenzial-Signale
+    "funding", "partnership", "ipo_progress", "market_growth", "patent", "investor_entry",
+    # Risiko-Signale
+    "regulatory", "negative_earnings", "supply_chain", "insider_selling", "customer_concentration",
+    # Neutral / Informativ
+    "filing", "ownership_entry", "general_news",
+]
+
 
 class SignalEvent:
-    __slots__ = ("company_id", "company_name", "event_type", "event_date",
-                 "summary", "source", "source_url", "severity", "raw_title")
+    __slots__ = (
+        "company_id", "company_name", "event_type", "event_date",
+        "summary", "source", "source_url", "severity", "raw_title",
+        # SE-09/SE-11/SE-12: neue Felder
+        "direction", "signal_category",
+    )
 
     def __init__(
         self,
@@ -53,27 +85,33 @@ class SignalEvent:
         source_url: str | None = None,
         severity: Severity = "medium",
         raw_title: str | None = None,
+        direction: Direction = "neutral",
+        signal_category: SignalCategory = "general_news",
     ):
-        self.company_id   = company_id
-        self.company_name = company_name
-        self.event_type   = event_type
-        self.event_date   = event_date
-        self.summary      = summary
-        self.source       = source
-        self.source_url   = source_url
-        self.severity     = severity
-        self.raw_title    = raw_title
+        self.company_id      = company_id
+        self.company_name    = company_name
+        self.event_type      = event_type
+        self.event_date      = event_date
+        self.summary         = summary
+        self.source          = source
+        self.source_url      = source_url
+        self.severity        = severity
+        self.raw_title       = raw_title
+        self.direction       = direction
+        self.signal_category = signal_category
 
     def to_dict(self) -> dict:
         return {
-            "company_id":   self.company_id,
-            "event_type":   self.event_type,
-            "event_date":   self.event_date.isoformat(),
-            "summary":      self.summary,
-            "source":       self.source,
-            "source_url":   self.source_url,
-            "severity":     self.severity,
-            "raw_title":    self.raw_title,
+            "company_id":      self.company_id,
+            "event_type":      self.event_type,
+            "event_date":      self.event_date.isoformat(),
+            "summary":         self.summary,
+            "source":          self.source,
+            "source_url":      self.source_url,
+            "severity":        self.severity,
+            "raw_title":       self.raw_title,
+            "direction":       self.direction,
+            "signal_category": self.signal_category,
         }
 
 
@@ -99,17 +137,132 @@ def _normalize_name(name: str) -> str:
 
 
 def _name_in_text(company_name: str, text: str) -> bool:
-    """Prüft ob Company-Name (normalisiert) im Text vorkommt."""
+    """
+    SE-08: Prüft ob Company-Name (normalisiert) im Text vorkommt.
+    Verwendet \b-Wortgrenzen — eliminiert False-Positives wie
+    'Moment Energy' matcht auf 'SpaceX'-Artikel der 'momentum' enthält.
+    """
     normalized = _normalize_name(company_name)
-    text_lower = text.lower()
-    # Direktmatch
-    if normalized in text_lower:
+    # Vollständiger normalisierter Name mit Wortgrenzen
+    if re.search(r'\b' + re.escape(normalized) + r'\b', text.lower()):
         return True
-    # Hauptwort match (erstes Wort ≥ 5 Zeichen)
+    # Hauptwort match (erstes Wort ≥ 5 Zeichen) — ebenfalls mit \b
     main_word = normalized.split()[0] if normalized else ""
-    if len(main_word) >= 5 and main_word in text_lower:
+    if len(main_word) >= 5 and re.search(r'\b' + re.escape(main_word) + r'\b', text.lower()):
         return True
     return False
+
+
+# ── SE-09/SE-11/SE-12: Keyword-basierte Direction + Category (Fallback) ──────
+
+# Potenzial-Signale: direction=positive
+_POSITIVE_KW: list[tuple[str, SignalCategory]] = [
+    # Funding / Investment
+    ("series a",            "funding"),
+    ("series b",            "funding"),
+    ("series c",            "funding"),
+    ("series d",            "funding"),
+    ("funding round",       "funding"),
+    ("raised",              "funding"),
+    ("finanzierungsrunde",  "funding"),
+    ("investment",          "funding"),
+    ("new investor",        "investor_entry"),
+    ("neuer investor",      "investor_entry"),
+    # Partnership
+    ("partnership",         "partnership"),
+    ("partnerschaft",       "partnership"),
+    ("joint venture",       "partnership"),
+    ("kooperation",         "partnership"),
+    ("collaboration",       "partnership"),
+    ("strategic agreement", "partnership"),
+    # IPO
+    ("s-1",                 "ipo_progress"),
+    ("ipo",                 "ipo_progress"),
+    ("initial public offering", "ipo_progress"),
+    ("börsengang",          "ipo_progress"),
+    ("going public",        "ipo_progress"),
+    # Market Growth
+    ("market growth",       "market_growth"),
+    ("wachstum",            "market_growth"),
+    ("expansion",           "market_growth"),
+    # Patent
+    ("patent",              "patent"),
+    ("patentiert",          "patent"),
+]
+
+# Risiko-Signale: direction=negative
+_NEGATIVE_KW: list[tuple[str, SignalCategory]] = [
+    # Regulatory
+    ("regulatorisch",       "regulatory"),
+    ("regulatory",          "regulatory"),
+    ("sanktion",            "regulatory"),
+    ("sanction",            "regulatory"),
+    ("bußgeld",             "regulatory"),
+    ("fine",                "regulatory"),
+    ("strafe",              "regulatory"),
+    ("klage",               "regulatory"),
+    ("lawsuit",             "regulatory"),
+    ("investigation",       "regulatory"),
+    ("ermittlung",          "regulatory"),
+    # Negative Earnings
+    ("verlust",             "negative_earnings"),
+    ("loss",                "negative_earnings"),
+    ("gewinnwarnung",       "negative_earnings"),
+    ("profit warning",      "negative_earnings"),
+    ("umsatzrückgang",      "negative_earnings"),
+    ("revenue decline",     "negative_earnings"),
+    ("insolvenz",           "negative_earnings"),
+    ("bankruptcy",          "negative_earnings"),
+    ("restructuring",       "negative_earnings"),
+    ("stellenabbau",        "negative_earnings"),
+    ("layoffs",             "negative_earnings"),
+    # Supply Chain
+    ("supply chain",        "supply_chain"),
+    ("lieferkette",         "supply_chain"),
+    ("shortage",            "supply_chain"),
+    ("engpass",             "supply_chain"),
+    # Insider Selling
+    ("insider selling",     "insider_selling"),
+    ("insider verkauf",     "insider_selling"),
+    ("direktor verkauft",   "insider_selling"),
+    # Customer Concentration
+    ("key customer",        "customer_concentration"),
+    ("hauptkunde",          "customer_concentration"),
+    ("customer dependency", "customer_concentration"),
+]
+
+
+def _keyword_direction(text: str) -> tuple[Direction, SignalCategory]:
+    """
+    SE-09 Fallback: Keyword-basierte direction + signal_category.
+    Wird verwendet wenn Claude-API nicht verfügbar.
+    Reihenfolge: Negativ vor Positiv (konservativer Ansatz bei Ambiguität).
+    """
+    text_lower = text.lower()
+    for kw, cat in _NEGATIVE_KW:
+        if kw in text_lower:
+            return "negative", cat
+    for kw, cat in _POSITIVE_KW:
+        if kw in text_lower:
+            return "positive", cat
+    return "neutral", "general_news"
+
+
+def _event_type_direction(event_type: EventType) -> tuple[Direction, SignalCategory]:
+    """
+    Strukturierte Events (EDGAR, Ownership) bekommen direction aus event_type —
+    kein Claude-Pass nötig, da Quelle eindeutig ist.
+    """
+    mapping: dict[EventType, tuple[Direction, SignalCategory]] = {
+        "funding_round":     ("positive", "funding"),
+        "ipo_status_change": ("positive", "ipo_progress"),
+        "m_and_a_event":     ("neutral",  "filing"),      # M&A kann + oder - sein → Claude klärt
+        "ownership_change":  ("neutral",  "ownership_entry"),
+        "kpi_breakout":      ("positive", "market_growth"),
+        "earnings":          ("neutral",  "filing"),       # Earnings → Claude klärt Richtung
+        "news":              ("neutral",  "general_news"),
+    }
+    return mapping.get(event_type, ("neutral", "general_news"))
 
 
 def _classify_event(title: str, description: str) -> EventType:
@@ -141,6 +294,159 @@ def _severity_for_event(event_type: EventType) -> Severity:
         "kpi_breakout":      "medium",
         "news":              "low",
     }.get(event_type, "medium")
+
+
+# ── SE-09: Claude-NER zweiter Pass ───────────────────────────────────────────
+
+_CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+_CLAUDE_MODEL   = "claude-haiku-4-5-20251001"   # schnell + günstig für NER-Batch
+
+_NER_SYSTEM = """\
+Du bist ein präziser Signal-Klassifikator für M&A- und Investment-Screening.
+Analysiere Unternehmens-News und klassifiziere das Signal.
+
+Antworte NUR mit einem JSON-Objekt, keine Erklärung, keine Markdown-Backticks:
+{
+  "direction": "positive" | "negative" | "neutral",
+  "signal_category": "<kategorie>",
+  "confidence": "high" | "medium" | "low"
+}
+
+Kategorien:
+  Positiv (direction=positive):
+    funding           – neue Finanzierungsrunde, Kapitalerhöhung
+    partnership       – Partnerschaft, JV, Kooperation, strategisches Abkommen
+    ipo_progress      – S-1-Filing, IPO-Ankündigung, Börsengang-Pläne
+    market_growth     – Marktwachstum, Expansion, neue Märkte
+    patent            – neues Patent, IP-Schutz, Innovation
+    investor_entry    – neuer namhafter Investor steigt ein
+
+  Negativ (direction=negative):
+    regulatory        – Regulierung, Klage, Bußgeld, Ermittlung, Sanktion
+    negative_earnings – Verlust, Umsatzrückgang, Gewinnwarnung, Insolvenz, Layoffs
+    supply_chain      – Lieferkettenprobleme, Engpässe, Abhängigkeiten
+    insider_selling   – Insider-Verkäufe, Direktorenverkäufe
+    customer_concentration – hohe Kundenabhängigkeit, Verlust eines Hauptkunden
+
+  Neutral (direction=neutral):
+    filing            – reguläres Filing (10-K, 10-Q, 8-K) ohne klares Signal
+    ownership_entry   – Ownership-Änderung ohne klare Richtung
+    general_news      – allgemeine News ohne Potenzial- oder Risikosignal
+
+Regeln:
+- Bei Ambiguität: konservativ klassifizieren (neutral > positiv > negativ)
+- M&A-Events: positiv wenn Übernahme durch starken Käufer, negativ wenn Verkauf unter Druck
+- Earnings: positiv wenn Beat, negativ wenn Miss/Verlust, neutral wenn gemischt
+- confidence=low wenn wenig Information im Text
+"""
+
+
+async def _claude_ner_pass(
+    events: list[SignalEvent],
+    client: httpx.AsyncClient,
+) -> list[SignalEvent]:
+    """
+    SE-09: Claude-NER zweiter Pass.
+    Klassifiziert direction + signal_category für News-basierte Events.
+    EDGAR-strukturierte Events (filing, ownership_entry) werden übersprungen.
+    Batch-Verarbeitung: max 10 Events pro API-Call.
+    Fallback auf Keyword-Matching bei API-Fehler.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.warning("SE-09: ANTHROPIC_API_KEY fehlt — Keyword-Fallback für alle Events")
+        for ev in events:
+            if ev.direction == "neutral" and ev.signal_category == "general_news":
+                ev.direction, ev.signal_category = _keyword_direction(
+                    f"{ev.raw_title or ''} {ev.summary}"
+                )
+        return events
+
+    # Events die Claude-Pass brauchen: News + ambige Events (m_and_a, earnings)
+    needs_ner = [
+        ev for ev in events
+        if ev.event_type in ("news", "m_and_a_event", "earnings")
+        or (ev.direction == "neutral" and ev.signal_category == "general_news")
+    ]
+
+    if not needs_ner:
+        return events
+
+    # Batch-Verarbeitung in Chunks von 10
+    for i in range(0, len(needs_ner), 10):
+        batch = needs_ner[i:i+10]
+        items_text = "\n".join(
+            f"{j+1}. Titel: {ev.raw_title or '—'}\n   Summary: {ev.summary[:200]}"
+            for j, ev in enumerate(batch)
+        )
+        prompt = (
+            f"Klassifiziere diese {len(batch)} Unternehmens-Signale.\n"
+            f"Antworte mit einem JSON-Array der Länge {len(batch)}:\n"
+            f"[{{\"direction\":...,\"signal_category\":...,\"confidence\":...}}, ...]\n\n"
+            f"{items_text}"
+        )
+
+        try:
+            resp = await client.post(
+                _CLAUDE_API_URL,
+                headers={
+                    "x-api-key":         api_key,
+                    "anthropic-version":  "2023-06-01",
+                    "content-type":       "application/json",
+                },
+                json={
+                    "model":      _CLAUDE_MODEL,
+                    "max_tokens": 512,
+                    "system":     _NER_SYSTEM,
+                    "messages":   [{"role": "user", "content": prompt}],
+                },
+                timeout=20.0,
+            )
+
+            if resp.status_code != 200:
+                logger.warning("SE-09 Claude API %s — Keyword-Fallback", resp.status_code)
+                _apply_keyword_fallback(batch)
+                continue
+
+            raw = resp.json()["content"][0]["text"].strip()
+            # JSON-Fences entfernen falls Claude sie doch schreibt
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+            results = json.loads(raw)
+
+            if not isinstance(results, list) or len(results) != len(batch):
+                logger.warning("SE-09 Claude Antwort hat falsche Länge — Keyword-Fallback")
+                _apply_keyword_fallback(batch)
+                continue
+
+            for ev, res in zip(batch, results):
+                direction = res.get("direction", "neutral")
+                category  = res.get("signal_category", "general_news")
+                # Validierung gegen erlaubte Werte
+                if direction in ("positive", "negative", "neutral"):
+                    ev.direction = direction
+                if category in (
+                    "funding", "partnership", "ipo_progress", "market_growth",
+                    "patent", "investor_entry", "regulatory", "negative_earnings",
+                    "supply_chain", "insider_selling", "customer_concentration",
+                    "filing", "ownership_entry", "general_news"
+                ):
+                    ev.signal_category = category
+
+        except (json.JSONDecodeError, KeyError, Exception) as e:
+            logger.warning("SE-09 Claude NER Fehler: %s — Keyword-Fallback", e)
+            _apply_keyword_fallback(batch)
+
+        await asyncio.sleep(0.2)   # Rate-Limit
+
+    return events
+
+
+def _apply_keyword_fallback(events: list[SignalEvent]) -> None:
+    """Wendet Keyword-Fallback auf eine Liste von Events an (in-place)."""
+    for ev in events:
+        ev.direction, ev.signal_category = _keyword_direction(
+            f"{ev.raw_title or ''} {ev.summary}"
+        )
 
 
 # ── EDGAR Parser ─────────────────────────────────────────────────────────────
@@ -455,6 +761,124 @@ async def watch_ownership_changes(
             source_url=entry.get("source"),
             severity="medium",
             raw_title=f"Neuer Investor: {name}",
+            direction="neutral",
+            signal_category="ownership_entry",
+        ))
+
+    return events
+
+
+# ── SE-13: Abweichungs-Signale (Risiko aus fehlendem DB-Zustand) ─────────────
+
+def check_absence_signals(
+    company_id: str,
+    company_name: str,
+    company: dict,
+    ownership_entries: list[dict],
+    signals_count: int,
+) -> list[SignalEvent]:
+    """
+    SE-13: Erkennt Risiken aus dem was fehlt — kein Scraping, kein externer API-Call.
+    Ausgewertet werden ausschließlich Felder die bereits in der DB stehen.
+
+    Checks:
+      1. Ownership undurchsichtig → kein einziger Eintrag in ownership_entries
+      2. Kein Ticker in VC-getriebenem Markt (private + kein Funding) → fehlende Transparenz
+      3. Keine Signals in letzten 90 Tagen → Signal-Stille als Risiko
+      4. Kein Headcount → fehlende Transparenz bei privaten Companies
+      5. Kein Revenue in patentlastigem / VC-dominiertem Sektor (Tech, Biotech)
+    """
+    events: list[SignalEvent] = []
+    today = date.today()
+    industry = (company.get("industry") or "").lower()
+    is_listed = bool(company.get("ticker"))
+    region    = company.get("region", "")
+
+    # 1. Ownership-Transparenz: keine Einträge
+    if not ownership_entries and not is_listed:
+        events.append(SignalEvent(
+            company_id=company_id,
+            company_name=company_name,
+            event_type="ownership_change",
+            event_date=today,
+            summary=(
+                f"{company_name} — Keine Ownership-Daten verfügbar. "
+                f"Für private Companies ohne öffentliche Register-Einträge erhöht dies das Governance-Risiko."
+            ),
+            source="internal_absence",
+            source_url=None,
+            severity="medium",
+            raw_title="Ownership-Transparenz: keine Daten",
+            direction="negative",
+            signal_category="regulatory",
+        ))
+
+    # 2. Signal-Stille: kein Signal in letzten 90 Tagen (nur wenn Company ≥ 90 Tage alt)
+    last_signal_raw = company.get("last_signal_date")
+    if last_signal_raw:
+        try:
+            last_signal_date = date.fromisoformat(last_signal_raw[:10])
+            days_silent = (today - last_signal_date).days
+            if days_silent > 90:
+                events.append(SignalEvent(
+                    company_id=company_id,
+                    company_name=company_name,
+                    event_type="news",
+                    event_date=today,
+                    summary=(
+                        f"{company_name} — Keine öffentlichen Signale in den letzten {days_silent} Tagen. "
+                        f"Signal-Stille kann auf Kommunikationsprobleme oder stagnierende Aktivität hinweisen."
+                    ),
+                    source="internal_absence",
+                    source_url=None,
+                    severity="low",
+                    raw_title=f"Signal-Stille: {days_silent} Tage",
+                    direction="negative",
+                    signal_category="general_news",
+                ))
+        except ValueError:
+            pass
+
+    # 3. Kein Headcount bei privater Company (fehlende Transparenz)
+    headcount = company.get("headcount")
+    if not headcount and not is_listed:
+        events.append(SignalEvent(
+            company_id=company_id,
+            company_name=company_name,
+            event_type="news",
+            event_date=today,
+            summary=(
+                f"{company_name} — Keine Headcount-Daten verfügbar. "
+                f"Für private Companies ohne öffentliche Mitarbeiterzahl ist die Skalierungseinschätzung eingeschränkt."
+            ),
+            source="internal_absence",
+            source_url=None,
+            severity="low",
+            raw_title="Headcount-Transparenz: keine Daten",
+            direction="negative",
+            signal_category="general_news",
+        ))
+
+    # 4. Kein Revenue in tech-nahen Sektoren (höhere Erwartung an Transparenz)
+    tech_sectors = ("software", "ai", "biotech", "medtech", "semiconductor", "cloud", "saas")
+    revenue = company.get("revenue_usd_mn")
+    if not revenue and any(s in industry for s in tech_sectors) and not is_listed:
+        events.append(SignalEvent(
+            company_id=company_id,
+            company_name=company_name,
+            event_type="earnings",
+            event_date=today,
+            summary=(
+                f"{company_name} — Keine Umsatzdaten verfügbar. "
+                f"Im {industry}-Sektor ist Umsatz-Transparenz typischerweise höher — "
+                f"fehlende Daten erhöhen das Bewertungsrisiko."
+            ),
+            source="internal_absence",
+            source_url=None,
+            severity="low",
+            raw_title=f"Revenue-Transparenz: keine Daten ({industry})",
+            direction="negative",
+            signal_category="negative_earnings",
         ))
 
     return events
@@ -469,7 +893,8 @@ async def run_signal_engine(companies: list[dict], ownership_map: dict[str, list
     Aufgerufen von main.py _cron_signal_engine().
 
     Args:
-        companies:     Liste von Company-Dicts (id, name, ticker, exchange, last_signal_date)
+        companies:     Liste von Company-Dicts (id, name, ticker, exchange,
+                       last_signal_date, industry, region, headcount, revenue_usd_mn)
         ownership_map: {company_id: [ownership_entries]} — aktueller DB-Stand
     """
     all_events: list[SignalEvent] = []
@@ -510,6 +935,9 @@ async def run_signal_engine(companies: list[dict], ownership_map: dict[str, list
             region = company.get("region", "")
             if is_listed or region in ("US", ""):
                 edgar_events = await parse_edgar(cid, cname, ticker, client)
+                # EDGAR-Events: direction direkt aus event_type ableiten (strukturierte Quelle)
+                for ev in edgar_events:
+                    ev.direction, ev.signal_category = _event_type_direction(ev.event_type)
                 company_events.extend(edgar_events)
                 if edgar_events:
                     await asyncio.sleep(0.5)   # EDGAR Rate-Limit respektieren
@@ -531,13 +959,30 @@ async def run_signal_engine(companies: list[dict], ownership_map: dict[str, list
             ow_events = await watch_ownership_changes(cid, cname, entries, last_signal_date)
             company_events.extend(ow_events)
 
+            # 5. SE-09: Claude-NER zweiter Pass (direction + signal_category für News-Events)
+            if company_events:
+                company_events = await _claude_ner_pass(company_events, client)
+
+            # 6. SE-13: Abweichungs-Signale aus DB-Zustand
+            absence_events = check_absence_signals(
+                cid, cname, company,
+                ownership_entries=entries,
+                signals_count=len(company_events),
+            )
+            company_events.extend(absence_events)
+
             logger.info(
-                "Signal-Engine: %s → %d events (edgar=%d news=%d tc=%d ownership=%d)",
+                "Signal-Engine: %s → %d events (edgar=%d news=%d tc=%d ownership=%d absence=%d) "
+                "pos=%d neg=%d neu=%d",
                 cname, len(company_events),
                 sum(1 for e in company_events if e.source == "edgar"),
                 sum(1 for e in company_events if e.source == "google_news"),
                 sum(1 for e in company_events if e.source == "techcrunch"),
                 sum(1 for e in company_events if e.source == "internal"),
+                sum(1 for e in company_events if e.source == "internal_absence"),
+                sum(1 for e in company_events if e.direction == "positive"),
+                sum(1 for e in company_events if e.direction == "negative"),
+                sum(1 for e in company_events if e.direction == "neutral"),
             )
             all_events.extend(company_events)
 

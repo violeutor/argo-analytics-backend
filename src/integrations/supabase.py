@@ -313,14 +313,15 @@ def insert_score(deal_id: str, scores, summary: str, warnings: list[str]) -> str
     return result.data[0]["id"]
 
 
-# ── Signals (SE-01–SE-03) ─────────────────────────────────────────────────────
+# ── Signals (SE-01–SE-13) ─────────────────────────────────────────────────────
 
 def fetch_signals(company_id: str, limit: int = 50) -> list[dict]:
     """Gibt Signals für eine Company zurück, chronologisch absteigend."""
     db = get_supabase()
     try:
         result = db.table("signals").select(
-            "id, event_type, event_date, summary, source, source_url, severity, is_read, raw_title, created_at"
+            "id, event_type, event_date, summary, source, source_url, "
+            "severity, is_read, raw_title, direction, signal_category, created_at"
         ).eq("company_id", company_id).order("event_date", desc=True).limit(limit).execute()
         return result.data or []
     except Exception as e:
@@ -344,12 +345,13 @@ def fetch_all_signals(limit: int = 500) -> list[dict]:
 def upsert_signals(events: list[dict]) -> int:
     """
     Schreibt Signal-Events in die signals-Tabelle.
-    Duplikat-sicher via UNIQUE INDEX (company_id, event_type, event_date, source).
+    Duplikat-sicher via UNIQUE CONSTRAINT (company_id, event_type, event_date, source).
     Gibt Anzahl geschriebener Rows zurück.
 
     Erwartet dicts mit:
         company_id, event_type, event_date, summary,
-        source, source_url, severity, raw_title
+        source, source_url, severity, raw_title,
+        direction, signal_category           ← SE-09/SE-11/SE-12/SE-13
     """
     if not events:
         return 0
@@ -357,8 +359,14 @@ def upsert_signals(events: list[dict]) -> int:
     written = 0
     for event in events:
         try:
+            # direction + signal_category mit sicheren Defaults falls fehlen
+            payload = {
+                **event,
+                "direction":       event.get("direction", "neutral"),
+                "signal_category": event.get("signal_category", "general_news"),
+            }
             db.table("signals").upsert(
-                event,
+                payload,
                 on_conflict="company_id,event_type,event_date,source",
                 ignore_duplicates=True,
             ).execute()
@@ -380,3 +388,51 @@ def fetch_last_signal_date(company_id: str) -> str | None:
     except Exception as e:
         logger.warning("fetch_last_signal_date failed for %s: %s", company_id, e)
         return None
+
+
+def fetch_directional_signals(
+    company_id: str,
+    direction: str,
+    limit: int = 10,
+) -> list[dict]:
+    """
+    SE-09: Gibt Signals nach direction gefiltert zurück.
+    direction: 'positive' | 'negative' | 'neutral'
+    Wird von Tab 5 (Potenziale & Risiken) und company_assessments genutzt.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("signals").select(
+            "id, event_type, event_date, summary, source, source_url, "
+            "severity, raw_title, direction, signal_category"
+        ).eq("company_id", company_id).eq("direction", direction).order(
+            "event_date", desc=True
+        ).limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_directional_signals(%s, %s): %s", company_id, direction, e)
+        return []
+
+
+def fetch_signals_by_category(
+    company_id: str,
+    categories: list[str],
+    limit: int = 10,
+) -> list[dict]:
+    """
+    SE-11/SE-12: Gibt Signals nach signal_category gefiltert zurück.
+    Nützlich für spezifische Risk/Potential Checks in Tab 5 + Scoring.
+    Beispiel: categories=['regulatory', 'negative_earnings'] → alle Risiko-Signals
+    """
+    db = get_supabase()
+    try:
+        result = db.table("signals").select(
+            "id, event_type, event_date, summary, source, source_url, "
+            "severity, raw_title, direction, signal_category"
+        ).eq("company_id", company_id).in_(
+            "signal_category", categories
+        ).order("event_date", desc=True).limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_signals_by_category(%s): %s", company_id, e)
+        return []
