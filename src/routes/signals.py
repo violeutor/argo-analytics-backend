@@ -76,15 +76,40 @@ async def trigger_signal_engine(background_tasks: BackgroundTasks):
     Läuft als BackgroundTask um den Request nicht zu blockieren.
     """
     async def _run():
+        logger.info("Manual trigger: _run() gestartet")
         try:
-            from src.integrations.supabase import fetch_companies, upsert_signals
+            from src.integrations.supabase import (
+                fetch_companies, upsert_signals
+            )
             from src.services.signal_engine import run_signal_engine
 
+            logger.info("Manual trigger: imports OK")
+
             companies = fetch_companies(limit=500)
-            events = await run_signal_engine(companies, {})
+            logger.info("Manual trigger: %d companies geladen", len(companies))
+
+            # Ownership-Map aufbauen: {company_id: [entries]}
+            ownership_map: dict[str, list[dict]] = {}
+            try:
+                from src.integrations.supabase import fetch_all_ownership_entries
+                all_ownership = fetch_all_ownership_entries()
+                for entry in all_ownership:
+                    cid = entry.get("company_id")
+                    if cid:
+                        ownership_map.setdefault(cid, []).append(entry)
+                logger.info("Manual trigger: ownership_map %d companies", len(ownership_map))
+            except Exception as oe:
+                logger.warning("Manual trigger: ownership fetch failed (%s) — leere Map", oe)
+
+            events = await run_signal_engine(companies, ownership_map)
+            logger.info("Manual trigger: %d events gesammelt", len(events))
+
             if events:
                 written = upsert_signals([e.to_dict() for e in events])
-                logger.info("Manual trigger: %d events, %d written", len(events), written)
+                logger.info("Manual trigger: %d/%d events geschrieben", written, len(events))
+            else:
+                logger.info("Manual trigger: keine events")
+
         except Exception as e:
             logger.exception("Manual signal trigger FEHLER: %s", e)
 

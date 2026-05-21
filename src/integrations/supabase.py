@@ -191,6 +191,22 @@ def set_enrichment_status(company_id: str, status: str) -> None:
         logger.warning("set_enrichment_status FAILED for %s: %s", company_id, e)
 
 
+def fetch_all_ownership_entries() -> list[dict]:
+    """
+    Gibt alle Ownership-Einträge zurück — für Signal-Engine ownership_map.
+    Felder: company_id, name, role, share_pct, as_of_date, source
+    """
+    db = get_supabase()
+    try:
+        result = db.table("ownership_entries").select(
+            "company_id, name, role, share_pct, as_of_date, source"
+        ).order("as_of_date", desc=True).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_all_ownership_entries failed: %s", e)
+        return []
+
+
 # ── Value Drivers ────────────────────────────────────────────────────────────
 
 def fetch_value_drivers(company_id: str) -> dict | None:
