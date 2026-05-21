@@ -411,6 +411,21 @@ _EXCHANGE_SUFFIX: dict[str, str] = {
     "hkex": ".HK", "tokyo": ".T",
 }
 
+# Yahoo exchangeName → lesbarer Display-Name
+_EXCHANGE_DISPLAY: dict[str, str] = {
+    "NMS": "Nasdaq", "NGM": "Nasdaq", "NCM": "Nasdaq", "NasdaqGM": "Nasdaq",
+    "NasdaqGS": "Nasdaq", "NasdaqCM": "Nasdaq",
+    "NYQ": "NYSE", "NYSE": "NYSE", "NYSEArca": "NYSE Arca",
+    "PCX": "NYSE Arca",
+    "GER": "Frankfurt", "FRA": "Frankfurt", "FSX": "Frankfurt",
+    "XETRA": "Xetra",
+    "LSE": "London", "IOB": "London",
+    "PAR": "Euronext Paris", "AMS": "Euronext Amsterdam",
+    "SWX": "SIX Swiss Exchange",
+    "TYO": "Tokyo", "HKG": "Hong Kong", "TSX": "Toronto",
+    "ASX": "ASX",
+}
+
 def _pct(v: float | None) -> float | None:
     """Konvertiert Yahoo-Dezimalwert (0.23) → Prozent (23.0), None wenn fehlt."""
     return round(v * 100, 1) if v is not None else None
@@ -472,7 +487,7 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             meta = cr.json().get("chart",{}).get("result",[{}])[0].get("meta",{})
         out = {
             "ticker": symbol,
-            "exchange": meta.get("exchangeName"),
+            "exchange": _EXCHANGE_DISPLAY.get(meta.get("exchangeName", ""), meta.get("exchangeName")),
             "price": meta.get("regularMarketPrice"),
             "market_cap_bn": (meta.get("marketCap") or 0) / 1e9 or None,
             "currency": meta.get("currency"),
