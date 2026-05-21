@@ -478,112 +478,54 @@ def _safe_float(val) -> float | None:
 
 async def _fetch_twelve_data(symbol: str, exchange_key: str | None) -> dict:
     """
-    Primärquelle für Fundamentals. Liefert dasselbe dict-Format wie bisheriger _fetch_yahoo().
+    YH-08 · Twelve Data — nur Quote (Preis + MarktCap + 52W).
+    /statistics ist Pro-only — Fundamentals kommen via Bridge /yahoo/fundamentals/.
     Free Tier: 800 calls/day.
+
+    Symbol-Format: Twelve Data erwartet Bare-Symbol + exchange als MIC-Code,
+    NICHT Yahoo-Format (SIE.DE). Wir übergeben symbol=SIE&exchange=XETR.
     """
     api_key = settings.twelve_data_api_key or _TWELVE_DATA_API_KEY
     if not api_key:
         logger.warning("TWELVE_DATA_API_KEY nicht gesetzt")
         return {}
 
+    # Symbol bereinigen: Yahoo-Suffix (.DE, .L etc.) entfernen — Twelve Data will Bare-Symbol
+    bare_symbol = symbol.split(".")[0] if "." in symbol else symbol
     mic = _TD_EXCHANGE.get((exchange_key or "").lower(), "")
-    qs  = f"symbol={symbol}&apikey={api_key}" + (f"&exchange={mic}" if mic else "")
+    # Twelve Data: symbol + exchange als separate Parameter, kein Yahoo-Format
+    params = f"symbol={bare_symbol}&apikey={api_key}" + (f"&exchange={mic}" if mic else "")
 
     try:
-        timeout = httpx.Timeout(10.0, connect=4.0)
+        timeout = httpx.Timeout(8.0, connect=3.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            quote_resp, stats_resp = await asyncio.gather(
-                client.get(f"{_TD_BASE}/quote?{qs}"),
-                client.get(f"{_TD_BASE}/statistics?{qs}"),
-                return_exceptions=True,
-            )
+            quote_resp = await client.get(f"{_TD_BASE}/quote?{params}")
 
-        out: dict = {"ticker": symbol}
+        out: dict = {"ticker": symbol}  # Original-Symbol (mit Suffix) für Downstream
 
-        # Quote — Preis + MarktCap
         if not isinstance(quote_resp, Exception) and quote_resp.status_code == 200:
             q = quote_resp.json()
             if q.get("status") != "error":
-                out["price"]        = _safe_float(q.get("close"))
-                out["currency"]     = q.get("currency")
-                out["exchange"]     = _EXCHANGE_DISPLAY.get(q.get("exchange", ""), q.get("exchange"))
-                out["week_52_high"] = _safe_float(q.get("fifty_two_week", {}).get("high"))
-                out["week_52_low"]  = _safe_float(q.get("fifty_two_week", {}).get("low"))
+                out["price"]         = _safe_float(q.get("close"))
+                out["currency"]      = q.get("currency")
+                out["exchange"]      = _EXCHANGE_DISPLAY.get(q.get("exchange", ""), q.get("exchange"))
+                out["week_52_high"]  = _safe_float(q.get("fifty_two_week", {}).get("high"))
+                out["week_52_low"]   = _safe_float(q.get("fifty_two_week", {}).get("low"))
                 mc = _safe_float(q.get("market_cap"))
                 if mc:
                     out["market_cap_bn"] = mc / 1e9
-                logger.info("TWELVE_DATA quote OK: %s price=%s", symbol, out.get("price"))
+                logger.info("TWELVE_DATA quote OK: %s price=%s mcap=%.1fBn",
+                            bare_symbol, out.get("price"), out.get("market_cap_bn") or 0)
             else:
-                logger.warning("TWELVE_DATA quote error: %s → %s", symbol, q.get("message"))
+                logger.warning("TWELVE_DATA quote error: %s → %s", bare_symbol, q.get("message"))
         else:
-            s = quote_resp.status_code if not isinstance(quote_resp, Exception) else repr(quote_resp)
-            logger.warning("TWELVE_DATA quote HTTP %s for %s", s, symbol)
-
-        # Statistics — Fundamentals
-        if not isinstance(stats_resp, Exception) and stats_resp.status_code == 200:
-            s = stats_resp.json()
-            if s.get("status") != "error":
-                vs  = s.get("statistics", {})
-                fin = vs.get("financials", {})
-                inc = fin.get("income_statement", {})
-                bal = fin.get("balance_sheet", {})
-                cf  = fin.get("cash_flow", {})
-                val = vs.get("valuations", {})
-                hi  = vs.get("stock_statistics", {})
-
-                if not out.get("market_cap_bn"):
-                    mc2 = _safe_float(val.get("market_capitalization"))
-                    if mc2:
-                        out["market_cap_bn"] = mc2 / 1e9
-
-                out["pe_ratio"]             = _safe_float(val.get("trailing_pe"))
-                out["week_52_high"]         = out.get("week_52_high") or _safe_float(hi.get("week_52_high"))
-                out["week_52_low"]          = out.get("week_52_low")  or _safe_float(hi.get("week_52_low"))
-
-                rev    = _safe_float(inc.get("total_revenue"))
-                ebitda = _safe_float(inc.get("ebitda"))
-                out["revenue_bn"] = rev / 1e9 if rev else None
-                out["ebitda_bn"]  = ebitda / 1e9 if ebitda else None
-
-                debt = _safe_float(bal.get("total_debt"))
-                if out.get("ebitda_bn") and debt:
-                    out["debt_ebitda"] = round((debt / 1e9) / out["ebitda_bn"], 2)
-
-                out["gross_margin_pct"]     = _pct(_safe_float(inc.get("gross_profit_margin")))
-                out["operating_margin_pct"] = _pct(_safe_float(inc.get("operating_margin")))
-                out["profit_margin_pct"]    = _pct(_safe_float(inc.get("net_profit_margin")))
-                out["revenue_growth_pct"]   = _pct(_safe_float(inc.get("quarterly_revenue_growth")))
-                out["earnings_growth_pct"]  = _pct(_safe_float(inc.get("quarterly_earnings_growth_yoy")))
-
-                fcf = _safe_float(cf.get("free_cash_flow"))
-                ocf = _safe_float(cf.get("operating_cash_flow"))
-                out["free_cashflow_bn"]      = fcf / 1e9 if fcf else None
-                out["operating_cashflow_bn"] = ocf / 1e9 if ocf else None
-
-                ev = _safe_float(val.get("enterprise_value"))
-                out["enterprise_value_bn"] = ev / 1e9 if ev else None
-                if ev and out.get("revenue_bn"):
-                    out["ev_revenue"] = round((ev / 1e9) / out["revenue_bn"], 1)
-                if ev and out.get("ebitda_bn"):
-                    out["ev_ebitda"]  = round((ev / 1e9) / out["ebitda_bn"], 1)
-
-                logger.info(
-                    "TWELVE_DATA stats OK: %s rev=%.1fBn margin=%.1f%% ev=%.1fBn",
-                    symbol,
-                    out.get("revenue_bn") or 0,
-                    out.get("gross_margin_pct") or 0,
-                    out.get("enterprise_value_bn") or 0,
-                )
-            else:
-                logger.warning("TWELVE_DATA stats error: %s → %s", symbol, s.get("message"))
-        else:
-            sc = stats_resp.status_code if not isinstance(stats_resp, Exception) else repr(stats_resp)
-            logger.warning("TWELVE_DATA stats HTTP %s for %s", sc, symbol)
+            sc = quote_resp.status_code if not isinstance(quote_resp, Exception) else repr(quote_resp)
+            logger.warning("TWELVE_DATA quote HTTP %s for %s", sc, bare_symbol)
 
         return out
 
     except Exception as e:
-        logger.warning("TWELVE_DATA failed for %s: %s", symbol, e)
+        logger.warning("TWELVE_DATA failed for %s: %s", bare_symbol, e)
         return {}
 
 
@@ -608,10 +550,41 @@ async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
     return {}
 
 
+async def _fetch_bridge_fundamentals(symbol: str) -> dict:
+    """
+    YH-08 · Fundamentals via BA-Bridge /yahoo/fundamentals/{ticker}.
+    Bridge nutzt yfinance — kostenlos, kein Plan-Upgrade nötig.
+    Gibt leeres dict zurück bei Fehler — kein Hard-Fail.
+    """
+    if not settings.ba_bridge_url:
+        logger.debug("BA-Bridge nicht konfiguriert — kein Fundamentals-Call")
+        return {}
+    try:
+        timeout = httpx.Timeout(10.0, connect=3.0)
+        headers = {"X-API-Key": settings.ba_bridge_api_key}
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            resp = await client.get(f"{settings.ba_bridge_url}/yahoo/fundamentals/{symbol}")
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(
+                "BRIDGE_FUNDAMENTALS OK: %s rev=%.1fBn margin=%.1f%%",
+                symbol,
+                data.get("revenue_bn") or 0,
+                data.get("gross_margin_pct") or 0,
+            )
+            return data
+        logger.warning("BRIDGE_FUNDAMENTALS HTTP %s for %s", resp.status_code, symbol)
+    except Exception as e:
+        logger.warning("BRIDGE_FUNDAMENTALS failed for %s: %s", symbol, e)
+    return {}
+
+
 async def _fetch_yahoo(ticker: str | None) -> dict:
     """
-    Primär: Twelve Data (Quote + Statistics).
-    Fallback: Yahoo Chart-API für Preis/MarktCap wenn Twelve Data keinen Preis liefert.
+    YH-08 Hybrid-Architektur:
+      1. Twelve Data /quote        → Preis + MarktCap + 52W  (Free Tier)
+      2. BA-Bridge /fundamentals/  → Revenue, EBITDA, Margen, EV (yfinance, kostenlos)
+      3. Yahoo Chart /v8/chart/    → Preis-Fallback wenn Twelve Data leer
     """
     if not ticker:
         return {}
@@ -624,8 +597,21 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
         if suffix:
             symbol = symbol + suffix
 
-    out = await _fetch_twelve_data(symbol, exchange_key)
+    # Parallel: Twelve Data Quote + Bridge Fundamentals
+    td_out, bridge_out = await asyncio.gather(
+        _fetch_twelve_data(symbol, exchange_key),
+        _fetch_bridge_fundamentals(symbol),
+        return_exceptions=True,
+    )
+    if isinstance(td_out, Exception):
+        td_out = {}
+    if isinstance(bridge_out, Exception):
+        bridge_out = {}
 
+    # Merge: Twelve Data Preis + Bridge Fundamentals
+    out: dict = {**bridge_out, **td_out}  # td_out hat Prio bei Überschneidung (Preis/Exchange)
+
+    # Preis-Fallback: Yahoo Chart wenn Twelve Data keinen Preis lieferte
     if not out.get("price"):
         logger.info("Twelve Data kein Preis für %s — Yahoo Chart Fallback", symbol)
         fallback = await _fetch_yahoo_price_fallback(symbol)
