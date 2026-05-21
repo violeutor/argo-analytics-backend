@@ -236,31 +236,54 @@ async def search_company(request: SearchRequest) -> SearchResponse:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _fetch_company_fuzzy(query: str) -> dict | None:
-    """Fuzzy match company by name or ticker in DB."""
+    """
+    BUG-12: Case-insensitive fuzzy match — gibt immer DB-canonical-Namen zurück.
+    'spacex' findet 'SpaceX' und gibt {'name': 'SpaceX', ...} zurück.
+    Matching-Reihenfolge: exact → prefix → substring → ticker.
+    """
     companies = fetch_companies(limit=500)
     q = query.lower().strip()
+
+    # 1. Exact match (case-insensitive)
     for c in companies:
-        if (
-            c.get("name", "").lower() == q
-            or q in c.get("name", "").lower()
-            or (c.get("proxy_ticker") and q in c.get("proxy_ticker", "").lower())
-        ):
+        if c.get("name", "").lower() == q:
             return c
+
+    # 2. Ticker match
+    for c in companies:
+        if c.get("ticker") and q == c.get("ticker", "").lower().split("·")[0].strip():
+            return c
+        if c.get("proxy_ticker") and q in c.get("proxy_ticker", "").lower():
+            return c
+
+    # 3. Substring match (query als Teil des DB-Namens)
+    for c in companies:
+        if q in c.get("name", "").lower():
+            return c
+
     return None
 
 
 async def _persist_enriched_company(name: str, enrichment: dict) -> dict:
-    """Save enriched company to Supabase companies table."""
+    """
+    BUG-12: Speichert enriched Company mit canonical name aus Wikipedia/Enrichment.
+    Bevorzugt enrichment['canonical_name'] > enrichment['name'] > User-Input.
+    """
     try:
         db = get_supabase()
+        # Canonical name: Wikipedia-Name hat Priorität über User-Input (verhindert lowercase-Einträge)
+        canonical_name = (
+            enrichment.get("canonical_name")
+            or enrichment.get("name")
+            or name
+        )
         payload = {
-            "name": name,
-            "summary": enrichment.get("description"),
-            "tags": enrichment.get("tags", []),
-            "source": "manual",
+            "name":            canonical_name,
+            "summary":         enrichment.get("description"),
+            "tags":            enrichment.get("tags", []),
+            "source":          "manual",
             "investment_path": "Beobachten",
         }
-        # Add funding hints if available
         if enrichment.get("funding_hint_mn"):
             payload["funding_total_usd_mn"] = enrichment["funding_hint_mn"]
 
@@ -271,14 +294,88 @@ async def _persist_enriched_company(name: str, enrichment: dict) -> dict:
         logger.warning("Could not persist enriched company: %s", e)
         return {"name": name, "description": enrichment.get("description"), "tags": enrichment.get("tags", [])}
 
-
 def _filter_relevant_buyers(buyers: list[dict], company: dict) -> list[dict]:
     """
-    Return buyers that are plausibly relevant to the company.
-    Currently: all buyers from DB (small set of 8).
-    Phase 2: filter by sector overlap + geographic fit.
+    BUG-13: Gibt nur Buyers zurück die zur Company passen.
+    Matching nach industry + investment_path + region.
+    Fallback: alle Buyers wenn zu wenige Treffer (< 2).
     """
-    return buyers  # all 8 are relevant for Climate Tech universe
+    industry   = (company.get("industry") or "").lower()
+    category   = (company.get("category") or "").lower()
+    inv_path   = (company.get("investment_path") or "").lower()
+    region     = (company.get("region") or "").lower()
+
+    # Sektor-Mapping: Buyer-Sektor → Company-Industrien/Kategorien die passen
+    _SECTOR_FIT: dict[str, list[str]] = {
+        "energy":          ["energy", "solar", "wind", "hydrogen", "battery", "grid", "geothermal", "nuclear"],
+        "industrials":     ["manufacturing", "construction", "materials", "cement", "steel", "chemical"],
+        "technology":      ["software", "ai", "saas", "semiconductor", "cloud", "iot", "robotics"],
+        "agriculture":     ["agritech", "food", "agriculture", "biotech"],
+        "transportation":  ["mobility", "evs", "logistics", "aviation", "maritime"],
+        "materials":       ["mining", "materials", "recycling", "carbon capture"],
+        "healthcare":      ["medtech", "biotech", "pharma", "health"],
+        "finance":         ["fintech", "insurance", "payments"],
+    }
+
+    def _buyer_fits(buyer: dict) -> bool:
+        buyer_sector = (buyer.get("sector") or "").lower()
+        fit_industries = _SECTOR_FIT.get(buyer_sector, [])
+
+        # Direkte Sektor-Übereinstimmung
+        if any(ind in industry or ind in category for ind in fit_industries):
+            return True
+
+        # Regional-Fit: EU-Buyer bevorzugt EU-Companies, US-Buyer bevorzugt US
+        buyer_region = (buyer.get("region") or "").lower()
+        if buyer_region and region and buyer_region == region:
+            return True
+
+        # Investment-Path-Fit: Käufer-Proxy Companies passen zu strategischen Buyern
+        if inv_path in ("käufer-proxy", "kaufer-proxy") and buyer.get("market_cap_usd_bn", 0) > 5:
+            return True
+
+        return False
+
+    relevant = [b for b in buyers if _buyer_fits(b)]
+
+    # Fallback: wenn < 2 Treffer → alle Buyers (kleines Universe noch)
+    if len(relevant) < 2:
+        logger.info(
+            "_filter_relevant_buyers: nur %d Treffer für %s → alle %d Buyers",
+            len(relevant), company.get("name"), len(buyers),
+        )
+        return buyers
+
+    logger.info(
+        "_filter_relevant_buyers: %d/%d Buyers relevant für %s (industry=%s)",
+        len(relevant), len(buyers), company.get("name"), industry,
+    )
+    return relevant
+
+
+async def _ensure_buyer_in_db(buyer_name: str, ticker: str | None = None) -> dict | None:
+    """
+    BUG-13: Legt Buyer an wenn noch nicht in DB — analog One-Click für Companies.
+    Minimaler Eintrag mit name + ticker; Enrichment folgt via Background-Pipeline.
+    """
+    db = get_supabase()
+    try:
+        # Erst prüfen ob schon vorhanden (ilike)
+        existing = db.table("buyers").select("*").ilike("name", buyer_name).limit(1).execute()
+        if existing.data:
+            return existing.data[0]
+
+        # Neu anlegen
+        payload: dict = {"name": buyer_name, "sector": "unknown"}
+        if ticker:
+            payload["ticker"] = ticker
+
+        result = db.table("buyers").insert(payload).execute()
+        logger.info("BUG-13: Neuer Buyer angelegt: %s", buyer_name)
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("_ensure_buyer_in_db failed for %s: %s", buyer_name, e)
+        return None
 
 
 def _map_stage(stage: str) -> str:

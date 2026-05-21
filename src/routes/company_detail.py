@@ -367,6 +367,46 @@ _TR_WEIGHTS = {
 }
 
 
+# ── BUG-13: Buyer-Relevanz-Filter ────────────────────────────────────────────
+
+_SECTOR_FIT: dict[str, list[str]] = {
+    "energy":          ["energy", "solar", "wind", "hydrogen", "battery", "grid", "geothermal", "nuclear", "cleantech"],
+    "industrials":     ["manufacturing", "construction", "materials", "cement", "steel", "chemical", "industrial"],
+    "technology":      ["software", "ai", "saas", "semiconductor", "cloud", "iot", "robotics", "tech"],
+    "agriculture":     ["agritech", "food", "agriculture", "biotech"],
+    "transportation":  ["mobility", "evs", "logistics", "aviation", "maritime", "transport"],
+    "materials":       ["mining", "materials", "recycling", "carbon capture", "carbon", "climate"],
+    "healthcare":      ["medtech", "biotech", "pharma", "health"],
+    "finance":         ["fintech", "insurance", "payments"],
+}
+
+
+def _filter_relevant_buyers_detail(buyers: list[dict], company: dict) -> list[dict]:
+    """
+    BUG-13: Filtert Buyers nach Sektor-Fit zur Company.
+    Fallback auf alle Buyers wenn < 2 Treffer (kleines Universe).
+    """
+    industry = (company.get("industry") or "").lower()
+    category = (company.get("category") or "").lower()
+    inv_path = (company.get("investment_path") or "").lower()
+    region   = (company.get("region") or "").lower()
+
+    def _fits(buyer: dict) -> bool:
+        buyer_sector = (buyer.get("sector") or "").lower()
+        fit_kws = _SECTOR_FIT.get(buyer_sector, [])
+        if any(kw in industry or kw in category for kw in fit_kws):
+            return True
+        buyer_region = (buyer.get("region") or "").lower()
+        if buyer_region and region and buyer_region == region:
+            return True
+        if inv_path in ("käufer-proxy", "kaufer-proxy") and buyer.get("market_cap_usd_bn", 0) > 5:
+            return True
+        return False
+
+    relevant = [b for b in buyers if _fits(b)]
+    return relevant if len(relevant) >= 2 else buyers
+
+
 # ── Claude intro ──────────────────────────────────────────────────────────────
 
 async def _generate_intro(company: dict, tam: dict) -> str:
@@ -1120,7 +1160,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     ]
 
     # 9. Scoring
-    buyers = fetch_buyers(limit=50)
+    all_buyers = fetch_buyers(limit=50)
+    # BUG-13: nur company-relevante Buyers scoren
+    buyers = _filter_relevant_buyers_detail(all_buyers, company)
+    logger.info(
+        "Scoring: %d/%d Buyers relevant für %s (industry=%s)",
+        len(buyers), len(all_buyers), company_name, company.get("industry"),
+    )
     scorings: list[ScoringDetail] = []
 
     # Auto-TR einmalig berechnen — gilt für alle Buyer-Loops
