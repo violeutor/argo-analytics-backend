@@ -447,139 +447,194 @@ def _pct(v: float | None) -> float | None:
     return round(v * 100, 1) if v is not None else None
 
 
-_YAHOO_UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
-_yahoo_ua_idx = 0
+# Twelve Data API Key — aus settings (konsistent mit restlicher Config-Nutzung)
+_TWELVE_DATA_API_KEY: str | None = None  # wird lazy aus settings geladen
 
-def _next_yahoo_ua() -> str:
-    global _yahoo_ua_idx
-    ua = _YAHOO_UA_POOL[_yahoo_ua_idx % len(_YAHOO_UA_POOL)]
-    _yahoo_ua_idx += 1
-    return ua
+_TD_BASE = "https://api.twelvedata.com"
+
+_TD_EXCHANGE: dict[str, str] = {
+    "nasdaq":    "NASDAQ",
+    "nyse":      "NYSE",
+    "frankfurt": "XETR",
+    "xetra":     "XETR",
+    "london":    "LSE",
+    "euronext":  "XPAR",
+    "milan":     "MIL",
+    "swiss":     "SIX",
+    "amsterdam": "XAMS",
+    "stockholm": "STO",
+}
 
 
-async def _get_yahoo_crumb(client: httpx.AsyncClient) -> tuple[str | None, dict]:
-    """
-    Holt Yahoo Finance Session-Cookie + Crumb für authentifizierte API-Calls.
-    Nötig für quoteSummary seit Yahoo's Auth-Änderung 2024.
-    Versucht erst query2 (oft weniger gedrosselt), dann query1 als Fallback.
-    """
-    ua = _next_yahoo_ua()
-    headers = {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*", "Accept-Language": "en-US,en;q=0.9"}
+def _safe_float(val) -> float | None:
+    """Konvertiert Twelve Data Felder sicher zu float."""
+    if val is None or val == "" or val == "None":
+        return None
     try:
-        # Schritt 1: Session-Cookie + Consent holen
-        await client.get("https://fc.yahoo.com", headers=headers)
-        # Schritt 2: Crumb holen — query2 zuerst, dann query1
-        for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
-            crumb_resp = await client.get(
-                f"https://{host}/v1/test/getcrumb",
-                headers=headers,
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _fetch_twelve_data(symbol: str, exchange_key: str | None) -> dict:
+    """
+    Primärquelle für Fundamentals. Liefert dasselbe dict-Format wie bisheriger _fetch_yahoo().
+    Free Tier: 800 calls/day.
+    """
+    api_key = settings.twelve_data_api_key or _TWELVE_DATA_API_KEY
+    if not api_key:
+        logger.warning("TWELVE_DATA_API_KEY nicht gesetzt")
+        return {}
+
+    mic = _TD_EXCHANGE.get((exchange_key or "").lower(), "")
+    qs  = f"symbol={symbol}&apikey={api_key}" + (f"&exchange={mic}" if mic else "")
+
+    try:
+        timeout = httpx.Timeout(10.0, connect=4.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            quote_resp, stats_resp = await asyncio.gather(
+                client.get(f"{_TD_BASE}/quote?{qs}"),
+                client.get(f"{_TD_BASE}/statistics?{qs}"),
+                return_exceptions=True,
             )
-            if crumb_resp.status_code == 200 and crumb_resp.text.strip():
-                return crumb_resp.text.strip(), dict(client.cookies)
+
+        out: dict = {"ticker": symbol}
+
+        # Quote — Preis + MarktCap
+        if not isinstance(quote_resp, Exception) and quote_resp.status_code == 200:
+            q = quote_resp.json()
+            if q.get("status") != "error":
+                out["price"]        = _safe_float(q.get("close"))
+                out["currency"]     = q.get("currency")
+                out["exchange"]     = _EXCHANGE_DISPLAY.get(q.get("exchange", ""), q.get("exchange"))
+                out["week_52_high"] = _safe_float(q.get("fifty_two_week", {}).get("high"))
+                out["week_52_low"]  = _safe_float(q.get("fifty_two_week", {}).get("low"))
+                mc = _safe_float(q.get("market_cap"))
+                if mc:
+                    out["market_cap_bn"] = mc / 1e9
+                logger.info("TWELVE_DATA quote OK: %s price=%s", symbol, out.get("price"))
+            else:
+                logger.warning("TWELVE_DATA quote error: %s → %s", symbol, q.get("message"))
+        else:
+            s = quote_resp.status_code if not isinstance(quote_resp, Exception) else repr(quote_resp)
+            logger.warning("TWELVE_DATA quote HTTP %s for %s", s, symbol)
+
+        # Statistics — Fundamentals
+        if not isinstance(stats_resp, Exception) and stats_resp.status_code == 200:
+            s = stats_resp.json()
+            if s.get("status") != "error":
+                vs  = s.get("statistics", {})
+                fin = vs.get("financials", {})
+                inc = fin.get("income_statement", {})
+                bal = fin.get("balance_sheet", {})
+                cf  = fin.get("cash_flow", {})
+                val = vs.get("valuations", {})
+                hi  = vs.get("stock_statistics", {})
+
+                if not out.get("market_cap_bn"):
+                    mc2 = _safe_float(val.get("market_capitalization"))
+                    if mc2:
+                        out["market_cap_bn"] = mc2 / 1e9
+
+                out["pe_ratio"]             = _safe_float(val.get("trailing_pe"))
+                out["week_52_high"]         = out.get("week_52_high") or _safe_float(hi.get("week_52_high"))
+                out["week_52_low"]          = out.get("week_52_low")  or _safe_float(hi.get("week_52_low"))
+
+                rev    = _safe_float(inc.get("total_revenue"))
+                ebitda = _safe_float(inc.get("ebitda"))
+                out["revenue_bn"] = rev / 1e9 if rev else None
+                out["ebitda_bn"]  = ebitda / 1e9 if ebitda else None
+
+                debt = _safe_float(bal.get("total_debt"))
+                if out.get("ebitda_bn") and debt:
+                    out["debt_ebitda"] = round((debt / 1e9) / out["ebitda_bn"], 2)
+
+                out["gross_margin_pct"]     = _pct(_safe_float(inc.get("gross_profit_margin")))
+                out["operating_margin_pct"] = _pct(_safe_float(inc.get("operating_margin")))
+                out["profit_margin_pct"]    = _pct(_safe_float(inc.get("net_profit_margin")))
+                out["revenue_growth_pct"]   = _pct(_safe_float(inc.get("quarterly_revenue_growth")))
+                out["earnings_growth_pct"]  = _pct(_safe_float(inc.get("quarterly_earnings_growth_yoy")))
+
+                fcf = _safe_float(cf.get("free_cash_flow"))
+                ocf = _safe_float(cf.get("operating_cash_flow"))
+                out["free_cashflow_bn"]      = fcf / 1e9 if fcf else None
+                out["operating_cashflow_bn"] = ocf / 1e9 if ocf else None
+
+                ev = _safe_float(val.get("enterprise_value"))
+                out["enterprise_value_bn"] = ev / 1e9 if ev else None
+                if ev and out.get("revenue_bn"):
+                    out["ev_revenue"] = round((ev / 1e9) / out["revenue_bn"], 1)
+                if ev and out.get("ebitda_bn"):
+                    out["ev_ebitda"]  = round((ev / 1e9) / out["ebitda_bn"], 1)
+
+                logger.info(
+                    "TWELVE_DATA stats OK: %s rev=%.1fBn margin=%.1f%% ev=%.1fBn",
+                    symbol,
+                    out.get("revenue_bn") or 0,
+                    out.get("gross_margin_pct") or 0,
+                    out.get("enterprise_value_bn") or 0,
+                )
+            else:
+                logger.warning("TWELVE_DATA stats error: %s → %s", symbol, s.get("message"))
+        else:
+            sc = stats_resp.status_code if not isinstance(stats_resp, Exception) else repr(stats_resp)
+            logger.warning("TWELVE_DATA stats HTTP %s for %s", sc, symbol)
+
+        return out
+
     except Exception as e:
-        logger.debug("Yahoo crumb fetch failed: %s", e)
-    return None, {}
+        logger.warning("TWELVE_DATA failed for %s: %s", symbol, e)
+        return {}
+
+
+async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
+    """Yahoo Chart-API — nur Preis + MarktCap, kein Auth nötig."""
+    try:
+        timeout = httpx.Timeout(6.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            cr = await client.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+            )
+        if cr.status_code == 200:
+            meta = cr.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            return {
+                "price":         meta.get("regularMarketPrice"),
+                "market_cap_bn": (meta.get("marketCap") or 0) / 1e9 or None,
+                "currency":      meta.get("currency"),
+                "exchange":      _EXCHANGE_DISPLAY.get(meta.get("exchangeName", ""), meta.get("exchangeName")),
+            }
+    except Exception as e:
+        logger.debug("Yahoo chart fallback failed for %s: %s", symbol, e)
+    return {}
 
 
 async def _fetch_yahoo(ticker: str | None) -> dict:
+    """
+    Primär: Twelve Data (Quote + Statistics).
+    Fallback: Yahoo Chart-API für Preis/MarktCap wenn Twelve Data keinen Preis liefert.
+    """
     if not ticker:
         return {}
     parts = ticker.split("·")
     symbol = parts[0].split("→")[-1].strip()
+    exchange_key: str | None = None
     if len(parts) > 1 and "." not in symbol:
         exchange_key = parts[1].strip().lower()
         suffix = _EXCHANGE_SUFFIX.get(exchange_key, "")
         if suffix:
             symbol = symbol + suffix
-    try:
-        timeout = httpx.Timeout(8.0, connect=3.0)
-        ua = _next_yahoo_ua()
-        headers = {"User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
-        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-            # Crumb holen + Chart-Call parallel
-            crumb, _ = await _get_yahoo_crumb(client)
-            cr = await client.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
-            )
-            # quoteSummary: v11 zuerst (weniger Auth-Probleme), v10 als Fallback
-            qs_base = f"?modules=summaryDetail,financialData,defaultKeyStatistics,price" \
-                      + (f"&crumb={crumb}" if crumb else "")
-            sr = await client.get(
-                f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{symbol}{qs_base}"
-            )
-            if sr.status_code != 200:
-                sr = await client.get(
-                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{qs_base}"
-                )
 
-        # Chart — Preis + Marktcap
-        meta = {}
-        if not isinstance(cr, Exception) and cr.status_code == 200:
-            meta = cr.json().get("chart",{}).get("result",[{}])[0].get("meta",{})
-        out = {
-            "ticker": symbol,
-            "exchange": _EXCHANGE_DISPLAY.get(meta.get("exchangeName", ""), meta.get("exchangeName")),
-            "price": meta.get("regularMarketPrice"),
-            "market_cap_bn": (meta.get("marketCap") or 0) / 1e9 or None,
-            "currency": meta.get("currency"),
-        }
-        if not isinstance(sr, Exception) and sr.status_code == 200:
-            res = sr.json().get("quoteSummary",{}).get("result",[{}])[0]
-            det = res.get("summaryDetail",{})
-            fin = res.get("financialData",{})
-            ks  = res.get("defaultKeyStatistics",{})
-            prc = res.get("price",{})
-            # Marktcap: price-Modul ist zuverlässiger für internationale Ticker
-            mc_raw = (prc.get("marketCap",{}).get("raw")
-                      or det.get("marketCap",{}).get("raw")
-                      or meta.get("marketCap"))
-            if mc_raw:
-                out["market_cap_bn"] = mc_raw / 1e9
-            out["pe_ratio"]     = det.get("trailingPE",{}).get("raw")
-            out["week_52_high"] = det.get("fiftyTwoWeekHigh",{}).get("raw")
-            out["week_52_low"]  = det.get("fiftyTwoWeekLow",{}).get("raw")
-            out["revenue_bn"]   = (fin.get("totalRevenue",{}).get("raw") or 0) / 1e9 or None
-            out["ebitda_bn"]    = (fin.get("ebitda",{}).get("raw") or 0) / 1e9 or None
-            if out.get("ebitda_bn") and fin.get("totalDebt",{}).get("raw"):
-                out["debt_ebitda"] = (fin["totalDebt"]["raw"]/1e9) / out["ebitda_bn"]
-            # Margen
-            out["gross_margin_pct"]     = _pct(fin.get("grossMargins",{}).get("raw"))
-            out["operating_margin_pct"] = _pct(fin.get("operatingMargins",{}).get("raw"))
-            out["profit_margin_pct"]    = _pct(fin.get("profitMargins",{}).get("raw"))
-            # Growth
-            out["revenue_growth_pct"]   = _pct(fin.get("revenueGrowth",{}).get("raw"))
-            out["earnings_growth_pct"]  = _pct(fin.get("earningsGrowth",{}).get("raw"))
-            # Cashflow
-            fcf_raw = fin.get("freeCashflow",{}).get("raw")
-            ocf_raw = fin.get("operatingCashflow",{}).get("raw")
-            out["free_cashflow_bn"]     = fcf_raw / 1e9 if fcf_raw else None
-            out["operating_cashflow_bn"]= ocf_raw / 1e9 if ocf_raw else None
-            # Enterprise Value + Multiples
-            ev_raw = ks.get("enterpriseValue",{}).get("raw")
-            out["enterprise_value_bn"]  = ev_raw / 1e9 if ev_raw else None
-            if ev_raw and out.get("revenue_bn"):
-                out["ev_revenue"] = round(ev_raw / 1e9 / out["revenue_bn"], 1)
-            if ev_raw and out.get("ebitda_bn"):
-                out["ev_ebitda"]  = round(ev_raw / 1e9 / out["ebitda_bn"], 1)
-            logger.warning(
-                "YAHOO_DEBUG %s — margin=%.1f%% rev_growth=%.1f%% fcf=%s ev=%s",
-                symbol,
-                out.get("gross_margin_pct") or 0,
-                out.get("revenue_growth_pct") or 0,
-                out.get("free_cashflow_bn"),
-                out.get("enterprise_value_bn"),
-            )
-        else:
-            sr_status = sr.status_code if not isinstance(sr, Exception) else repr(sr)
-            logger.warning("YAHOO_DEBUG %s — quoteSummary HTTP %s crumb=%s", symbol, sr_status, bool(crumb))
-        return out
-    except Exception as e:
-        logger.warning("Yahoo Finance failed for %s: %s", symbol, e)
-        return {"ticker": symbol}
+    out = await _fetch_twelve_data(symbol, exchange_key)
+
+    if not out.get("price"):
+        logger.info("Twelve Data kein Preis für %s — Yahoo Chart Fallback", symbol)
+        fallback = await _fetch_yahoo_price_fallback(symbol)
+        for k in ("price", "market_cap_bn", "currency", "exchange"):
+            if fallback.get(k) and not out.get(k):
+                out[k] = fallback[k]
+
+    out.setdefault("ticker", symbol)
+    return out
 
 
 async def _fetch_beta_from_bridge(
