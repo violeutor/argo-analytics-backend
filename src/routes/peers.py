@@ -266,23 +266,29 @@ async def _resolve_or_create_peer(
             return db_id
 
     # Nicht gefunden → minimal anlegen
-    try:
-        payload = {
-            "name":            peer_name,
-            "source":          "peer_generated",
-            "investment_path": "Beobachten",
-            # Industrie vom Source-Company übernehmen als Startwert
-            "industry":        source_company.get("industry"),
-            "category":        source_company.get("category"),
-            "region":          source_company.get("region"),
-        }
-        result = db.table("companies").insert(payload).execute()
-        if result.data:
-            new_id = result.data[0]["id"]
-            logger.info("Peer angelegt: %s → %s", peer_name, new_id)
-            return new_id
-    except Exception as e:
-        logger.warning("Peer anlegen fehlgeschlagen für %s: %s", peer_name, e)
+    for source_val in ("peer_generated", "manual"):
+        try:
+            payload = {
+                "name":            peer_name,
+                "source":          source_val,
+                "investment_path": "Beobachten",
+                # Industrie vom Source-Company übernehmen als Startwert
+                "industry":        source_company.get("industry"),
+                "category":        source_company.get("category"),
+                "region":          source_company.get("region"),
+            }
+            result = db.table("companies").insert(payload).execute()
+            if result.data:
+                new_id = result.data[0]["id"]
+                logger.info("Peer angelegt: %s → %s (source=%s)", peer_name, new_id, source_val)
+                return new_id
+            break
+        except Exception as e:
+            if source_val == "peer_generated" and "22P02" in str(e):
+                logger.warning("Enum 'peer_generated' fehlt — Fallback auf 'manual' für %s", peer_name)
+                continue
+            logger.warning("Peer anlegen fehlgeschlagen für %s: %s", peer_name, e)
+            break
 
     return None
 
