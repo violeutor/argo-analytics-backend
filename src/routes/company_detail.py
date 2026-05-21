@@ -108,7 +108,17 @@ class FundamentalsData(BaseModel):
     ba_total_assets_mn: float | None = None
     ba_employees: int | None = None
     ba_source_url: str | None = None
-
+    # Beta (YH-06)
+    # listed  → beta_cache (BA-Bridge, yfinance)
+    # private → damodaran_beta (Branchen-Beta, NYU Damodaran)
+    beta_1y: float | None = None
+    beta_3y: float | None = None
+    volatility_30d: float | None = None
+    beta_source: str | None = None          # 'market' | 'damodaran'
+    beta_benchmark: str | None = None       # z.B. '^GDAXI', '^GSPC'
+    beta_benchmark_is_fallback: bool = False
+    beta_calculated_at: str | None = None   # ISO 8601 — für Frontend-Tooltip "Stand 19.05."
+    beta_data_quality: str | None = None    # 'full' | 'partial'
 
 class TechReadinessDetail(BaseModel):
     overall: float
@@ -547,14 +557,90 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
         return {"ticker": symbol}
 
 
+async def _fetch_beta_from_bridge(
+    ticker: str | None,
+    category: str | None,
+    is_listed: bool,
+) -> dict:
+    """
+    YH-06 — Beta-Routing:
+        listed  → GET /yahoo/ticker/{ticker}           → beta_source='market'
+        private → GET /yahoo/ticker/_/damodaran        → beta_source='damodaran'
+
+    Gibt leeres dict zurück bei Fehler / nicht gefunden — kein Hard-Fail.
+    """
+    if not settings.ba_bridge_url:
+        return {}
+
+    headers = {"X-API-Key": settings.ba_bridge_api_key}
+    timeout = httpx.Timeout(5.0, connect=2.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            if is_listed and ticker:
+                symbol = ticker.split("·")[0].split("→")[-1].strip().upper()
+                resp = await client.get(f"{settings.ba_bridge_url}/yahoo/ticker/{symbol}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return {
+                        "beta_1y":                    data.get("beta_1y"),
+                        "beta_3y":                    data.get("beta_3y"),
+                        "volatility_30d":             data.get("volatility_30d"),
+                        "beta_source":                "market",
+                        "beta_benchmark":             data.get("benchmark_ticker"),
+                        "beta_benchmark_is_fallback": data.get("benchmark_is_fallback", False),
+                        "beta_calculated_at":         data.get("calculated_at"),
+                        "beta_data_quality":          data.get("data_quality"),
+                    }
+                logger.debug("Beta bridge miss for ticker=%s: HTTP %s", symbol, resp.status_code)
+
+            elif not is_listed and category:
+                resp = await client.get(
+                    f"{settings.ba_bridge_url}/yahoo/ticker/_/damodaran",
+                    params={"category": category},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return {
+                        "beta_1y":                    data.get("unlevered_beta"),
+                        "beta_3y":                    None,
+                        "volatility_30d":             None,
+                        "beta_source":                "damodaran",
+                        "beta_benchmark":             f"Damodaran · {data.get('sector', '')}",
+                        "beta_benchmark_is_fallback": False,
+                        "beta_calculated_at":         None,
+                        "beta_data_quality":          "full",
+                    }
+                logger.debug("Damodaran miss for category=%s: HTTP %s", category, resp.status_code)
+
+    except Exception as e:
+        logger.debug("_fetch_beta_from_bridge failed: %s", e)
+
+    return {}
+
+
 def _build_fundamentals(
     is_listed: bool,
     yahoo: dict,
     ba: BundesanzeigerData | None,
     proxy: str | None,
+    beta: dict | None = None,
 ) -> FundamentalsData:
+    beta = beta or {}
+
+    def _apply_beta(fd: FundamentalsData) -> FundamentalsData:
+        fd.beta_1y                    = beta.get("beta_1y")
+        fd.beta_3y                    = beta.get("beta_3y")
+        fd.volatility_30d             = beta.get("volatility_30d")
+        fd.beta_source                = beta.get("beta_source")
+        fd.beta_benchmark             = beta.get("beta_benchmark")
+        fd.beta_benchmark_is_fallback = beta.get("beta_benchmark_is_fallback", False)
+        fd.beta_calculated_at         = beta.get("beta_calculated_at")
+        fd.beta_data_quality          = beta.get("beta_data_quality")
+        return fd
+
     if is_listed:
-        return FundamentalsData(
+        fd = FundamentalsData(
             is_listed=True,
             ticker=yahoo.get("ticker") or (proxy.split("·")[0].strip() if proxy else None),
             exchange=yahoo.get("exchange"), price=yahoo.get("price"),
@@ -573,6 +659,8 @@ def _build_fundamentals(
             ev_ebitda=yahoo.get("ev_ebitda"),
             enterprise_value_bn=yahoo.get("enterprise_value_bn"),
         )
+        return _apply_beta(fd)
+
     fd = FundamentalsData(is_listed=False)
     if ba and ba.found:
         fd.ba_found=True; fd.ba_legal_form=ba.legal_form
@@ -580,7 +668,7 @@ def _build_fundamentals(
         fd.ba_revenue_mn=ba.revenue_mn; fd.ba_equity_mn=ba.equity_mn
         fd.ba_total_assets_mn=ba.total_assets_mn; fd.ba_employees=ba.employees
         fd.ba_source_url=ba.source_url
-    return fd
+    return _apply_beta(fd)
 
 
 # ── Supabase query ────────────────────────────────────────────────────────────
@@ -813,8 +901,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     headcount_disp    = enrichment.employee_count or (str(company.get("headcount")) if company.get("headcount") else None)
     description_disp  = enrichment.description    or company.get("description")
 
-    # 5. Fundamentals
-    fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy)
+    # 5. Fundamentals + Beta (YH-06)
+    beta = await _fetch_beta_from_bridge(
+        ticker=company.get("ticker") or (proxy.split("·")[0].strip() if proxy else None),
+        category=company.get("category"),
+        is_listed=is_listed,
+    )
+    fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy, beta)
 
     # 7. Ownership
     if company_name in _OWNERSHIP_OVERRIDES:
