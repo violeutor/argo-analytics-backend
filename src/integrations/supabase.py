@@ -311,3 +311,72 @@ def insert_score(deal_id: str, scores, summary: str, warnings: list[str]) -> str
 
     result = db.table("scores").insert(payload).execute()
     return result.data[0]["id"]
+
+
+# ── Signals (SE-01–SE-03) ─────────────────────────────────────────────────────
+
+def fetch_signals(company_id: str, limit: int = 50) -> list[dict]:
+    """Gibt Signals für eine Company zurück, chronologisch absteigend."""
+    db = get_supabase()
+    try:
+        result = db.table("signals").select(
+            "id, event_type, event_date, summary, source, source_url, severity, is_read, raw_title, created_at"
+        ).eq("company_id", company_id).order("event_date", desc=True).limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_signals failed for %s: %s", company_id, e)
+        return []
+
+
+def fetch_all_signals(limit: int = 500) -> list[dict]:
+    """Gibt alle Signals zurück — für Dashboard-Übersicht."""
+    db = get_supabase()
+    try:
+        result = db.table("signals").select(
+            "id, company_id, event_type, event_date, summary, source, severity, created_at"
+        ).order("event_date", desc=True).limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_all_signals failed: %s", e)
+        return []
+
+
+def upsert_signals(events: list[dict]) -> int:
+    """
+    Schreibt Signal-Events in die signals-Tabelle.
+    Duplikat-sicher via UNIQUE INDEX (company_id, event_type, event_date, source).
+    Gibt Anzahl geschriebener Rows zurück.
+
+    Erwartet dicts mit:
+        company_id, event_type, event_date, summary,
+        source, source_url, severity, raw_title
+    """
+    if not events:
+        return 0
+    db = get_supabase()
+    written = 0
+    for event in events:
+        try:
+            db.table("signals").upsert(
+                event,
+                on_conflict="company_id,event_type,event_date,source",
+                ignore_duplicates=True,
+            ).execute()
+            written += 1
+        except Exception as e:
+            logger.warning("upsert_signals FAILED for event %s: %s", event.get("event_type"), e)
+    logger.info("upsert_signals: %d/%d events written", written, len(events))
+    return written
+
+
+def fetch_last_signal_date(company_id: str) -> str | None:
+    """Gibt das Datum des jüngsten Signals für eine Company zurück (ISO 8601)."""
+    db = get_supabase()
+    try:
+        result = db.table("signals").select("event_date").eq(
+            "company_id", company_id
+        ).order("event_date", desc=True).limit(1).execute()
+        return result.data[0]["event_date"] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_last_signal_date failed for %s: %s", company_id, e)
+        return None
