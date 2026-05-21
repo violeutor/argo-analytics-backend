@@ -16,7 +16,7 @@ Endpoints:
 """
 
 import logging
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 
 from src.integrations.supabase import (
     fetch_company_by_name,
@@ -70,48 +70,52 @@ def get_all_signals(limit: int = 100):
 
 
 @router.post("/signals/trigger")
-async def trigger_signal_engine(background_tasks: BackgroundTasks):
+async def trigger_signal_engine():
     """
     Manueller Trigger der Signal-Engine — für Tests und Debugging.
-    Läuft als BackgroundTask um den Request nicht zu blockieren.
+    Läuft synchron (blockierend) damit Render Free Tier die Task nicht killt.
     """
-    async def _run():
-        logger.info("Manual trigger: _run() gestartet")
+    logger.info("Manual trigger: gestartet")
+    try:
+        from src.integrations.supabase import (
+            fetch_companies, upsert_signals
+        )
+        from src.services.signal_engine import run_signal_engine
+
+        logger.info("Manual trigger: imports OK")
+
+        companies = fetch_companies(limit=500)
+        logger.info("Manual trigger: %d companies geladen", len(companies))
+
+        ownership_map: dict[str, list[dict]] = {}
         try:
-            from src.integrations.supabase import (
-                fetch_companies, upsert_signals
-            )
-            from src.services.signal_engine import run_signal_engine
+            from src.integrations.supabase import fetch_all_ownership_entries
+            all_ownership = fetch_all_ownership_entries()
+            for entry in all_ownership:
+                cid = entry.get("company_id")
+                if cid:
+                    ownership_map.setdefault(cid, []).append(entry)
+            logger.info("Manual trigger: ownership_map %d companies", len(ownership_map))
+        except Exception as oe:
+            logger.warning("Manual trigger: ownership fetch failed (%s) — leere Map", oe)
 
-            logger.info("Manual trigger: imports OK")
+        events = await run_signal_engine(companies, ownership_map)
+        logger.info("Manual trigger: %d events gesammelt", len(events))
 
-            companies = fetch_companies(limit=500)
-            logger.info("Manual trigger: %d companies geladen", len(companies))
+        written = 0
+        if events:
+            written = upsert_signals([e.to_dict() for e in events])
+            logger.info("Manual trigger: %d/%d events geschrieben", written, len(events))
+        else:
+            logger.info("Manual trigger: keine events")
 
-            # Ownership-Map aufbauen: {company_id: [entries]}
-            ownership_map: dict[str, list[dict]] = {}
-            try:
-                from src.integrations.supabase import fetch_all_ownership_entries
-                all_ownership = fetch_all_ownership_entries()
-                for entry in all_ownership:
-                    cid = entry.get("company_id")
-                    if cid:
-                        ownership_map.setdefault(cid, []).append(entry)
-                logger.info("Manual trigger: ownership_map %d companies", len(ownership_map))
-            except Exception as oe:
-                logger.warning("Manual trigger: ownership fetch failed (%s) — leere Map", oe)
+        return {
+            "status":        "done",
+            "companies":     len(companies),
+            "events_found":  len(events),
+            "events_written": written,
+        }
 
-            events = await run_signal_engine(companies, ownership_map)
-            logger.info("Manual trigger: %d events gesammelt", len(events))
-
-            if events:
-                written = upsert_signals([e.to_dict() for e in events])
-                logger.info("Manual trigger: %d/%d events geschrieben", written, len(events))
-            else:
-                logger.info("Manual trigger: keine events")
-
-        except Exception as e:
-            logger.exception("Manual signal trigger FEHLER: %s", e)
-
-    background_tasks.add_task(_run)
-    return {"status": "triggered", "message": "Signal-Engine läuft im Hintergrund."}
+    except Exception as e:
+        logger.exception("Manual signal trigger FEHLER: %s", e)
+        return {"status": "error", "detail": str(e)}
