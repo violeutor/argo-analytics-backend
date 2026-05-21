@@ -119,6 +119,12 @@ class FundamentalsData(BaseModel):
     beta_benchmark_is_fallback: bool = False
     beta_calculated_at: str | None = None   # ISO 8601 — für Frontend-Tooltip "Stand 19.05."
     beta_data_quality: str | None = None    # 'full' | 'partial'
+    # FD-01 Routing — Herkunfts-Badge je Feld im Frontend
+    fundamentals_source: str | None = None          # 'yahoo' | 'ba_bridge' | 'edgar' | 'none'
+    fundamentals_source_secondary: str | None = None # z.B. 'ba_bridge' als Ergänzung zu Yahoo (listed DE)
+    fundamentals_quality_flag: str | None = None    # None | 'partial' | 'no_data'
+    # partial  → Yahoo lückenhaft (kleinere EU-Börse) — Frontend zeigt Hinweis
+    # no_data  → keine Finanzdaten öffentlich verfügbar — Frontend zeigt Badge
 
 class TechReadinessDetail(BaseModel):
     overall: float
@@ -625,8 +631,10 @@ def _build_fundamentals(
     ba: BundesanzeigerData | None,
     proxy: str | None,
     beta: dict | None = None,
+    fd_source: dict | None = None,
 ) -> FundamentalsData:
-    beta = beta or {}
+    beta      = beta or {}
+    fd_source = fd_source or {}
 
     def _apply_beta(fd: FundamentalsData) -> FundamentalsData:
         fd.beta_1y                    = beta.get("beta_1y")
@@ -637,6 +645,10 @@ def _build_fundamentals(
         fd.beta_benchmark_is_fallback = beta.get("beta_benchmark_is_fallback", False)
         fd.beta_calculated_at         = beta.get("beta_calculated_at")
         fd.beta_data_quality          = beta.get("beta_data_quality")
+        # FD-01 Routing — Herkunfts-Badge
+        fd.fundamentals_source           = fd_source.get("primary")
+        fd.fundamentals_source_secondary = fd_source.get("secondary")
+        fd.fundamentals_quality_flag     = fd_source.get("quality_flag")
         return fd
 
     if is_listed:
@@ -669,6 +681,96 @@ def _build_fundamentals(
         fd.ba_total_assets_mn=ba.total_assets_mn; fd.ba_employees=ba.employees
         fd.ba_source_url=ba.source_url
     return _apply_beta(fd)
+
+
+# ── FD-01 · Fundamentals-Routing ─────────────────────────────────────────────
+
+# Mögliche Quellen-Typen — für Herkunfts-Badge im Frontend
+FUNDAMENTALS_SOURCE_YAHOO    = "yahoo"        # Yahoo Finance (listed)
+FUNDAMENTALS_SOURCE_BA       = "ba_bridge"    # Bundesanzeiger via BA-Bridge (private DE)
+FUNDAMENTALS_SOURCE_EDGAR    = "edgar"        # SEC EDGAR (private/listed US) — Phase 2
+FUNDAMENTALS_SOURCE_NONE     = "none"         # Keine Fundamentals öffentlich verfügbar
+
+
+def _get_fundamentals_source(
+    is_listed: bool,
+    exchange: str | None,
+    region: str | None,
+) -> dict:
+    """
+    FD-01 — Routing-Logik: welche Quellen für Fundamentals nutzen.
+
+    Returns:
+        {
+            "primary":   str,   # Haupt-Quelle
+            "secondary": str | None,  # Ergänzung (z.B. BA-Bridge für listed DE)
+            "beta":      str,   # 'market' (listed) | 'damodaran' (private)
+            "quality_flag": str | None,  # None | 'partial' — für Frontend-Hinweis
+        }
+
+    Routing-Tabelle (aus REQUESTS v1.8 FD-Block):
+        Private DE          → BA-Bridge primär
+        Private US          → EDGAR primär (Phase 2), Wikipedia Fallback
+        Private EU non-DE   → none (Revenue oft nicht öffentlich)
+        Private non-EU/US   → none
+        Listed US           → Yahoo Finance
+        Listed EU DE        → Yahoo Finance + BA-Bridge (Ergänzung)
+        Listed EU non-DE    → Yahoo Finance (quality_flag='partial' — lückenhaft)
+        Listed non-EU/US    → Yahoo Finance (quality_flag='partial')
+    """
+    exchange_norm = (exchange or "").lower()
+    region_norm   = (region or "").lower()
+
+    # ── Listed ──────────────────────────────────────────────────────────────
+    if is_listed:
+        # US-Börsen — Yahoo zuverlässig
+        if exchange_norm in ("nyse", "nasdaq", "nyse arca"):
+            return {
+                "primary":      FUNDAMENTALS_SOURCE_YAHOO,
+                "secondary":    None,
+                "beta":         "market",
+                "quality_flag": None,
+            }
+        # Frankfurt / Xetra — Yahoo + BA-Bridge Ergänzung
+        if exchange_norm in ("frankfurt", "xetra"):
+            return {
+                "primary":      FUNDAMENTALS_SOURCE_YAHOO,
+                "secondary":    FUNDAMENTALS_SOURCE_BA,
+                "beta":         "market",
+                "quality_flag": None,
+            }
+        # Sonstige EU + internationale Börsen — Yahoo, aber lückenhaft
+        return {
+            "primary":      FUNDAMENTALS_SOURCE_YAHOO,
+            "secondary":    None,
+            "beta":         "market",
+            "quality_flag": "partial",  # Frontend zeigt Hinweis
+        }
+
+    # ── Private ─────────────────────────────────────────────────────────────
+    # DE (region oder exchange gibt Hinweis)
+    if region_norm in ("de", "deu", "germany") or exchange_norm in ("frankfurt", "xetra"):
+        return {
+            "primary":      FUNDAMENTALS_SOURCE_BA,
+            "secondary":    None,
+            "beta":         "damodaran",
+            "quality_flag": None,
+        }
+    # US
+    if region_norm in ("us", "usa", "united states"):
+        return {
+            "primary":      FUNDAMENTALS_SOURCE_EDGAR,   # Phase 2 — aktuell Wikipedia-Fallback
+            "secondary":    None,
+            "beta":         "damodaran",
+            "quality_flag": None,
+        }
+    # EU non-DE + Rest
+    return {
+        "primary":      FUNDAMENTALS_SOURCE_NONE,
+        "secondary":    None,
+        "beta":         "damodaran",
+        "quality_flag": "no_data",  # Frontend zeigt Badge "Keine Finanzdaten öffentlich verfügbar"
+    }
 
 
 # ── Supabase query ────────────────────────────────────────────────────────────
@@ -901,13 +1003,31 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     headcount_disp    = enrichment.employee_count or (str(company.get("headcount")) if company.get("headcount") else None)
     description_disp  = enrichment.description    or company.get("description")
 
-    # 5. Fundamentals + Beta (YH-06)
+    # 5. Fundamentals + Beta (YH-06) + Routing (FD-01)
+    fd_source = _get_fundamentals_source(
+        is_listed=is_listed,
+        exchange=company.get("exchange") or yahoo.get("exchange"),
+        region=company.get("region"),
+    )
     beta = await _fetch_beta_from_bridge(
         ticker=company.get("ticker") or (proxy.split("·")[0].strip() if proxy else None),
         category=company.get("category"),
         is_listed=is_listed,
     )
-    fundamentals = _build_fundamentals(is_listed, yahoo, enrichment.bundesanzeiger, proxy, beta)
+    fundamentals = _build_fundamentals(
+        is_listed=is_listed,
+        yahoo=yahoo,
+        ba=enrichment.bundesanzeiger,
+        proxy=proxy,
+        beta=beta,
+        fd_source=fd_source,
+    )
+    # FD-02 — Lücken-Badge: keine öffentlichen Finanzdaten
+    if fd_source["primary"] == "none":
+        warnings.append("Keine Finanzdaten öffentlich verfügbar für diese Company.")
+    # FD-03 — Qualitäts-Flag: Yahoo-Daten lückenhaft (kleinere EU-Börsen)
+    if fd_source.get("quality_flag") == "partial" and is_listed:
+        warnings.append("Marktdaten eingeschränkt verfügbar — kleinere Börse, Yahoo Finance lückenhaft.")
 
     # 7. Ownership
     if company_name in _OWNERSHIP_OVERRIDES:
