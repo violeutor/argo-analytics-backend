@@ -10,6 +10,7 @@ from src.routes.market import router as market_router
 from src.routes.ownership import router as ownership_router
 from src.routes.value_drivers import router as value_drivers_router
 from src.routes.signals import router as signals_router
+from src.routes.peers import router as peers_router
 import os
 import asyncio
 import logging
@@ -107,6 +108,7 @@ app.include_router(market_router)
 app.include_router(ownership_router)
 app.include_router(value_drivers_router)
 app.include_router(signals_router)
+app.include_router(peers_router)
 
 
 @app.get("/health")
