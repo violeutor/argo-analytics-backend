@@ -447,25 +447,39 @@ def _pct(v: float | None) -> float | None:
     return round(v * 100, 1) if v is not None else None
 
 
+_YAHOO_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+_yahoo_ua_idx = 0
+
+def _next_yahoo_ua() -> str:
+    global _yahoo_ua_idx
+    ua = _YAHOO_UA_POOL[_yahoo_ua_idx % len(_YAHOO_UA_POOL)]
+    _yahoo_ua_idx += 1
+    return ua
+
+
 async def _get_yahoo_crumb(client: httpx.AsyncClient) -> tuple[str | None, dict]:
     """
     Holt Yahoo Finance Session-Cookie + Crumb für authentifizierte API-Calls.
     Nötig für quoteSummary seit Yahoo's Auth-Änderung 2024.
+    Versucht erst query2 (oft weniger gedrosselt), dann query1 als Fallback.
     """
+    ua = _next_yahoo_ua()
+    headers = {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*", "Accept-Language": "en-US,en;q=0.9"}
     try:
-        # Schritt 1: Session-Cookie holen
-        await client.get(
-            "https://fc.yahoo.com",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        # Schritt 2: Crumb holen
-        crumb_resp = await client.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if crumb_resp.status_code == 200:
-            crumb = crumb_resp.text.strip()
-            return crumb, dict(client.cookies)
+        # Schritt 1: Session-Cookie + Consent holen
+        await client.get("https://fc.yahoo.com", headers=headers)
+        # Schritt 2: Crumb holen — query2 zuerst, dann query1
+        for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
+            crumb_resp = await client.get(
+                f"https://{host}/v1/test/getcrumb",
+                headers=headers,
+            )
+            if crumb_resp.status_code == 200 and crumb_resp.text.strip():
+                return crumb_resp.text.strip(), dict(client.cookies)
     except Exception as e:
         logger.debug("Yahoo crumb fetch failed: %s", e)
     return None, {}
@@ -483,19 +497,24 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
             symbol = symbol + suffix
     try:
         timeout = httpx.Timeout(8.0, connect=3.0)
-        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        ua = _next_yahoo_ua()
+        headers = {"User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
             # Crumb holen + Chart-Call parallel
             crumb, _ = await _get_yahoo_crumb(client)
             cr = await client.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
             )
-            # quoteSummary mit Crumb wenn vorhanden
-            qs_url = (
-                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                f"?modules=summaryDetail,financialData,defaultKeyStatistics,price"
-                + (f"&crumb={crumb}" if crumb else "")
+            # quoteSummary: v11 zuerst (weniger Auth-Probleme), v10 als Fallback
+            qs_base = f"?modules=summaryDetail,financialData,defaultKeyStatistics,price" \
+                      + (f"&crumb={crumb}" if crumb else "")
+            sr = await client.get(
+                f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{symbol}{qs_base}"
             )
-            sr = await client.get(qs_url)
+            if sr.status_code != 200:
+                sr = await client.get(
+                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{qs_base}"
+                )
 
         # Chart — Preis + Marktcap
         meta = {}
