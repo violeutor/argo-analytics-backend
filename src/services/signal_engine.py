@@ -856,7 +856,7 @@ def check_absence_signals(
             severity="low",
             raw_title="Headcount-Transparenz: keine Daten",
             direction="negative",
-            signal_category="general_news",
+            signal_category="filing",
         ))
 
     # 4. Kein Revenue in tech-nahen Sektoren (höhere Erwartung an Transparenz)
