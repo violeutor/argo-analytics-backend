@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-haiku-4-5-20251001"
 
 # ── Dimensionen-Definitionen ──────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ def fetch_scorings(company_id: str) -> list[dict]:
     db = get_supabase()
     try:
         r = db.table("scores").select(
-            "rating, srr_value, srr_category, mfr_value, mfr_signal, tech_readiness"
+            "rating, srr_value, srr_category, mfr_value, mfr_signal, tr_value"
         ).eq("company_id", company_id).order("created_at", desc=True).limit(1).execute()
         return r.data or []
     except Exception as e:
@@ -172,7 +172,7 @@ def _build_context(company: dict, market: dict | None, tam: dict | None,
             f"  Rating: {sc.get('rating') or '—'}",
             f"  SRR: {sc.get('srr_value') or '—'} ({sc.get('srr_category') or '—'})",
             f"  MFR: {sc.get('mfr_value') or '—'} → {sc.get('mfr_signal') or '—'}",
-            f"  TechReadiness: {sc.get('tech_readiness') or '—'}",
+            f"  TechReadiness: {sc.get('tr_value') or '—'}",
         ]
 
     if pos_signals:
