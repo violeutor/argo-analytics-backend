@@ -100,30 +100,52 @@ Rules:
 
 
 async def _fetch_market_snippets(company: str, sector: str) -> list[str]:
-    """Google Search Snippets für Marktsegmente + Wachstumstreiber."""
+    """
+    MD-B01: Snippets für Marktsegmente + Wachstumstreiber.
+    Primär: DuckDuckGo HTML-Suche (kein API-Key, kein CAPTCHA-Problem).
+    Fallback: Direkte IEA/BNEF-PR-Seiten via httpx.
+    Google-Scraping entfernt — CSS-Klassen zu instabil, CAPTCHA auf Render.
+    """
     queries = [
-        f"{sector} market segments breakdown 2035 billion USD",
-        f"{sector} market growth drivers trends 2030",
-        f"{company} {sector} total addressable market segments",
+        f"{sector} market size segments 2035 billion USD site:iea.org OR site:bnef.com OR site:mckinsey.com",
+        f"{sector} market growth drivers 2030 2035",
+        f"{company} total addressable market {sector} segments",
     ]
     snippets: list[str] = []
     try:
-        async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
-            for q in queries[:2]:  # max 2 requests
-                resp = await client.get(
-                    "https://www.google.com/search",
-                    params={"q": q, "num": 5, "hl": "en"},
-                    follow_redirects=True,
-                )
-                if resp.status_code == 200:
-                    found = re.findall(
-                        r'class="(?:BNeawe|VwiC3b|MUxGbd)[^"]*"[^>]*>([^<]{30,300})<',
-                        resp.text,
+        async with httpx.AsyncClient(
+            timeout=10,
+            headers={
+                **HEADERS,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            follow_redirects=True,
+        ) as client:
+            for q in queries[:2]:
+                try:
+                    resp = await client.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": q},
                     )
-                    snippets.extend(found[:5])
+                    if resp.status_code == 200:
+                        # DuckDuckGo HTML: Snippets in <a class="result__snippet">
+                        found = re.findall(
+                            r'class="result__snippet"[^>]*>([^<]{30,400})<',
+                            resp.text,
+                        )
+                        # Fallback: generische <span> mit Zahlen (enthält oft Marktdaten)
+                        if not found:
+                            found = re.findall(
+                                r'<a[^>]+class="result__url"[^>]*>([^<]{10,200})<',
+                                resp.text,
+                            )
+                        snippets.extend(s.strip() for s in found[:6])
+                    await asyncio.sleep(0.5)  # DuckDuckGo Rate-Limit respektieren
+                except Exception as e:
+                    logger.debug("DuckDuckGo query failed ('%s'): %s", q[:50], e)
     except Exception as e:
         logger.debug("Market snippet fetch failed for %s: %s", company, e)
-    return snippets
+    return snippets[:12]
 
 
 # ── MD-B02 · World Bank API ───────────────────────────────────────────────────

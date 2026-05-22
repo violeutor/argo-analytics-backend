@@ -135,31 +135,82 @@ def compute_cagr(
     n = target_year - base_year  # Anzahl Jahre
 
     if sector_tag:
-        tag = sector_tag.lower().replace(" ", "-").replace("/", "-")
+        tag = sector_tag.lower().strip()
+        # Normalisierung: Sonderzeichen → Bindestriche, Stopwörter entfernen
+        tag = re.sub(r"[/\\|&+]", "-", tag)   # Slash/Pipe/etc → Bindestrich
+        tag = re.sub(r"\s+", "-", tag)          # Leerzeichen → Bindestrich
+        tag = re.sub(r"-+", "-", tag)           # Doppelte Bindestriche
+        tag = tag.strip("-")
+        # Alias-Map: häufige Kurzschreibweisen → kanonischer Key
+        _ALIASES = {
+            "co2-fuels":       "co2-to-fuels",
+            "co2-chemicals":   "co2-to-chemicals",
+            "dac":             "direct-air-capture",
+            "ccus":            "carbon-capture",
+            "bess":            "long-duration-storage",
+            "ev-battery":      "battery",
+            "ldes":            "long-duration-storage",
+        }
+        tag = _ALIASES.get(tag, tag)
 
-        # 1. Curated CAGR — exakter Sektor-Match
-        for key, data in CURATED_CAGR.items():
-            if key in tag or tag in key:
-                return {
-                    "cagr_pct":        data["cagr_pct"],
-                    "cagr_source":     f"Curated · {key} (BNEF/IEA/McKinsey)",
-                    "cagr_confidence": data["confidence"],
-                }
+        # 1. Curated CAGR — exakter Match zuerst, dann längster Substring-Match
+        # Reihenfolge: exact → tag-in-key (spezifischster key gewinnt) → key-in-tag
+        # Bugfix: "battery" darf nicht auf "solid-state-battery" matchen wenn
+        # "solid-state-battery" der exaktere Key ist.
+        best_key: str | None = None
+        best_len: int = -1
+
+        # Exact match hat immer Prio
+        if tag in CURATED_CAGR:
+            best_key = tag
+        else:
+            # Längster Key der im tag vorkommt ODER tag der im key vorkommt
+            for key in CURATED_CAGR:
+                if key == tag:
+                    best_key = key
+                    break
+                # tag enthält key ("solid-state-battery" enthält "battery" → key_len=7)
+                # oder key enthält tag ("carbon-capture" enthält "carbon" → key_len=14)
+                # Wir bevorzugen immer den längeren/spezifischeren Match
+                if key in tag and len(key) > best_len:
+                    best_key = key
+                    best_len = len(key)
+                elif tag in key and len(key) > best_len:
+                    best_key = key
+                    best_len = len(key)
+
+        if best_key:
+            data = CURATED_CAGR[best_key]
+            return {
+                "cagr_pct":        data["cagr_pct"],
+                "cagr_source":     f"Curated · {best_key} (BNEF/IEA/McKinsey)",
+                "cagr_confidence": data["confidence"],
+            }
 
         # 2. Mathematische Hochrechnung aus TAM + Basiswert
         if tam_usd_bn:
-            for key, base in MARKET_BASE_2024.items():
-                if key in tag or tag in key:
-                    try:
-                        cagr = ((tam_usd_bn / base) ** (1 / n) - 1) * 100
-                        cagr = round(min(max(cagr, 0.0), 80.0), 1)  # Cap: 0–80%
-                        return {
-                            "cagr_pct":        cagr,
-                            "cagr_source":     f"Berechnet: ({tam_usd_bn}B / {base}B)^(1/{n}) − 1",
-                            "cagr_confidence": "medium",
-                        }
-                    except Exception:
-                        pass
+            best_math_key: str | None = None
+            best_math_len: int = -1
+            for key in MARKET_BASE_2024:
+                if key in tag and len(key) > best_math_len:
+                    best_math_key = key
+                    best_math_len = len(key)
+                elif tag in key and len(key) > best_math_len:
+                    best_math_key = key
+                    best_math_len = len(key)
+
+            if best_math_key:
+                base = MARKET_BASE_2024[best_math_key]
+                try:
+                    cagr = ((tam_usd_bn / base) ** (1 / n) - 1) * 100
+                    cagr = round(min(max(cagr, 0.0), 80.0), 1)  # Cap: 0–80%
+                    return {
+                        "cagr_pct":        cagr,
+                        "cagr_source":     f"Berechnet: ({tam_usd_bn}B / {base}B)^(1/{n}) − 1",
+                        "cagr_confidence": "medium",
+                    }
+                except Exception:
+                    pass
 
     # 3. Fallback
     return {
@@ -182,22 +233,31 @@ HEADERS = {
 
 
 async def _google_search_snippets(query: str, num: int = 5) -> list[str]:
-    """Fetch top Google result snippets for a query."""
+    """
+    Snippets für TAM-Extraktion via DuckDuckGo HTML-Suche.
+    Kein API-Key, kein CAPTCHA-Problem auf Render.
+    Google-Scraping entfernt — CSS-Klassen instabil, CAPTCHA auf Cloud-IPs.
+    """
     try:
-        async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
+        async with httpx.AsyncClient(
+            timeout=10,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+            follow_redirects=True,
+        ) as client:
             resp = await client.get(
-                "https://www.google.com/search",
-                params={"q": query, "num": num, "hl": "en"},
-                follow_redirects=True,
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
             )
         if resp.status_code != 200:
             return []
-        # Extract text from <div class="BNeawe"> and similar snippet containers
-        text = resp.text
-        snippets = re.findall(r'class="(?:BNeawe|VwiC3b|MUxGbd)[^"]*"[^>]*>([^<]{30,300})<', text)
-        return snippets[:10]
+        # DuckDuckGo HTML Snippets
+        snippets = re.findall(
+            r'class="result__snippet"[^>]*>([^<]{30,400})<',
+            resp.text,
+        )
+        return snippets[:num]
     except Exception as e:
-        logger.warning("Google search failed for '%s': %s", query, e)
+        logger.warning("DuckDuckGo search failed for '%s': %s", query[:60], e)
         return []
 
 
@@ -263,15 +323,31 @@ async def get_tam(company_name: str, sector: str | None = None) -> dict:
     One-Click-Prinzip: funktioniert für jede Company weltweit —
     kein manuelles Mapping, kein Whitelist-Denken.
     """
-    # 1. Sector-level curated lookup — aus sector/category ableiten
+    # 1. Sector-level curated lookup — längster/spezifischster Match gewinnt
     if sector:
-        sector_tag = sector.lower().replace(" ", "-").replace("/", "-")
-        for tag, data in CURATED_TAM.items():
-            if tag in sector_tag or sector_tag in tag:
-                result = data.copy()
-                result["method"] = "curated_sector"
-                result["tag"] = tag
-                return result
+        sector_tag = sector.lower().strip()
+        sector_tag = re.sub(r"[/\\|&+]", "-", sector_tag)
+        sector_tag = re.sub(r"\s+", "-", sector_tag)
+        sector_tag = re.sub(r"-+", "-", sector_tag).strip("-")
+        best_key: str | None = None
+        best_len: int = -1
+
+        if sector_tag in CURATED_TAM:
+            best_key = sector_tag
+        else:
+            for tag in CURATED_TAM:
+                if tag in sector_tag and len(tag) > best_len:
+                    best_key = tag
+                    best_len = len(tag)
+                elif sector_tag in tag and len(tag) > best_len:
+                    best_key = tag
+                    best_len = len(tag)
+
+        if best_key:
+            result = CURATED_TAM[best_key].copy()
+            result["method"] = "curated_sector"
+            result["tag"] = best_key
+            return result
 
     # 2. Google + Claude extraction
     logger.info("TAM not in curated dataset for '%s' — trying web extraction", company_name)
