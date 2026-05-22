@@ -166,10 +166,10 @@ _INVESTOR_TIER_KW: list[tuple[str, int]] = [
 
 # Display-Labels je Path
 _PATH_LABELS: dict[str, str] = {
-    "ipo":     "IPO Play",
-    "m_and_a": "M&A Target",
-    "etf":     "ETF Proxy",
-    "enabler": "Enabler Play",
+    "ipo":     "IPO",
+    "m_and_a": "M&A",
+    "etf":     "ETF-Proxy",
+    "enabler": "Enabler",
 }
 
 # Composite-Gewichte (SC-05)
@@ -203,6 +203,18 @@ def _stage_match(stage: str, mapping: dict[str, float]) -> float:
             result = pts
             best_len = len(key)
     return result
+
+
+def _is_listed(company: dict) -> bool:
+    """
+    Robuste Listed-Erkennung — prüft ticker UND ipo_status.
+    Verhindert false-negatives wenn Ticker noch nicht in DB steht
+    (z.B. kurz nach IPO-Eintrag vor erstem Enrichment-Lauf).
+    """
+    if bool(company.get("ticker")):
+        return True
+    ipo_status = (company.get("ipo_status") or "").lower()
+    return ipo_status in ("listed", "public", "ipo_erfolgt", "ipo erfolgt")
 
 
 def _investor_tier(name: str, investor_type: str) -> int:
@@ -436,7 +448,7 @@ def compute_risk_score(
         # low beta: kein Beitrag
 
     # Governance (0–3): Ownership-Intransparenz = Risiko
-    is_listed = bool(company.get("ticker"))
+    is_listed = _is_listed(company)
     if is_listed:
         score += 0.3   # listed: öffentliche Rechenschaftspflicht → niedrig
         inputs["governance"] = "listed"
@@ -486,7 +498,7 @@ def compute_ownership_score(
       Listed Bonus       0–1 Pkt   (öffentliche Märkte = höchste Transparenz)
     """
     inputs: dict = {}
-    is_listed = bool(company.get("ticker"))
+    is_listed = _is_listed(company)
 
     if not ownership_entries:
         if is_listed:
@@ -609,8 +621,7 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     """
     inputs: dict = {}
 
-    is_listed = bool(company.get("ticker"))
-    if is_listed:
+    if _is_listed(company):
         inputs["note"] = "already_listed"
         return 0.0, inputs
 
@@ -828,17 +839,23 @@ def compute_composite_score(result: ScoreResult) -> float | None:
 
 # ── SC-11 · Hero Path + SC-13 · Rating ─────────────────────────────────────────
 
-def select_hero_path(result: ScoreResult) -> tuple[str | None, float | None, str | None]:
+def select_hero_path(
+    result: ScoreResult,
+    is_listed: bool = False,
+) -> tuple[str | None, float | None, str | None]:
     """
     SC-11: Wählt den dominanten Investitionspfad (argmax der Path-Scores).
 
     Paths mit Score < 1.5 gelten als N/A (nicht viable) und werden herausgefiltert.
-    Wenn alle Paths < 1.5: bester Path trotzdem als Hero (kein Null-Hero).
+    IPO wird für bereits gelistete Companies explizit ausgeschlossen — unabhängig
+    vom gecachten Score (Fervo-Fix: ipo_status=listed aber Ticker noch nicht in DB).
 
     Returns: (hero_path, hero_score, hero_path_label)
     """
     candidates: dict[str, float] = {}
-    if result.ipo_score     is not None: candidates["ipo"]     = result.ipo_score
+    # IPO nie Hero für listed Companies — auch wenn gecachter Score > 0
+    if result.ipo_score     is not None and not is_listed:
+        candidates["ipo"]     = result.ipo_score
     if result.ma_score      is not None: candidates["m_and_a"] = result.ma_score
     if result.etf_score     is not None: candidates["etf"]     = result.etf_score
     if result.enabler_score is not None: candidates["enabler"] = result.enabler_score
@@ -937,7 +954,8 @@ def compute_all_scores(
         logger.warning("SC-05 Composite Score failed: %s", e)
 
     try:
-        result.hero_path, result.hero_score, result.hero_path_label = select_hero_path(result)
+        listed = _is_listed(company)
+        result.hero_path, result.hero_score, result.hero_path_label = select_hero_path(result, is_listed=listed)
         result.rating = derive_rating(result.hero_score, result.composite_score)
     except Exception as e:
         logger.warning("SC-11/13 Hero Path / Rating failed: %s", e)
