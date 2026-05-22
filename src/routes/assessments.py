@@ -118,15 +118,24 @@ def upsert_company_description(company_id: str, description: str) -> None:
 
 
 def fetch_scorings(company_id: str) -> list[dict]:
+    """
+    Scores sind über deal_id verknüpft, nicht direkt company_id.
+    Join über deals-Tabelle: deals.company_id → scores.deal_id
+    """
     db = get_supabase()
     try:
+        # deals für company_id holen, dann letzten Score dazu
+        deals = db.table("deals").select("id").eq("company_id", company_id)            .order("created_at", desc=True).limit(1).execute()
+        if not deals.data:
+            return []
+        deal_id = deals.data[0]["id"]
         r = db.table("scores").select(
             "rating, srr_value, srr_category, mfr_value, mfr_signal, tr_value"
-        ).eq("company_id", company_id).order("created_at", desc=True).limit(1).execute()
+        ).eq("deal_id", deal_id).limit(1).execute()
         return r.data or []
     except Exception as e:
         logger.warning("fetch_scorings(%s): %s", company_id, e)
-        return []
+        return []  # non-blocking — Scoring-Kontext ist optional
 
 
 # ── Context Builder ───────────────────────────────────────────────────────────
@@ -352,6 +361,12 @@ async def get_assessments(name: str):
     # 4. Claude-Call
     try:
         result = await _call_claude(context)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 529:
+            logger.warning("Claude 529 overloaded for %s — retry later", name)
+            raise HTTPException(status_code=503, detail="Assessment generation temporarily unavailable — Claude overloaded. Please retry in a moment.")
+        logger.error("Claude assessments call failed for %s: %s", name, e)
+        raise HTTPException(status_code=502, detail=f"Assessment generation failed: {e}")
     except Exception as e:
         logger.error("Claude assessments call failed for %s: %s", name, e)
         raise HTTPException(status_code=502, detail=f"Assessment generation failed: {e}")
