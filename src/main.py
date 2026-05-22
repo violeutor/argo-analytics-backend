@@ -12,6 +12,7 @@ from src.routes.value_drivers import router as value_drivers_router
 from src.routes.signals import router as signals_router
 from src.routes.peers import router as peers_router
 from src.routes.kpi_timeseries import router as kpi_router
+from src.routes.assessments import router as assessments_router
 import os
 import asyncio
 import logging
@@ -111,6 +112,7 @@ app.include_router(value_drivers_router)
 app.include_router(signals_router)
 app.include_router(peers_router)
 app.include_router(kpi_router)
+app.include_router(assessments_router)
 
 
 @app.get("/health")
