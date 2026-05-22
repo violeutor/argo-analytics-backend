@@ -544,3 +544,93 @@ def fetch_companies_for_funding_enrichment(days_since_last: int = 7) -> list[dic
     except Exception as e:
         logger.warning("fetch_companies_for_funding_enrichment failed: %s", e)
         return []
+
+
+# ── SC-01–SC-13 · Scores ──────────────────────────────────────────────────────
+
+def upsert_company_scores(company_id: str, scores: dict) -> bool:
+    """
+    SC: Schreibt ScoreResult in company_scores — UPSERT auf company_id.
+    Erwartet scores = ScoreResult.to_dict().
+    """
+    from datetime import datetime, timezone
+    db = get_supabase()
+    try:
+        payload = {
+            "company_id":         company_id,
+            "financial_score":    scores.get("financial_score"),
+            "strategic_score":    scores.get("strategic_score"),
+            "market_score":       scores.get("market_score"),
+            "risk_score":         scores.get("risk_score"),
+            "ownership_score":    scores.get("ownership_score"),
+            "value_driver_score": scores.get("value_driver_score"),
+            "ipo_score":          scores.get("ipo_score"),
+            "ma_score":           scores.get("ma_score"),
+            "etf_score":          scores.get("etf_score"),
+            "enabler_score":      scores.get("enabler_score"),
+            "composite_score":    scores.get("composite_score"),
+            "hero_path":          scores.get("hero_path"),
+            "hero_score":         scores.get("hero_score"),
+            "hero_path_label":    scores.get("hero_path_label"),
+            "rating":             scores.get("rating"),
+            "confidence":         scores.get("confidence", "auto"),
+            "score_inputs":       scores.get("score_inputs"),
+            "computed_at":        datetime.now(timezone.utc).isoformat(),
+        }
+        db.table("company_scores").upsert(payload, on_conflict="company_id").execute()
+        logger.info("upsert_company_scores OK for %s — hero=%s rating=%s",
+                    company_id, scores.get("hero_path"), scores.get("rating"))
+        return True
+    except Exception as e:
+        logger.warning("upsert_company_scores FAILED for %s: %s", company_id, e)
+        return False
+
+
+def fetch_company_scores(company_id: str) -> dict | None:
+    """SC: Gibt gecachte Scores für eine Company zurück (None wenn nicht vorhanden)."""
+    db = get_supabase()
+    try:
+        result = db.table("company_scores").select("*").eq(
+            "company_id", company_id
+        ).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_company_scores failed for %s: %s", company_id, e)
+        return None
+
+
+def fetch_recent_absence_categories(company_ids: list[str], days: int = 30) -> dict[str, set[str]]:
+    """
+    BUG-01: Gibt Absence-Signal-Kategorien zurück die in den letzten N Tagen
+    pro Company bereits emittiert wurden.
+    Verhindert täglich neue negative Absence-Signale (Cooldown-Mechanismus).
+
+    Returns: {company_id: {'ownership', 'headcount', 'revenue', 'signal_stille'}}
+    """
+    if not company_ids:
+        return {}
+    from datetime import datetime, timezone, timedelta
+    db = get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    result_map: dict[str, set[str]] = {cid: set() for cid in company_ids}
+    try:
+        result = db.table("signals").select(
+            "company_id, signal_category, raw_title"
+        ).eq("source", "internal_absence").gte(
+            "event_date", cutoff
+        ).in_("company_id", company_ids).execute()
+
+        for row in (result.data or []):
+            cid  = row.get("company_id")
+            cat  = row.get("signal_category") or ""
+            title = (row.get("raw_title") or "").lower()
+            if cid not in result_map:
+                continue
+            # Kategorie-Keys müssen mit check_absence_signals cooldown-Keys übereinstimmen
+            if "ownership" in title:       result_map[cid].add("ownership")
+            elif "headcount" in title:     result_map[cid].add("headcount")
+            elif "revenue" in title:       result_map[cid].add("revenue")
+            elif "signal-stille" in title: result_map[cid].add("signal_stille")
+    except Exception as e:
+        logger.warning("fetch_recent_absence_categories failed: %s", e)
+    return result_map

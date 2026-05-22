@@ -948,6 +948,7 @@ def check_absence_signals(
     company: dict,
     ownership_entries: list[dict],
     signals_count: int,
+    existing_absence_categories: set[str] | None = None,
 ) -> list[SignalEvent]:
     """
     SE-13: Erkennt Risiken aus dem was fehlt — kein Scraping, kein externer API-Call.
@@ -959,6 +960,10 @@ def check_absence_signals(
       3. Keine Signals in letzten 90 Tagen → Signal-Stille als Risiko
       4. Kein Headcount → fehlende Transparenz bei privaten Companies
       5. Kein Revenue in patentlastigem / VC-dominiertem Sektor (Tech, Biotech)
+
+    BUG-01: existing_absence_categories verhindert Doppel-Emission pro 30 Tage.
+    Jede Absence-Kategorie wird max. 1× pro 30 Tage emittiert.
+    Caller (run_signal_engine) befüllt aus DB-Query der letzten 30 Tage.
     """
     events: list[SignalEvent] = []
     today = date.today()
@@ -966,8 +971,11 @@ def check_absence_signals(
     is_listed = bool(company.get("ticker"))
     region    = company.get("region", "")
 
+    # BUG-01: Cooldown-Set — überspringe Kategorien die in letzten 30d bereits emittiert
+    cooldown = existing_absence_categories or set()
+
     # 1. Ownership-Transparenz: keine Einträge
-    if not ownership_entries and not is_listed:
+    if not ownership_entries and not is_listed and "ownership" not in cooldown:
         events.append(SignalEvent(
             company_id=company_id,
             company_name=company_name,
@@ -987,7 +995,7 @@ def check_absence_signals(
 
     # 2. Signal-Stille: kein Signal in letzten 90 Tagen (nur wenn Company ≥ 90 Tage alt)
     last_signal_raw = company.get("last_signal_date")
-    if last_signal_raw:
+    if last_signal_raw and "signal_stille" not in cooldown:
         try:
             last_signal_date = date.fromisoformat(last_signal_raw[:10])
             days_silent = (today - last_signal_date).days
@@ -1013,7 +1021,7 @@ def check_absence_signals(
 
     # 3. Kein Headcount bei privater Company (fehlende Transparenz)
     headcount = company.get("headcount")
-    if not headcount and not is_listed:
+    if not headcount and not is_listed and "headcount" not in cooldown:
         events.append(SignalEvent(
             company_id=company_id,
             company_name=company_name,
@@ -1034,7 +1042,7 @@ def check_absence_signals(
     # 4. Kein Revenue in tech-nahen Sektoren (höhere Erwartung an Transparenz)
     tech_sectors = ("software", "ai", "biotech", "medtech", "semiconductor", "cloud", "saas")
     revenue = company.get("revenue_usd_mn")
-    if not revenue and any(s in industry for s in tech_sectors) and not is_listed:
+    if not revenue and any(s in industry for s in tech_sectors) and not is_listed and "revenue" not in cooldown:
         events.append(SignalEvent(
             company_id=company_id,
             company_name=company_name,
@@ -1058,16 +1066,24 @@ def check_absence_signals(
 
 # ── Haupt-Orchestrator ────────────────────────────────────────────────────────
 
-async def run_signal_engine(companies: list[dict], ownership_map: dict[str, list[dict]]) -> list[SignalEvent]:
+async def run_signal_engine(
+    companies: list[dict],
+    ownership_map: dict[str, list[dict]],
+    absence_cooldown_map: dict[str, set[str]] | None = None,
+) -> list[SignalEvent]:
     """
     SE-01 — Haupt-Pipeline.
     Läuft täglich via Cron. Gibt alle gesammelten Signals zurück.
     Aufgerufen von main.py _cron_signal_engine().
 
     Args:
-        companies:     Liste von Company-Dicts (id, name, ticker, exchange,
-                       last_signal_date, industry, region, headcount, revenue_usd_mn)
-        ownership_map: {company_id: [ownership_entries]} — aktueller DB-Stand
+        companies:            Liste von Company-Dicts (id, name, ticker, exchange,
+                              last_signal_date, industry, region, headcount, revenue_usd_mn)
+        ownership_map:        {company_id: [ownership_entries]} — aktueller DB-Stand
+        absence_cooldown_map: {company_id: {'ownership', 'headcount', ...}} —
+                              BUG-01: Absence-Kategorien die in letzten 30d bereits emittiert
+                              wurden. Verhindert täglich neue negative Absence-Signale.
+                              Caller (main.py) befüllt via fetch_recent_absence_categories().
     """
     all_events: list[SignalEvent] = []
     timeout = httpx.Timeout(12.0, connect=4.0)
@@ -1140,6 +1156,7 @@ async def run_signal_engine(companies: list[dict], ownership_map: dict[str, list
                 cid, cname, company,
                 ownership_entries=entries,
                 signals_count=len(company_events),
+                existing_absence_categories=(absence_cooldown_map or {}).get(cid, set()),
             )
             company_events.extend(absence_events)
 

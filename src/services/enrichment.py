@@ -179,8 +179,12 @@ async def _fetch_wikipedia(company: str) -> dict:
 
         data = resp.json()
         desc = data.get("extract", "")
-        out["description"]   = desc[:500] if desc else None
-        out["wikipedia_url"] = data.get("content_urls", {}).get("desktop", {}).get("page")
+        out["description"]    = desc[:500] if desc else None
+        out["wikipedia_url"]  = data.get("content_urls", {}).get("desktop", {}).get("page")
+        # BUG-02: Kanonischer Name aus Wikipedia-Titel (z.B. "spacex" → "SpaceX")
+        wiki_title = data.get("title", "")
+        if wiki_title and wiki_title.lower() != "not found":
+            out["canonical_name"] = wiki_title
 
         # ── Founding year — erweitertes Muster ───────────────────────────────
         year_patterns = [
@@ -974,6 +978,11 @@ async def enrich_company(
     )
 
     if isinstance(wiki, dict):
+        # BUG-02: Kanonischen Namen aus Wikipedia-Titel übernehmen
+        # "spacex" → "SpaceX", "lanzatech" → "LanzaTech"
+        wiki_canonical = wiki.get("canonical_name", "")
+        if wiki_canonical and 2 <= len(wiki_canonical) <= 120:
+            result.name = wiki_canonical
         result.description    = wiki.get("description")
         result.wikipedia_url  = wiki.get("wikipedia_url")
         result.website        = wiki.get("website")

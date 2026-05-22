@@ -23,14 +23,18 @@ logger = logging.getLogger(__name__)
 async def _cron_signal_engine():
     """SE-01 — Signal-Engine Cron, täglich 06:00 UTC."""
     try:
-        from src.integrations.supabase import fetch_companies, upsert_signals
+        from src.integrations.supabase import fetch_companies, upsert_signals, fetch_recent_absence_categories
         from src.services.signal_engine import run_signal_engine
 
         companies = fetch_companies(limit=500)
         ownership_map: dict = {}
 
+        # BUG-01: Absence-Cooldown — verhindert täglich neue negative Absence-Signale
+        company_ids = [c["id"] for c in companies if c.get("id")]
+        absence_cooldown_map = fetch_recent_absence_categories(company_ids, days=30)
+
         logger.info("Signal-Engine Cron gestartet — %d Companies", len(companies))
-        events = await run_signal_engine(companies, ownership_map)
+        events = await run_signal_engine(companies, ownership_map, absence_cooldown_map)
 
         if events:
             dicts = [e.to_dict() for e in events]
@@ -40,6 +44,46 @@ async def _cron_signal_engine():
             logger.info("Signal-Engine Cron — keine neuen Events")
     except Exception as e:
         logger.exception("Signal-Engine Cron FEHLER: %s", e)
+
+
+async def _cron_scoring():
+    """SC-01–SC-13 — Scoring-Engine Cron, täglich 07:30 UTC (nach Signal + Funding)."""
+    try:
+        from src.integrations.supabase import (
+            fetch_companies, fetch_company_scores, upsert_company_scores,
+            fetch_signals, fetch_value_drivers,
+        )
+        from src.services.score_calculator import compute_all_scores
+
+        companies = fetch_companies(limit=500)
+        logger.info("Scoring Cron gestartet — %d Companies", len(companies))
+
+        written = 0
+        for company in companies:
+            cid = company.get("id")
+            if not cid:
+                continue
+            try:
+                signals_raw   = fetch_signals(cid, limit=50)
+                vd_cached     = fetch_value_drivers(cid)
+                vd_list: list[dict] = []
+                if vd_cached:
+                    for key in ("enablers", "contributors", "buyers"):
+                        vd_list.extend(vd_cached.get(key) or [])
+
+                result = compute_all_scores(
+                    company=company,
+                    signals=signals_raw,
+                    value_drivers=vd_list,
+                )
+                if upsert_company_scores(cid, result.to_dict()):
+                    written += 1
+            except Exception as ce:
+                logger.warning("Scoring Cron: %s failed — %s", company.get("name"), ce)
+
+        logger.info("Scoring Cron fertig — %d/%d Companies gecacht", written, len(companies))
+    except Exception as e:
+        logger.exception("Scoring Cron FEHLER: %s", e)
 
 
 async def _cron_funding_enrichment():
@@ -76,6 +120,9 @@ async def lifespan(app):
             # B-05: Funding Enrichment 30 Min nach Signal-Engine (Signals als Quelle nutzen)
             await asyncio.sleep(30 * 60)
             await _cron_funding_enrichment()
+            # SC-01–SC-13: Scoring 30 Min nach Funding Enrichment (frische Signals + Funding)
+            await asyncio.sleep(30 * 60)
+            await _cron_scoring()
 
     cron_task = asyncio.create_task(_schedule_cron())
     yield

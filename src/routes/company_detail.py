@@ -29,8 +29,12 @@ from src.integrations.supabase import (
     set_enrichment_status,
     fetch_value_drivers,
     upsert_value_drivers,
+    fetch_company_scores,
+    upsert_company_scores,
+    fetch_signals,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
+from src.services.score_calculator import compute_all_scores
 from src.services.tam import get_tam
 from src.services.market_data_enrichment import (
     enrich_market_data,
@@ -197,6 +201,8 @@ class CompanyDetailResponse(BaseModel):
     technology_tags: list[str]
     is_known: bool
     warnings: list[str]
+    # SC-01–SC-13: Scoring Engine
+    scores: dict | None = None      # ScoreResult.to_dict() — hero_path, rating, alle Sub-/Path-Scores
 
 
 def _parse_year(value: str | None) -> int | None:
@@ -1272,6 +1278,73 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
     ipo_status = company.get("ipo_status")
 
+    # 11. SC-01–SC-13 · Scores on-demand
+    # Erst DB-Cache prüfen (computed_at < 24h → verwenden).
+    # Sonst: compute_all_scores() + in Background cachen.
+    scores_result: dict | None = None
+    if company_id:
+        try:
+            from datetime import datetime, timezone, timedelta
+            cached_scores = fetch_company_scores(company_id)
+            _cache_fresh = False
+            if cached_scores and cached_scores.get("computed_at"):
+                _age = datetime.now(timezone.utc) - datetime.fromisoformat(
+                    cached_scores["computed_at"].replace("Z", "+00:00")
+                )
+                _cache_fresh = _age < timedelta(hours=24)
+
+            if _cache_fresh:
+                scores_result = cached_scores
+                logger.debug("Scores from cache for %s (age %.0fh)", company_name, _age.total_seconds() / 3600)
+            else:
+                # On-demand berechnen
+                signals_raw   = fetch_signals(company_id, limit=50)
+                ownership_raw = [
+                    {"name": inv.name, "investor_type": inv.type,
+                     "share_pct": None, "source": "enrichment"}
+                    for inv in enrichment.investors
+                ]
+                vd_cached_now = fetch_value_drivers(company_id)
+                vd_list: list[dict] = []
+                if vd_cached_now:
+                    for key in ("enablers", "contributors", "buyers"):
+                        vd_list.extend(vd_cached_now.get(key) or [])
+
+                buyers_raw = [
+                    {"name": b.get("name"), "mfr": b.get("mfr_confidence"),
+                     "sector": b.get("sector")}
+                    for b in buyers
+                ]
+
+                sc_result = compute_all_scores(
+                    company=company,
+                    market_data=market_data_cached or {},
+                    signals=signals_raw,
+                    ownership_entries=ownership_raw,
+                    buyers=buyers_raw,
+                    value_drivers=vd_list,
+                )
+                scores_result = sc_result.to_dict()
+
+                # Async-cachen ohne Response zu blockieren
+                _sc_dict_snapshot = scores_result
+                async def _cache_scores_bg():
+                    try:
+                        upsert_company_scores(company_id, _sc_dict_snapshot)
+                    except Exception as _e:
+                        logger.warning("Score cache write failed for %s: %s", company_name, _e)
+                background_tasks.add_task(_cache_scores_bg)
+                logger.info(
+                    "Scores computed for %s — hero=%s(%.1f) rating=%s conf=%s",
+                    company_name,
+                    scores_result.get("hero_path"),
+                    scores_result.get("hero_score") or 0,
+                    scores_result.get("rating"),
+                    scores_result.get("confidence"),
+                )
+        except Exception as _sc_err:
+            logger.warning("SC scoring failed for %s: %s", company_name, _sc_err)
+
     return CompanyDetailResponse(
         name=company_name,
         category=company.get("category"),
@@ -1309,4 +1382,5 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         technology_tags=enrichment.tags,
         is_known=True,
         warnings=warnings,
+        scores=scores_result,
     )
