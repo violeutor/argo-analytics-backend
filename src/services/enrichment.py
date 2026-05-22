@@ -85,6 +85,8 @@ class BundesanzeigerData:
     last_annual_report_year: str | None = None
     revenue_mn: float | None = None           # EUR Mio
     ebitda_mn: float | None = None
+    ebit_mn: float | None = None
+    net_income_mn: float | None = None
     equity_mn: float | None = None            # Eigenkapital
     total_assets_mn: float | None = None      # Bilanzsumme
     employees: int | None = None

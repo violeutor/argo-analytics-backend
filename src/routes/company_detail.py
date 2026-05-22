@@ -104,6 +104,9 @@ class FundamentalsData(BaseModel):
     ba_registered_at: str | None = None
     ba_last_report_year: str | None = None
     ba_revenue_mn: float | None = None
+    ba_ebitda_mn: float | None = None
+    ba_ebit_mn: float | None = None
+    ba_net_income_mn: float | None = None
     ba_equity_mn: float | None = None
     ba_total_assets_mn: float | None = None
     ba_employees: int | None = None
@@ -777,7 +780,10 @@ def _build_fundamentals(
     if ba and ba.found:
         fd.ba_found=True; fd.ba_legal_form=ba.legal_form
         fd.ba_registered_at=ba.registered_at; fd.ba_last_report_year=ba.last_annual_report_year
-        fd.ba_revenue_mn=ba.revenue_mn; fd.ba_equity_mn=ba.equity_mn
+        fd.ba_revenue_mn=ba.revenue_mn; fd.ba_ebitda_mn=ba.ebitda_mn
+        fd.ba_ebit_mn=getattr(ba, "ebit_mn", None)
+        fd.ba_net_income_mn=getattr(ba, "net_income_mn", None)
+        fd.ba_equity_mn=ba.equity_mn
         fd.ba_total_assets_mn=ba.total_assets_mn; fd.ba_employees=ba.employees
         fd.ba_source_url=ba.source_url
     return _apply_beta(fd)
