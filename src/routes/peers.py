@@ -23,7 +23,7 @@ import re
 from datetime import datetime, timezone, timedelta
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from src.config import settings
@@ -64,6 +64,8 @@ class PeerCompany(BaseModel):
     exchange: str | None = None
     # Benchmark-Felder (berechnet)
     stage_normalized: str | None = None
+    # R-10: Positioning note (Claude-generiert, relativ zu Subject Company)
+    positioning_note: str | None = None
 
 
 class PeerBenchmark(BaseModel):
@@ -86,10 +88,11 @@ class PeersResponse(BaseModel):
 # ── Haupt-Endpoint ────────────────────────────────────────────────────────────
 
 @router.get("/company/{name}/peers", response_model=PeersResponse)
-async def get_peers(name: str) -> PeersResponse:
+async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersResponse:
     """
     Gibt Peer-Companies zurück.
     Cache: 30 Tage — danach neu generiert via Claude.
+    Neu angelegte Peers werden via BackgroundTask angereichert (organic DB growth).
     """
     db = get_supabase()
 
@@ -104,6 +107,7 @@ async def get_peers(name: str) -> PeersResponse:
     # 2. Cache prüfen
     peers_resolved = company.get("peers_resolved") or []
     generated_at   = company.get("peers_generated_at")
+    peers_context  = company.get("peers_context") or {}   # {peer_name: positioning_note}
     cache_valid    = False
 
     if peers_resolved and generated_at:
@@ -118,14 +122,14 @@ async def get_peers(name: str) -> PeersResponse:
         return PeersResponse(
             status="ready",
             company_name=company_name,
-            peers=[_to_peer_model(p) for p in peer_rows],
+            peers=[_to_peer_model(p, peers_context) for p in peer_rows],
             benchmark=_build_benchmark(company, peer_rows),
             generated_at=generated_at,
             from_cache=True,
         )
 
-    # 3. Claude generiert Peer-Namen
-    peer_names = await _claude_generate_peers(company)
+    # 3. Claude generiert Peer-Namen + Positioning Notes
+    peer_names, peer_notes = await _claude_generate_peers(company)
     if not peer_names:
         return PeersResponse(
             status="empty",
@@ -134,26 +138,31 @@ async def get_peers(name: str) -> PeersResponse:
             benchmark=[],
         )
 
-    # 4. Peers in DB auflösen / anlegen
+    # 4. Peers in DB auflösen / anlegen — neue Rows via BackgroundTask anreichern
     all_companies = fetch_companies(limit=500)
     name_to_id: dict[str, str] = {c["name"].lower(): c["id"] for c in all_companies}
 
     resolved_ids: list[str] = []
     for peer_name in peer_names:
-        peer_id = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
+        peer_id, is_new = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
         if peer_id:
             resolved_ids.append(peer_id)
-            name_to_id[peer_name.lower()] = peer_id   # für Folge-Iterationen
+            name_to_id[peer_name.lower()] = peer_id
+            if is_new:
+                # Organic DB growth: Enrichment im Hintergrund anstoßen
+                background_tasks.add_task(_enrich_new_peer, peer_id, peer_name)
+                logger.info("Enrichment scheduled for new peer: %s", peer_name)
 
-    # 5. peers_resolved + generated_at in companies schreiben
+    # 5. peers_resolved + peers_context + generated_at in companies schreiben
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         db.table("companies").update({
             "peers":              peer_names,
             "peers_resolved":     resolved_ids,
             "peers_generated_at": now_iso,
+            "peers_context":      peer_notes,   # {peer_name: positioning_note}
         }).eq("id", company_id).execute()
-        logger.info("peers_resolved geschrieben: %s → %d peers", company_name, len(resolved_ids))
+        logger.info("peers_resolved + context geschrieben: %s → %d peers", company_name, len(resolved_ids))
     except Exception as e:
         logger.warning("peers_resolved upsert failed for %s: %s", company_name, e)
 
@@ -163,7 +172,7 @@ async def get_peers(name: str) -> PeersResponse:
     return PeersResponse(
         status="ready",
         company_name=company_name,
-        peers=[_to_peer_model(p) for p in peer_rows],
+        peers=[_to_peer_model(p, peer_notes) for p in peer_rows],
         benchmark=_build_benchmark(company, peer_rows),
         generated_at=now_iso,
         from_cache=False,
@@ -172,19 +181,20 @@ async def get_peers(name: str) -> PeersResponse:
 
 # ── Claude Peer-Generierung ───────────────────────────────────────────────────
 
-async def _claude_generate_peers(company: dict) -> list[str]:
+async def _claude_generate_peers(company: dict) -> tuple[list[str], dict[str, str]]:
     """
-    Claude generiert 3-5 direkte Wettbewerber.
-    Gibt Liste von Company-Namen zurück (englisch, ohne Rechtssuffix).
+    Claude generiert 4-5 direkte Wettbewerber + Positioning Note je Peer.
+    Gibt (peer_names, {peer_name: positioning_note}) zurück.
     """
     api_key = settings.anthropic_api_key
     if not api_key:
         logger.warning("ANTHROPIC_API_KEY fehlt — Peer-Generierung nicht möglich")
-        return []
+        return [], {}
 
-    prompt = f"""Du bist ein M&A-Analyst. Identifiziere die 4-5 direkten Wettbewerber dieser Company.
+    subject = company.get("name", "")
+    prompt = f"""Du bist ein M&A-Analyst. Identifiziere 4-5 direkte Wettbewerber dieser Company.
 
-Company: {company.get('name')}
+Company: {subject}
 Kategorie: {company.get('category') or '—'}
 Industrie: {company.get('industry') or '—'}
 Region: {company.get('region') or '—'}
@@ -193,54 +203,67 @@ Funding Stage: {company.get('funding_stage') or '—'}
 Investment Path: {company.get('investment_path') or '—'}
 
 Regeln:
-- Nur direkte Wettbewerber (gleiche Technologie / gleicher Markt)
+- Nur direkte Wettbewerber (gleiche Technologie / gleicher Zielmarkt)
 - Bevorzuge Companies ähnlicher Größe und Stage
 - Mische US + Europa wenn relevant
 - Keine Konglomerate oder reine Investoren
-- Antworte NUR mit einem JSON-Array von Company-Namen, keine Erklärung:
-["Name 1", "Name 2", "Name 3", "Name 4"]"""
+- positioning_note: 1 präziser Satz — warum direkter Wettbewerber, worin liegt der Kernunterschied zu {subject}
+
+Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
+[{{"name": "Company Name", "positioning_note": "Direkter Wettbewerber weil ... — unterscheidet sich von {subject} durch ..."}}]"""
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 _CLAUDE_API_URL,
                 headers={
-                    "x-api-key":        api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type":     "application/json",
+                    "x-api-key":         api_key,
+                    "anthropic-version":  "2023-06-01",
+                    "content-type":      "application/json",
                 },
                 json={
                     "model":      "claude-haiku-4-5-20251001",
-                    "max_tokens": 200,
+                    "max_tokens": 600,
                     "messages":   [{"role": "user", "content": prompt}],
                 },
             )
 
         if resp.status_code != 200:
             logger.warning("Claude Peer-Gen API %s", resp.status_code)
-            return []
+            return [], {}
 
         raw = resp.json()["content"][0]["text"].strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-        names = json.loads(raw)
+        parsed = json.loads(raw)
 
-        if isinstance(names, list):
-            # Bereinigen: max 5, keine leeren Strings, keine Duplikate
-            seen = set()
-            result = []
-            for n in names:
-                if isinstance(n, str) and n.strip() and n.strip().lower() not in seen:
-                    seen.add(n.strip().lower())
-                    result.append(n.strip())
-                if len(result) >= 5:
+        names: list[str] = []
+        notes: dict[str, str] = {}
+        seen: set[str] = set()
+
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    n    = (item.get("name") or "").strip()
+                    note = (item.get("positioning_note") or "").strip()
+                elif isinstance(item, str):
+                    n, note = item.strip(), ""
+                else:
+                    continue
+                if n and n.lower() not in seen:
+                    seen.add(n.lower())
+                    names.append(n)
+                    if note:
+                        notes[n] = note
+                if len(names) >= 5:
                     break
-            logger.info("Claude Peers für %s: %s", company.get("name"), result)
-            return result
+
+        logger.info("Claude Peers für %s: %s", subject, names)
+        return names, notes
 
     except Exception as e:
         logger.warning("_claude_generate_peers failed: %s", e)
 
-    return []
+    return [], {}
 
 
 # ── Peer auflösen / anlegen ───────────────────────────────────────────────────
@@ -250,20 +273,21 @@ async def _resolve_or_create_peer(
     peer_name: str,
     name_to_id: dict[str, str],
     source_company: dict,
-) -> str | None:
+) -> tuple[str | None, bool]:
     """
-    Gibt UUID des Peers zurück.
-    Wenn nicht in DB: minimalen Row anlegen (Enrichment läuft beim ersten Company-Aufruf).
+    Gibt (UUID, is_new) zurück.
+    is_new=True wenn der Peer neu in der DB angelegt wurde → Enrichment triggern.
+    Wenn nicht in DB: minimalen Row anlegen (Enrichment läuft im Background).
     """
     # Exakter Match (case-insensitive)
     existing_id = name_to_id.get(peer_name.lower())
     if existing_id:
-        return existing_id
+        return existing_id, False
 
     # Fuzzy: Substring-Match (z.B. "Climeworks AG" findet "Climeworks")
     for db_name, db_id in name_to_id.items():
         if peer_name.lower() in db_name or db_name in peer_name.lower():
-            return db_id
+            return db_id, False
 
     # Nicht gefunden → minimal anlegen
     for source_val in ("peer_generated", "manual"):
@@ -281,7 +305,7 @@ async def _resolve_or_create_peer(
             if result.data:
                 new_id = result.data[0]["id"]
                 logger.info("Peer angelegt: %s → %s (source=%s)", peer_name, new_id, source_val)
-                return new_id
+                return new_id, True
             break
         except Exception as e:
             if source_val == "peer_generated" and "22P02" in str(e):
@@ -290,7 +314,66 @@ async def _resolve_or_create_peer(
             logger.warning("Peer anlegen fehlgeschlagen für %s: %s", peer_name, e)
             break
 
-    return None
+    return None, False
+
+
+# ── Background: Enrichment für neue Peers ────────────────────────────────────
+
+async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
+    """
+    Organic DB growth: Wikipedia-Enrichment für neu angelegten Peer.
+    Befüllt founding_year, headquarters, headcount, website, description.
+    """
+    try:
+        from src.services.enrichment import enrich_company
+        enriched = await enrich_company(peer_name)
+        if not enriched:
+            logger.debug("_enrich_new_peer: kein Ergebnis für %s", peer_name)
+            return
+
+        db = get_supabase()
+        payload: dict = {}
+
+        # Direkte String-Felder
+        for src_key, dst_key in [
+            ("headquarters", "headquarters"),
+            ("website",       "website"),
+        ]:
+            val = enriched.get(src_key)
+            if val:
+                payload[dst_key] = str(val)
+
+        # founding_year: aus "founded" (Jahr-String oder Int)
+        founded = enriched.get("founded")
+        if founded:
+            try:
+                payload["founding_year"] = int(str(founded)[:4])
+            except (ValueError, TypeError):
+                pass
+
+        # headcount: aus employee_count (ggf. "1,200" oder "ca. 500")
+        hc_raw = enriched.get("employee_count")
+        if hc_raw:
+            try:
+                cleaned = re.sub(r"[^\d]", "", str(hc_raw).split()[0])
+                if cleaned:
+                    payload["headcount"] = int(cleaned)
+            except (ValueError, TypeError):
+                pass
+
+        # description aus intro oder product_description
+        desc = enriched.get("intro") or enriched.get("product_description")
+        if desc:
+            payload["description"] = str(desc)[:1000]
+
+        if payload:
+            db.table("companies").update(payload).eq("id", peer_id).execute()
+            logger.info("Peer %s enriched: %d Felder", peer_name, len(payload))
+        else:
+            logger.debug("Peer %s: kein Enrichment-Payload", peer_name)
+
+    except Exception as e:
+        logger.warning("_enrich_new_peer failed für %s: %s", peer_name, e)
 
 
 # ── DB Helpers ────────────────────────────────────────────────────────────────
@@ -320,7 +403,7 @@ _STAGE_LABEL: dict[str, str] = {
 }
 
 
-def _to_peer_model(row: dict) -> PeerCompany:
+def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> PeerCompany:
     raw_stage = row.get("funding_stage") or ""
     return PeerCompany(
         id=row["id"],
@@ -343,6 +426,7 @@ def _to_peer_model(row: dict) -> PeerCompany:
         ticker=row.get("ticker"),
         exchange=row.get("exchange"),
         stage_normalized=_STAGE_LABEL.get(raw_stage, raw_stage) or None,
+        positioning_note=(peers_context or {}).get(row["name"]),
     )
 
 
