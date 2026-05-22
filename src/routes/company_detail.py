@@ -461,7 +461,7 @@ TAM 2035: ${tam.get('tam_usd_bn',100)}B"""
 
 # Exchange → Yahoo-Suffix Mapping für internationale Börsen
 _EXCHANGE_SUFFIX: dict[str, str] = {
-    "xetra": ".DE", "frankfurt": ".F", "fse": ".F",
+    "xetra": ".DE", "frankfurt": ".DE", "fse": ".F",
     "euronext": ".PA", "euronext paris": ".PA", "euronext amsterdam": ".AS",
     "london": ".L", "lse": ".L",
     "swiss": ".SW", "six": ".SW",
@@ -597,26 +597,36 @@ async def _fetch_bridge_fundamentals(symbol: str) -> dict:
     """
     YH-08 · Fundamentals via BA-Bridge /yahoo/fundamentals/{ticker}.
     Bridge nutzt yfinance — kostenlos, kein Plan-Upgrade nötig.
+    Suffix-Fallback: .DE → .F für Frankfurt-Listings (yfinance Abdeckung variiert).
     Gibt leeres dict zurück bei Fehler — kein Hard-Fail.
     """
     if not settings.ba_bridge_url:
         logger.debug("BA-Bridge nicht konfiguriert — kein Fundamentals-Call")
         return {}
+
+    # Suffix-Fallback: wenn .DE kein Ergebnis → .F versuchen (und umgekehrt)
+    candidates = [symbol]
+    if symbol.endswith(".DE"):
+        candidates.append(symbol[:-3] + ".F")
+    elif symbol.endswith(".F"):
+        candidates.append(symbol[:-2] + ".DE")
+
     try:
         timeout = httpx.Timeout(10.0, connect=3.0)
         headers = {"X-API-Key": settings.ba_bridge_api_key}
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            resp = await client.get(f"{settings.ba_bridge_url}/yahoo/fundamentals/{symbol}")
-        if resp.status_code == 200:
-            data = resp.json()
-            logger.info(
-                "BRIDGE_FUNDAMENTALS OK: %s rev=%.1fBn margin=%.1f%%",
-                symbol,
-                data.get("revenue_bn") or 0,
-                data.get("gross_margin_pct") or 0,
-            )
-            return data
-        logger.warning("BRIDGE_FUNDAMENTALS HTTP %s for %s", resp.status_code, symbol)
+            for sym in candidates:
+                resp = await client.get(f"{settings.ba_bridge_url}/yahoo/fundamentals/{sym}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    logger.info(
+                        "BRIDGE_FUNDAMENTALS OK: %s rev=%.1fBn margin=%.1f%%",
+                        sym,
+                        data.get("revenue_bn") or 0,
+                        data.get("gross_margin_pct") or 0,
+                    )
+                    return data
+                logger.warning("BRIDGE_FUNDAMENTALS HTTP %s for %s", resp.status_code, sym)
     except Exception as e:
         logger.warning("BRIDGE_FUNDAMENTALS failed for %s: %s", symbol, e)
     return {}
