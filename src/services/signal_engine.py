@@ -70,8 +70,10 @@ class SignalEvent:
     __slots__ = (
         "company_id", "company_name", "event_type", "event_date",
         "summary", "source", "source_url", "severity", "raw_title",
-        # SE-09/SE-11/SE-12: neue Felder
+        # SE-09/SE-11/SE-12: Richtung + Kategorie
         "direction", "signal_category",
+        # Session 10: Qualität + Deduplizierung + B-05
+        "source_domain", "relevance_score", "funding_amount_usd_mn",
     )
 
     def __init__(
@@ -87,37 +89,83 @@ class SignalEvent:
         raw_title: str | None = None,
         direction: Direction = "neutral",
         signal_category: SignalCategory = "general_news",
+        source_domain: str | None = None,
+        relevance_score: float | None = None,
+        funding_amount_usd_mn: float | None = None,
     ):
-        self.company_id      = company_id
-        self.company_name    = company_name
-        self.event_type      = event_type
-        self.event_date      = event_date
-        self.summary         = summary
-        self.source          = source
-        self.source_url      = source_url
-        self.severity        = severity
-        self.raw_title       = raw_title
-        self.direction       = direction
-        self.signal_category = signal_category
+        self.company_id            = company_id
+        self.company_name          = company_name
+        self.event_type            = event_type
+        self.event_date            = event_date
+        self.summary               = summary
+        self.source                = source
+        self.source_url            = source_url
+        self.severity              = severity
+        self.raw_title             = raw_title
+        self.direction             = direction
+        self.signal_category       = signal_category
+        self.source_domain         = source_domain or _extract_domain(source_url)
+        self.relevance_score       = relevance_score
+        self.funding_amount_usd_mn = funding_amount_usd_mn
 
     def to_dict(self) -> dict:
         return {
-            "company_id":      self.company_id,
-            "event_type":      self.event_type,
-            "event_date":      self.event_date.isoformat(),
-            "summary":         self.summary,
-            "source":          self.source,
-            "source_url":      self.source_url,
-            "severity":        self.severity,
-            "raw_title":       self.raw_title,
-            "direction":       self.direction,
-            "signal_category": self.signal_category,
+            "company_id":            self.company_id,
+            "event_type":            self.event_type,
+            "event_date":            self.event_date.isoformat(),
+            "summary":               self.summary,
+            "source":                self.source,
+            "source_url":            self.source_url,
+            "severity":              self.severity,
+            "raw_title":             self.raw_title,
+            "direction":             self.direction,
+            "signal_category":       self.signal_category,
+            "source_domain":         self.source_domain,
+            "relevance_score":       self.relevance_score,
+            "funding_amount_usd_mn": self.funding_amount_usd_mn,
         }
 
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
-def _parse_rss_date(date_str: str | None) -> date:
+def _extract_domain(url: str | None) -> str | None:
+    """Extrahiert Hostname aus URL für Deduplizierung — z.B. 'techcrunch.com'."""
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).hostname or None
+    except Exception:
+        return None
+
+
+_FUNDING_AMOUNT_RE = re.compile(
+    r'\$\s*([\d,]+(?:\.\d+)?)\s*(billion|million|bn|mn|b|m)\b'
+    r'|'
+    r'([\d,]+(?:\.\d+)?)\s*(billion|million|bn|mn|b|m)\s*(USD|Dollar|dollars)',
+    re.IGNORECASE
+)
+
+
+def _extract_funding_amount(text: str) -> float | None:
+    """
+    B-05: Extrahiert Funding-Betrag aus Freitext → USD Mio.
+    Beispiele: '$50 million' → 50.0 | '$1.2 billion' → 1200.0 | '€80 Mio.' → None (EUR skip)
+    """
+    m = _FUNDING_AMOUNT_RE.search(text)
+    if not m:
+        return None
+    raw_num = (m.group(1) or m.group(3) or "").replace(",", "")
+    unit    = (m.group(2) or m.group(4) or "").lower()
+    try:
+        val = float(raw_num)
+    except ValueError:
+        return None
+    if unit in ("billion", "bn", "b"):
+        return round(val * 1000, 2)
+    if unit in ("million", "mn", "m"):
+        return round(val, 2)
+    return None
     """Parst RSS pubDate zu date — Fallback: heute."""
     if not date_str:
         return date.today()
@@ -421,6 +469,7 @@ async def _claude_ner_pass(
             for ev, res in zip(batch, results):
                 direction = res.get("direction", "neutral")
                 category  = res.get("signal_category", "general_news")
+                confidence = res.get("confidence", "medium")
                 # Validierung gegen erlaubte Werte
                 if direction in ("positive", "negative", "neutral"):
                     ev.direction = direction
@@ -431,6 +480,13 @@ async def _claude_ner_pass(
                     "filing", "ownership_entry", "general_news"
                 ):
                     ev.signal_category = category
+                # relevance_score aus Confidence
+                ev.relevance_score = {"high": 0.9, "medium": 0.6, "low": 0.3}.get(confidence, 0.6)
+                # B-05: Funding-Betrag aus raw_title + summary extrahieren
+                if ev.event_type == "funding_round" and not ev.funding_amount_usd_mn:
+                    ev.funding_amount_usd_mn = _extract_funding_amount(
+                        f"{ev.raw_title or ''} {ev.summary}"
+                    )
 
         except (json.JSONDecodeError, KeyError, Exception) as e:
             logger.warning("SE-09 Claude NER Fehler: %s — Keyword-Fallback", e)
@@ -451,19 +507,23 @@ def _apply_keyword_fallback(events: list[SignalEvent]) -> None:
 
 # ── EDGAR Parser ─────────────────────────────────────────────────────────────
 
-_EDGAR_BASE = "https://efts.sec.gov/LATEST/search-index"
-_EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index?q=%22{query}%22&dateRange=custom&startdt={start}&forms={forms}&hits.hits._source=period_of_report,file_date,display_names,period_of_report,entity_name,file_num"
+_EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 
 # Form-Typen → Event-Mapping
 _EDGAR_FORM_MAP: dict[str, EventType] = {
-    "S-1":  "ipo_status_change",
-    "S-11": "ipo_status_change",
-    "10-K": "earnings",
-    "10-Q": "earnings",
-    "8-K":  "m_and_a_event",   # 8-K kann viel sein — NER klärt ob M&A
+    "S-1":    "ipo_status_change",
+    "S-11":   "ipo_status_change",
+    "10-K":   "earnings",
+    "10-Q":   "earnings",
+    "8-K":    "m_and_a_event",    # 8-K kann viel sein — NER klärt ob M&A
+    "D":      "funding_round",    # SEC Form D = private Placement / Funding
+    "D/A":    "funding_round",    # Amendment zu Form D
     "SC 13D": "ownership_change",
     "SC 13G": "ownership_change",
 }
+
+# 8-K Item-Nummern die echte M&A / wesentliche Events indizieren
+_8K_MA_ITEMS = {"1.01", "2.01", "2.02", "5.02", "8.01"}
 
 
 async def parse_edgar(
@@ -474,50 +534,66 @@ async def parse_edgar(
     lookback_days: int = 30,
 ) -> list[SignalEvent]:
     """
-    Sucht SEC EDGAR nach Filings der letzten `lookback_days` Tage.
-    Unterstützt US-listed Companies (Ticker vorhanden) und Namens-Suche.
+    SE-10: Robuster SEC EDGAR Parser.
+    - Saubere URL-Konstruktion via httpx params (kein manueller String-Bau)
+    - Form D (funding_round) für private Companies
+    - 8-K: nur Items 1.01/2.01/2.02 (echte M&A/Events), nicht jedes Filing
+    - Korrekter filing_url via accession number
+    - source_domain gesetzt für Deduplizierung
     """
     events: list[SignalEvent] = []
     start_date = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-    # Query: Ticker hat Prio (exakter Match), sonst Company-Name
-    query = ticker.split("·")[0].strip() if ticker else company_name
-    forms = "S-1,S-11,10-K,10-Q,8-K,SC 13D,SC 13G"
+    # Ticker-Prefix bereinigen (kann "LNZA · Nasdaq" sein)
+    clean_ticker = ticker.split("·")[0].strip() if ticker else None
 
-    url = (
-        f"https://efts.sec.gov/LATEST/search-index"
-        f"?q=%22{httpx.QueryParams({'': query}).value if False else query.replace(' ', '+')}"
-        f"%22&dateRange=custom&startdt={start_date}&forms={forms}"
-    )
+    # Query: Ticker hat Prio (EDGAR kennt Ticker), sonst Company-Name
+    query = f'"{clean_ticker}"' if clean_ticker else f'"{company_name}"'
+    forms = "S-1,S-11,10-K,10-Q,8-K,D,D/A,SC 13D,SC 13G"
 
     try:
         resp = await client.get(
-            "https://efts.sec.gov/LATEST/search-index",
+            _EDGAR_SEARCH_URL,
             params={
-                "q":         f'"{query}"',
+                "q":         query,
                 "dateRange": "custom",
                 "startdt":   start_date,
                 "forms":     forms,
+                "_source":   "period_of_report,file_date,display_names,entity_name,file_num,form_type,items",
             },
-            timeout=10.0,
+            timeout=12.0,
         )
         if resp.status_code != 200:
-            logger.warning("EDGAR HTTP %s for %s", resp.status_code, company_name)
+            logger.warning("EDGAR HTTP %s for %s (query=%s)", resp.status_code, company_name, query)
+            # Fallback: Namens-Suche wenn Ticker-Suche scheitert
+            if clean_ticker and resp.status_code in (400, 404):
+                return await _edgar_name_fallback(company_id, company_name, client, start_date, forms)
             return events
 
         data = resp.json()
         hits = data.get("hits", {}).get("hits", [])
 
-        for hit in hits[:5]:   # max 5 Filings pro Company
-            src = hit.get("_source", {})
-            form_type  = src.get("forms", [None])[0] if src.get("forms") else None
-            file_date  = src.get("file_date") or src.get("period_of_report")
-            entity     = src.get("entity_name", company_name)
-            accession  = hit.get("_id", "").replace("-", "")
-            filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={src.get('file_num', '')}" if src.get("file_num") else None
+        if not hits and clean_ticker:
+            # Kein Ergebnis mit Ticker → Name-Fallback
+            logger.info("EDGAR: kein Treffer für Ticker %s — versuche Name-Suche", clean_ticker)
+            return await _edgar_name_fallback(company_id, company_name, client, start_date, forms)
+
+        for hit in hits[:8]:   # max 8 Filings pro Company
+            src       = hit.get("_source", {})
+            # form_type kann in '_source.form_type' oder '_source.forms[0]' stehen
+            form_type = src.get("form_type") or (src.get("forms") or [None])[0]
+            file_date = src.get("file_date") or src.get("period_of_report")
+            entity    = src.get("entity_name", company_name)
+            accession = hit.get("_id", "")
 
             if not form_type or not file_date:
                 continue
+
+            # 8-K: nur wenn echte M&A/Event-Items → kein Rauschen
+            items = src.get("items", [])
+            if form_type == "8-K" and items:
+                if not any(item in _8K_MA_ITEMS for item in items):
+                    continue   # 8-K ohne relevante Items überspringen
 
             event_type = _EDGAR_FORM_MAP.get(form_type, "news")
             try:
@@ -525,7 +601,28 @@ async def parse_edgar(
             except ValueError:
                 ev_date = date.today()
 
+            # Korrekter Filing-Link via accession number
+            acc_clean   = accession.replace("-", "")
+            filing_url  = (
+                f"https://www.sec.gov/Archives/edgar/data/"
+                f"{src.get('file_num', '').replace('-', '')}/{acc_clean}/{accession}-index.htm"
+                if accession else None
+            )
+            # Fallback: EDGAR-Suche nach file_num
+            if not filing_url and src.get("file_num"):
+                filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={src['file_num']}"
+
             summary = _edgar_summary(form_type, entity, ev_date)
+
+            # B-05: Form D → Funding-Betrag aus total_offering falls vorhanden
+            funding_amount = None
+            if form_type in ("D", "D/A"):
+                total_offering = src.get("total_offering_amount")
+                if total_offering:
+                    try:
+                        funding_amount = round(float(total_offering) / 1_000_000, 2)
+                    except (ValueError, TypeError):
+                        pass
 
             events.append(SignalEvent(
                 company_id=company_id,
@@ -537,6 +634,8 @@ async def parse_edgar(
                 source_url=filing_url,
                 severity=_severity_for_event(event_type),
                 raw_title=f"{form_type} — {entity}",
+                source_domain="sec.gov",
+                funding_amount_usd_mn=funding_amount,
             ))
             logger.info("EDGAR signal: %s %s %s → %s", company_name, form_type, ev_date, event_type)
 
@@ -546,13 +645,76 @@ async def parse_edgar(
     return events
 
 
+async def _edgar_name_fallback(
+    company_id: str,
+    company_name: str,
+    client: httpx.AsyncClient,
+    start_date: str,
+    forms: str,
+) -> list[SignalEvent]:
+    """
+    SE-10: Fallback-Suche via Company-Name wenn Ticker-Suche kein Ergebnis liefert.
+    Wird nur aufgerufen wenn Ticker-Suche fehlschlägt.
+    """
+    events: list[SignalEvent] = []
+    # Normalisierter Name ohne Rechtssuffixe
+    normalized = _normalize_name(company_name)
+    try:
+        resp = await client.get(
+            _EDGAR_SEARCH_URL,
+            params={
+                "q":         f'"{normalized}"',
+                "dateRange": "custom",
+                "startdt":   start_date,
+                "forms":     forms,
+                "_source":   "period_of_report,file_date,entity_name,file_num,form_type,items",
+            },
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return events
+        hits = resp.json().get("hits", {}).get("hits", [])
+        for hit in hits[:5]:
+            src       = hit.get("_source", {})
+            form_type = src.get("form_type") or (src.get("forms") or [None])[0]
+            file_date = src.get("file_date") or src.get("period_of_report")
+            entity    = src.get("entity_name", company_name)
+            if not form_type or not file_date:
+                continue
+            items = src.get("items", [])
+            if form_type == "8-K" and items and not any(i in _8K_MA_ITEMS for i in items):
+                continue
+            event_type = _EDGAR_FORM_MAP.get(form_type, "news")
+            try:
+                ev_date = date.fromisoformat(file_date[:10])
+            except ValueError:
+                ev_date = date.today()
+            events.append(SignalEvent(
+                company_id=company_id,
+                company_name=company_name,
+                event_type=event_type,
+                event_date=ev_date,
+                summary=_edgar_summary(form_type, entity, ev_date),
+                source="edgar",
+                source_url=f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={src.get('file_num', '')}",
+                severity=_severity_for_event(event_type),
+                raw_title=f"{form_type} — {entity}",
+                source_domain="sec.gov",
+            ))
+    except Exception as e:
+        logger.warning("EDGAR name_fallback failed for %s: %s", company_name, e)
+    return events
+
+
 def _edgar_summary(form_type: str, entity: str, ev_date: date) -> str:
     summaries = {
-        "S-1":   f"{entity} hat einen S-1-Antrag bei der SEC eingereicht — IPO-Prozess gestartet ({ev_date}).",
-        "S-11":  f"{entity} hat einen S-11-Antrag bei der SEC eingereicht — IPO-Prozess gestartet ({ev_date}).",
-        "10-K":  f"{entity} hat den Jahresbericht (10-K) bei der SEC eingereicht ({ev_date}).",
-        "10-Q":  f"{entity} hat den Quartalsbericht (10-Q) bei der SEC eingereicht ({ev_date}).",
-        "8-K":   f"{entity} hat ein 8-K-Formular eingereicht — mögliche M&A- oder wesentliche Unternehmens-Events ({ev_date}).",
+        "S-1":    f"{entity} hat einen S-1-Antrag bei der SEC eingereicht — IPO-Prozess gestartet ({ev_date}).",
+        "S-11":   f"{entity} hat einen S-11-Antrag bei der SEC eingereicht — IPO-Prozess gestartet ({ev_date}).",
+        "10-K":   f"{entity} hat den Jahresbericht (10-K) bei der SEC eingereicht ({ev_date}).",
+        "10-Q":   f"{entity} hat den Quartalsbericht (10-Q) bei der SEC eingereicht ({ev_date}).",
+        "8-K":    f"{entity} hat ein 8-K-Formular eingereicht — wesentliches Unternehmens-Event oder M&A ({ev_date}).",
+        "D":      f"{entity} hat ein Form D bei der SEC eingereicht — private Kapitalaufnahme gemeldet ({ev_date}).",
+        "D/A":    f"{entity} hat eine Form-D-Änderung (D/A) bei der SEC eingereicht — Kapitalrunde aktualisiert ({ev_date}).",
         "SC 13D": f"Neuer Großaktionär (>5%) bei {entity} gemeldet via SC 13D ({ev_date}).",
         "SC 13G": f"Institutioneller Investor hat Position bei {entity} via SC 13G gemeldet ({ev_date}).",
     }
@@ -615,6 +777,11 @@ async def parse_google_news(
                 # Kurze Summary aus Titel
                 summary = _news_summary(event_type, company_name, title, ev_date)
 
+                # B-05: Funding-Betrag direkt aus Titel/Description extrahieren
+                funding_amount = None
+                if event_type == "funding_round":
+                    funding_amount = _extract_funding_amount(f"{title} {description[:300]}")
+
                 events.append(SignalEvent(
                     company_id=company_id,
                     company_name=company_name,
@@ -625,6 +792,7 @@ async def parse_google_news(
                     source_url=link or None,
                     severity=severity,
                     raw_title=title,
+                    funding_amount_usd_mn=funding_amount,
                 ))
 
         except ET.ParseError as e:
@@ -697,8 +865,10 @@ async def parse_techcrunch(
 
             event_type = _classify_event(title, description)
             if event_type not in ("funding_round", "m_and_a_event", "ipo_status_change"):
-                continue   # TechCrunch nur für Investment-Events nutzen
-
+                continue
+            funding_amount = None
+            if event_type == "funding_round":
+                funding_amount = _extract_funding_amount(f"{title} {description[:300]}")
             events.append(SignalEvent(
                 company_id=company_id,
                 company_name=company_name,
@@ -709,6 +879,8 @@ async def parse_techcrunch(
                 source_url=link or None,
                 severity=_severity_for_event(event_type),
                 raw_title=title,
+                source_domain=_extract_domain(link) or "techcrunch.com",
+                funding_amount_usd_mn=funding_amount,
             ))
 
     except Exception as e:

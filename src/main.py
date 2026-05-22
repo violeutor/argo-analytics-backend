@@ -23,12 +23,10 @@ logger = logging.getLogger(__name__)
 async def _cron_signal_engine():
     """SE-01 — Signal-Engine Cron, täglich 06:00 UTC."""
     try:
-        from src.integrations.supabase import fetch_companies, fetch_signals, upsert_signals
+        from src.integrations.supabase import fetch_companies, upsert_signals
         from src.services.signal_engine import run_signal_engine
 
         companies = fetch_companies(limit=500)
-        # Ownership-Map aus signals nicht nötig — watch_ownership_changes liest aus DB direkt
-        # Wir übergeben leere Map; Ownership-Diff läuft intern via as_of_date
         ownership_map: dict = {}
 
         logger.info("Signal-Engine Cron gestartet — %d Companies", len(companies))
@@ -42,6 +40,21 @@ async def _cron_signal_engine():
             logger.info("Signal-Engine Cron — keine neuen Events")
     except Exception as e:
         logger.exception("Signal-Engine Cron FEHLER: %s", e)
+
+
+async def _cron_funding_enrichment():
+    """B-05 — Funding Enrichment Cron, täglich 06:30 UTC (nach Signal-Engine)."""
+    try:
+        from src.services.funding_enrichment import run_funding_enrichment
+
+        logger.info("Funding-Enrichment Cron gestartet")
+        stats = await run_funding_enrichment(days_since_last=7)
+        logger.info(
+            "Funding-Enrichment Cron fertig — %d Companies, %d Runden geschrieben, %d Skip",
+            stats["companies_processed"], stats["rounds_written"], stats["rounds_skipped"],
+        )
+    except Exception as e:
+        logger.exception("Funding-Enrichment Cron FEHLER: %s", e)
 
 
 @asynccontextmanager
@@ -60,6 +73,9 @@ async def lifespan(app):
             logger.info("Signal-Engine Cron: nächster Run in %.0f Minuten", wait_seconds / 60)
             await asyncio.sleep(wait_seconds)
             await _cron_signal_engine()
+            # B-05: Funding Enrichment 30 Min nach Signal-Engine (Signals als Quelle nutzen)
+            await asyncio.sleep(30 * 60)
+            await _cron_funding_enrichment()
 
     cron_task = asyncio.create_task(_schedule_cron())
     yield

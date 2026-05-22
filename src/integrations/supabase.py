@@ -337,7 +337,8 @@ def fetch_signals(company_id: str, limit: int = 50) -> list[dict]:
     try:
         result = db.table("signals").select(
             "id, event_type, event_date, summary, source, source_url, "
-            "severity, is_read, raw_title, direction, signal_category, created_at"
+            "severity, is_read, raw_title, direction, signal_category, "
+            "relevance_score, source_domain, funding_amount_usd_mn, created_at"
         ).eq("company_id", company_id).order("event_date", desc=True).limit(limit).execute()
         return result.data or []
     except Exception as e:
@@ -361,13 +362,16 @@ def fetch_all_signals(limit: int = 500) -> list[dict]:
 def upsert_signals(events: list[dict]) -> int:
     """
     Schreibt Signal-Events in die signals-Tabelle.
-    Duplikat-sicher via UNIQUE CONSTRAINT (company_id, event_type, event_date, source).
+    Duplikat-sicher via UNIQUE CONSTRAINT signals_dedup_v2
+    (company_id, event_type, event_date, source, source_domain).
     Gibt Anzahl geschriebener Rows zurück.
 
     Erwartet dicts mit:
         company_id, event_type, event_date, summary,
         source, source_url, severity, raw_title,
-        direction, signal_category           ← SE-09/SE-11/SE-12/SE-13
+        direction, signal_category,           ← SE-09/SE-11/SE-12/SE-13
+        source_domain, relevance_score,       ← Session 10: Qualität + Deduplizierung
+        funding_amount_usd_mn,               ← B-05 Funding Enrichment
     """
     if not events:
         return 0
@@ -375,15 +379,17 @@ def upsert_signals(events: list[dict]) -> int:
     written = 0
     for event in events:
         try:
-            # direction + signal_category mit sicheren Defaults falls fehlen
             payload = {
                 **event,
-                "direction":       event.get("direction", "neutral"),
-                "signal_category": event.get("signal_category", "general_news"),
+                "direction":             event.get("direction", "neutral"),
+                "signal_category":       event.get("signal_category", "general_news"),
+                "source_domain":         event.get("source_domain"),
+                "relevance_score":       event.get("relevance_score"),
+                "funding_amount_usd_mn": event.get("funding_amount_usd_mn"),
             }
             db.table("signals").upsert(
                 payload,
-                on_conflict="company_id,event_type,event_date,source",
+                on_conflict="company_id,event_type,event_date,source,source_domain",
                 ignore_duplicates=True,
             ).execute()
             written += 1
@@ -444,11 +450,97 @@ def fetch_signals_by_category(
     try:
         result = db.table("signals").select(
             "id, event_type, event_date, summary, source, source_url, "
-            "severity, raw_title, direction, signal_category"
+            "severity, raw_title, direction, signal_category, relevance_score, source_domain"
         ).eq("company_id", company_id).in_(
             "signal_category", categories
         ).order("event_date", desc=True).limit(limit).execute()
         return result.data or []
     except Exception as e:
         logger.warning("fetch_signals_by_category(%s): %s", company_id, e)
+        return []
+
+
+# ── B-05: Funding Enrichment ─────────────────────────────────────────────────
+
+def upsert_funding_round(company_id: str, data: dict) -> bool:
+    """
+    B-05: Schreibt eine Funding-Runde in funding_rounds.
+    Duplikat-sicher via UNIQUE (company_id, date, type).
+    Gibt True zurück wenn geschrieben, False bei Duplikat/Fehler.
+
+    Erwartet:
+        date, type, amount_usd_mn, lead_investor?, co_investors?,
+        source_url?, raw_text?, enrichment_source
+    """
+    db = get_supabase()
+    payload = {k: v for k, v in data.items() if v is not None}
+    payload["company_id"] = company_id
+    try:
+        db.table("funding_rounds").upsert(
+            payload,
+            on_conflict="company_id,date,type",
+            ignore_duplicates=True,
+        ).execute()
+        logger.info(
+            "upsert_funding_round OK: %s %s %s %.1fM",
+            company_id, data.get("date"), data.get("type"),
+            data.get("amount_usd_mn") or 0,
+        )
+        return True
+    except Exception as e:
+        logger.warning("upsert_funding_round FAILED for %s: %s", company_id, e)
+        return False
+
+
+def update_last_funding_enriched_at(company_id: str) -> None:
+    """B-05: Setzt companies.last_funding_enriched_at auf jetzt."""
+    from datetime import timezone
+    db = get_supabase()
+    try:
+        db.table("companies").update({
+            "last_funding_enriched_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", company_id).execute()
+    except Exception as e:
+        logger.warning("update_last_funding_enriched_at FAILED for %s: %s", company_id, e)
+
+
+def fetch_funding_signals(company_id: str, limit: int = 20) -> list[dict]:
+    """
+    B-05: Gibt Signals mit funding_amount_usd_mn zurück — für Funding-Enrichment-Pipeline.
+    Nur Signals die einen extrahierten Betrag haben.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("signals").select(
+            "id, event_date, summary, source, source_url, "
+            "raw_title, funding_amount_usd_mn, signal_category"
+        ).eq("company_id", company_id).eq(
+            "event_type", "funding_round"
+        ).not_.is_("funding_amount_usd_mn", "null").order(
+            "event_date", desc=True
+        ).limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_funding_signals failed for %s: %s", company_id, e)
+        return []
+
+
+def fetch_companies_for_funding_enrichment(days_since_last: int = 7) -> list[dict]:
+    """
+    B-05: Gibt Companies zurück die seit >N Tagen kein Funding-Enrichment hatten.
+    Steuerung via companies.last_funding_enriched_at.
+    """
+    from datetime import timezone, timedelta
+    db = get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_since_last)).isoformat()
+    try:
+        # Companies ohne last_funding_enriched_at ODER mit altem Timestamp
+        result = db.table("companies").select(
+            "id, name, ticker, exchange, region, last_funding_enriched_at"
+        ).or_(
+            f"last_funding_enriched_at.is.null,last_funding_enriched_at.lt.{cutoff}"
+        ).order("last_funding_enriched_at", desc=False, nullsfirst=True).limit(50).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_companies_for_funding_enrichment failed: %s", e)
         return []
