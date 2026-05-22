@@ -174,9 +174,11 @@ async def get_company_ownership(name: str, background_tasks: BackgroundTasks) ->
             share_pct=e.get("share_pct"), source=e.get("source"),
             as_of_date=str(e["as_of_date"]) if e.get("as_of_date") else None,
         ) for e in existing]
-        # Trotzdem Background-Enrichment anstoßen für Pipeline-Daten
-        if company_id and enrichment_status not in ("running",):
+        # Enrichment nur anstoßen wenn noch nie gelaufen — nicht bei running/done
+        if company_id and enrichment_status not in ("running", "done", "error"):
             _queue_enrichment(background_tasks, company_id, company_name, company, existing, funding_rounds)
+        # Immer "manual" zurückgeben wenn Einträge vorhanden — nie "running"
+        # Frontend-Polling stoppt bei "manual", wartet nicht auf Enrichment
         return OwnershipResponse(
             status="manual",
             entries=entries,
@@ -184,12 +186,16 @@ async def get_company_ownership(name: str, background_tasks: BackgroundTasks) ->
         )
 
     # 6. Keine Einträge → Background-Enrichment anstoßen
+    # Aber: wenn enrichment_status="running" bereits → 202-ähnlich, kein neuer Task
     if company_id and enrichment_status not in ("running",):
         _queue_enrichment(background_tasks, company_id, company_name, company, existing, funding_rounds)
         logger.info("Ownership enrichment queued for %s", company_name)
 
+    # "running" → Frontend pollt weiter (korrekt, Daten kommen noch)
+    # "done" ohne Einträge → Pipeline hat nichts gefunden, als "empty" markieren
+    terminal_status = "empty" if enrichment_status == "done" else (enrichment_status or "pending")
     return OwnershipResponse(
-        status=enrichment_status or "pending",
+        status=terminal_status,
         cap_table=cap,
     )
 
