@@ -328,8 +328,8 @@ def compute_competition_score(
 
     if player_count == 0:
         return {
-            "competition_score": "low",
-            "competition_note": "Keine vergleichbaren Companies in DB — Markt möglicherweise sehr früh oder nischig.",
+            "competition_score": "unknown",
+            "competition_note": "Keine vergleichbaren Companies in DB — Wettbewerbsintensität nicht bestimmbar.",
         }
 
     # Funding-Konzentration: größter Player / Gesamtfunding
