@@ -374,6 +374,18 @@ PATENT_SCORING_SECTORS: frozenset[str] = frozenset({
     "solid-state", "long-duration storage", "co₂", "co2",
 })
 
+# SE-15: Sektoren wo Google Trends ein sinnvolles Markt-Signal liefert.
+# Primär: Software/SaaS/AI-Companies wo User-Suchvolumen Nachfrage reflektiert.
+# Explizit NICHT: Deep Tech / Industrial / B2B-only (niemand googelt "Elektrolyse-Stack").
+TRENDS_RELEVANT_SECTORS: frozenset[str] = frozenset({
+    "software", "saas", "ai", "artificial intelligence", "machine learning",
+    "cloud", "platform", "marketplace", "api", "developer tools",
+    "fintech", "insurtech", "proptech", "legaltech", "edtech",
+    "healthtech", "consumer", "climate risk", "climate analytics",
+    "esg platform", "carbon credits", "agritech saas", "food tech",
+    "digital infrastructure", "climate intelligence",
+})
+
 _NER_SYSTEM = """\
 Du bist ein präziser Signal-Klassifikator für M&A- und Investment-Screening.
 Analysiere Unternehmens-News und klassifiziere das Signal.
@@ -791,7 +803,140 @@ async def parse_epo(
     return signals, patent_records
 
 
-# ── EDGAR Parser ─────────────────────────────────────────────────────────────
+# ── SE-15: Google Trends Signal ───────────────────────────────────────────────
+
+_TRENDS_URL = "https://trends.google.com/trends/api/explore"
+_TRENDS_WIDGET_URL = "https://trends.google.com/trends/api/widgetdata/multiline"
+
+
+def _is_trends_relevant(category: str, industry: str) -> bool:
+    """Prüft ob Google Trends für diese Company ein sinnvolles Signal liefert."""
+    text = f"{category} {industry}".lower()
+    return any(s in text for s in TRENDS_RELEVANT_SECTORS)
+
+
+async def _fetch_pytrends(
+    company_name: str,
+    client: httpx.AsyncClient,
+    lookback_days: int = 90,
+) -> tuple[str, float]:
+    """
+    SE-15: Google Trends Daten via pytrends (lazy import).
+    Gibt (direction, change_pct) zurück: 'rising' | 'falling' | 'stable', Δ%.
+
+    Fallback: ('stable', 0.0) bei Import-Fehler oder Rate-Limit.
+    pytrends braucht keine eigene httpx-Session — nutzt requests intern.
+    """
+    try:
+        from pytrends.request import TrendReq   # optionale Abhängigkeit
+    except ImportError:
+        logger.debug("SE-15: pytrends nicht installiert — Signal übersprungen")
+        return "stable", 0.0
+
+    try:
+        pt = TrendReq(hl="en-US", tz=0, timeout=(4, 8), retries=2, backoff_factor=0.5)
+        pt.build_payload([company_name], timeframe="today 3-m", geo="")
+        df = pt.interest_over_time()
+
+        if df is None or df.empty or company_name not in df.columns:
+            return "stable", 0.0
+
+        series = df[company_name].astype(float)
+        if len(series) < 8:   # zu wenig Datenpunkte
+            return "stable", 0.0
+
+        # Letztes Drittel vs. erstes Drittel → Trendrichtung
+        n       = len(series)
+        third   = max(n // 3, 4)
+        recent  = series.iloc[-third:].mean()
+        earlier = series.iloc[:third].mean()
+
+        if earlier < 1:   # kein Suchvolumen → kein Signal
+            return "stable", 0.0
+
+        change = (recent - earlier) / earlier
+        if change > 0.25:
+            return "rising", round(change * 100, 1)
+        elif change < -0.25:
+            return "falling", round(change * 100, 1)
+        return "stable", round(change * 100, 1)
+
+    except Exception as e:
+        # 429 Rate-Limit oder IP-Block auf Cloud-Servern — graceful degradation
+        logger.debug("SE-15: pytrends fehlgeschlagen für '%s': %s", company_name, e)
+        return "stable", 0.0
+
+
+async def parse_google_trends(
+    company_id: str,
+    company_name: str,
+    category: str,
+    industry: str,
+    client: httpx.AsyncClient,
+) -> list[SignalEvent]:
+    """
+    SE-15: Google Trends Signal für SaaS / AI / Software Companies.
+
+    Suchvolumen-Trend über 90 Tage → direction (rising/falling/stable).
+    Nur aktiv für TRENDS_RELEVANT_SECTORS — Deep Tech / Industrial übersprungen.
+
+    Gibt leere Liste zurück wenn:
+      - Sektor nicht relevant
+      - pytrends nicht installiert
+      - Rate-Limit / IP-Block (Render-Cloud)
+      - Zu wenig Suchvolumen
+
+    Kein Crash bei Fehler — immer graceful degradation.
+    """
+    if not _is_trends_relevant(category, industry):
+        return []
+
+    direction, change_pct = await _fetch_pytrends(company_name, client)
+
+    if direction == "stable":
+        return []   # stable ist kein actionables Signal
+
+    today = date.today()
+
+    if direction == "rising":
+        summary = (
+            f"{company_name} — Google Trends: Suchvolumen +{change_pct:.0f}% "
+            f"in den letzten 90 Tagen. Wachsendes Marktinteresse."
+        )
+        signal_direction: Direction = "positive"
+        severity: Severity          = "low"
+        relevance                   = 0.45
+        raw_title                   = f"Google Trends: steigend (+{change_pct:.0f}%)"
+    else:
+        summary = (
+            f"{company_name} — Google Trends: Suchvolumen {change_pct:.0f}% "
+            f"in den letzten 90 Tagen. Rückläufiges Marktinteresse."
+        )
+        signal_direction = "negative"
+        severity         = "low"
+        relevance        = 0.40
+        raw_title        = f"Google Trends: fallend ({change_pct:.0f}%)"
+
+    logger.info(
+        "SE-15: %s → Trend %s (%.0f%%) — Kategorie: %s",
+        company_name, direction, change_pct, category,
+    )
+
+    return [SignalEvent(
+        company_id=company_id,
+        company_name=company_name,
+        event_type="news",
+        event_date=today,
+        summary=summary,
+        source="google_trends",
+        source_url=f"https://trends.google.com/trends/explore?q={company_name.replace(' ', '+')}",
+        severity=severity,
+        raw_title=raw_title,
+        direction=signal_direction,
+        signal_category="market_growth" if direction == "rising" else "general_news",
+        source_domain="trends.google.com",
+        relevance_score=relevance,
+    )]
 
 _EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 
@@ -1463,9 +1608,20 @@ async def run_signal_engine(
             if epo_patents:
                 await asyncio.sleep(0.25)   # EPO Rate-Limit: 4 req/s
 
+            # 8. SE-15: Google Trends (nur TRENDS_RELEVANT_SECTORS)
+            trends_signals = await parse_google_trends(
+                cid, cname,
+                company.get("category") or "",
+                company.get("industry") or "",
+                client,
+            )
+            company_events.extend(trends_signals)
+            if trends_signals:
+                await asyncio.sleep(1.0)   # Google Trends Rate-Limit: konservativ
+
             logger.info(
                 "Signal-Engine: %s → %d events "
-                "(edgar=%d news=%d tc=%d ownership=%d absence=%d patent=%d) "
+                "(edgar=%d news=%d tc=%d ownership=%d absence=%d patent=%d trends=%d) "
                 "pos=%d neg=%d neu=%d",
                 cname, len(company_events),
                 sum(1 for e in company_events if e.source == "edgar"),
@@ -1474,6 +1630,7 @@ async def run_signal_engine(
                 sum(1 for e in company_events if e.source == "internal"),
                 sum(1 for e in company_events if e.source == "internal_absence"),
                 sum(1 for e in company_events if e.source == "epo_ops"),
+                sum(1 for e in company_events if e.source == "google_trends"),
                 sum(1 for e in company_events if e.direction == "positive"),
                 sum(1 for e in company_events if e.direction == "negative"),
                 sum(1 for e in company_events if e.direction == "neutral"),
