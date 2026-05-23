@@ -142,8 +142,17 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
     all_companies = fetch_companies(limit=500)
     name_to_id: dict[str, str] = {c["name"].lower(): c["id"] for c in all_companies}
 
+    # BUG-34: Self-reference guard — Company darf nicht ihr eigener Peer sein
+    company_name_lower = company_name.lower()
     resolved_ids: list[str] = []
     for peer_name in peer_names:
+        # Skip wenn Peer-Name die eigene Company matcht (exact oder substring beidseitig)
+        pn_lower = peer_name.lower()
+        if (pn_lower == company_name_lower
+                or pn_lower in company_name_lower
+                or company_name_lower in pn_lower):
+            logger.info("Self-reference skipped: peer '%s' matches source '%s'", peer_name, company_name)
+            continue
         peer_id, is_new = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
         if peer_id:
             resolved_ids.append(peer_id)

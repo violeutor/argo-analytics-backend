@@ -708,7 +708,15 @@ async def _fetch_beta_from_bridge(
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             if is_listed and ticker:
-                symbol = ticker.split("·")[0].split("→")[-1].strip().upper()
+                # BUG-37: Exchange-Suffix analog zu _fetch_yahoo auflösen
+                # ticker kann "SIE · Frankfurt", "SIE.DE" oder "SIE" sein
+                _parts = ticker.split("·")
+                symbol = _parts[0].split("→")[-1].strip().upper()
+                if "." not in symbol and len(_parts) > 1:
+                    _exch = _parts[1].strip().lower()
+                    _sfx  = _EXCHANGE_SUFFIX.get(_exch, "")
+                    if _sfx:
+                        symbol = symbol + _sfx
                 resp = await client.get(f"{settings.ba_bridge_url}/yahoo/ticker/{symbol}")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1088,7 +1096,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
     enrichment, yahoo, intro = await asyncio.gather(
         _safe_enrichment(),
-        _fetch_yahoo(proxy if is_listed else None),
+        # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
+        # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
+        _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
+        _fetch_yahoo(_yahoo_ticker),
         _safe_intro(),
     )
 
@@ -1188,9 +1199,15 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         exchange=company.get("exchange") or yahoo.get("exchange"),
         region=company.get("region"),
     )
+    # BUG-37: ticker mit Exchange zusammenbauen damit Suffix-Auflösung in _fetch_beta_from_bridge greift
+    # "SIE" (kein Exchange) → "SIE · Frankfurt" → _fetch_beta_from_bridge löst zu "SIE.DE" auf
+    _beta_ticker_raw = company.get("ticker") or (proxy.split("·")[0].strip() if proxy else None)
+    _beta_exchange   = company.get("exchange") or (yahoo.get("exchange") if yahoo else None)
+    if _beta_ticker_raw and _beta_exchange and "·" not in _beta_ticker_raw and "." not in _beta_ticker_raw:
+        _beta_ticker_raw = f"{_beta_ticker_raw} · {_beta_exchange}"
     beta = await _fetch_beta_from_bridge(
-        ticker=company.get("ticker") or (proxy.split("·")[0].strip() if proxy else None),
-        category=company.get("category"),
+        ticker=_beta_ticker_raw,
+        category=company.get("category") or getattr(enrichment, "category", None),
         is_listed=is_listed,
     )
 
@@ -1210,7 +1227,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 logger.debug("Proxy beta fetch failed for %s: %s", proxy_symbol, _pb_err)
 
     fundamentals = _build_fundamentals(
-        is_listed=is_listed,
+        is_listed=is_listed or bool(yahoo.get("price") or yahoo.get("market_cap_bn")),
         yahoo=yahoo,
         ba=enrichment.bundesanzeiger,
         proxy=proxy,

@@ -11,6 +11,21 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+def upsert_ticker_yf(company_id: str, ticker_yf: str) -> None:
+    """
+    Schreibt den yfinance-Ticker (z.B. 'SIE.DE') in companies.ticker_yf.
+    Wird vom BA-Bridge price_fetcher Cron aufgerufen.
+    """
+    if not company_id or not ticker_yf:
+        return
+    try:
+        db = get_supabase()
+        db.table("companies").update({"ticker_yf": ticker_yf}).eq("id", company_id).execute()
+        logger.debug("ticker_yf=%s geschrieben für company_id=%s", ticker_yf, company_id)
+    except Exception as e:
+        logger.warning("upsert_ticker_yf fehlgeschlagen für %s: %s", company_id, e)
+
+
 _client: Client | None = None
 
 
@@ -27,10 +42,11 @@ def fetch_companies(limit: int = 100, source: str | None = None) -> list[dict]:
     db = get_supabase()
     query = db.table("companies").select(
         "id, name, category, industry, potential, risk, ipo_potential, ipo_status, "
-        "investment_path, proxy_ticker, ticker, exchange, funding_total_usd_mn, funding_stage, "
+        "investment_path, proxy_ticker, ticker, ticker_yf, exchange, funding_total_usd_mn, funding_stage, "
         "funding_last_round, last_signal, last_signal_date, source, "
         "founding_year, headquarters, headcount, description, peers, region, "
-        "patent_count, patent_granted_ratio, patent_ipc_codes, patents_fetched_at"
+        "patent_count, patent_granted_ratio, patent_ipc_codes, patents_fetched_at, "
+        "peers_context, peers_resolved, peers_generated_at"
     ).limit(limit).order("name")
 
     if source:
