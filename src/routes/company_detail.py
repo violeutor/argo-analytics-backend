@@ -1120,6 +1120,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
         }
+        # BUG-34 complete: Wikipedia-Titel als kanonischen Namen übernehmen
+        # ("Linde" → "Linde plc", "SpaceX" → korrekte Schreibweise)
+        # Nur wenn enrichment.name vom DB-Namen abweicht und plausibel ist
+        if (enrichment.name
+                and enrichment.name.lower() != company_name.lower()
+                and 2 <= len(enrichment.name) <= 120):
+            upsert_payload["name"] = enrichment.name
+            logger.info("Canonical name update: '%s' → '%s'", company_name, enrichment.name)
         # EN-06: Ticker + Exchange nur für börsennotierte Companies schreiben
         # Verhindert dass private Companies versehentlich einen Ticker bekommen
         if is_listed:
