@@ -373,17 +373,11 @@ def compute_competition_score(
     all_companies: list[dict],
     all_funding_rounds: list[dict],
     external_signals: dict | None = None,
+    peers_context: dict | None = None,
 ) -> dict:
     """
     MD-B05: Wettbewerbsintensität — externe Signale als Primärquelle.
-
-    Scoring-Logik (Reihenfolge):
-      1. DuckDuckGo result_count_proxy (Marktfragmentierung extern)
-      2. TAM-Signal wenn verfügbar (großer TAM → mehr Player)
-      3. DB-Funding-Konzentration als ergänzende Kontextnote (nicht als Score-Basis)
-
-    DB-Zählung ist KEIN Score-Input — Argo-DB bildet den Markt erst
-    partiell ab. 0 DB-Einträge sagen nichts über den echten Wettbewerb.
+    R-22: peers_context (Positioning Notes aus Peer Review) ergänzt competition_note.
     """
     ext = external_signals or {}
     result_count = ext.get("result_count_proxy", 0)
@@ -397,16 +391,23 @@ def compute_competition_score(
         score = "medium"
         note = f"Moderate Wettbewerbsintensität ({result_count} externe Signale)."
     else:
-        # Wenig externe Signale → früher Markt oder Nische — aber nicht "low" als Fakt setzen
-        # sondern als Einschätzung mit Unsicherheits-Marker
         score = "low"
         note = f"Wenig externe Signale ({result_count}) — früher oder nischiger Markt."
 
-    # Bekannte Player aus Snippets ergänzen
     if top_names:
         note += f" Erwähnte Player: {', '.join(top_names[:3])}."
 
-    # ── 2. DB-Funding-Konzentration als Kontextnote (nicht Score) ────────────
+    # ── 2. R-22: Peer Positioning Notes als direkter Wettbewerbs-Kontext ─────
+    if peers_context:
+        peer_notes = [
+            f"{name}: {note_text}"
+            for name, note_text in list(peers_context.items())[:3]
+            if note_text
+        ]
+        if peer_notes:
+            note += " Bekannte Wettbewerber — " + " | ".join(peer_notes) + "."
+
+    # ── 3. DB-Funding-Konzentration als Kontextnote (nicht Score) ────────────
     db_peers = [c for c in all_companies if c.get("category") == category]
     if len(db_peers) >= 2:
         peer_fundings = {
@@ -621,27 +622,27 @@ def enrich_market_data_sync_wrapper(
     all_companies: list[dict],
     all_funding_rounds: list[dict],
     tech_readiness: float | None = None,
-    async_result: dict | None = None,  # Ergebnis von enrich_market_data() — enthält _competition_signals
+    async_result: dict | None = None,
+    peers_context: dict | None = None,   # R-22: Positioning Notes aus Peer Review
 ) -> dict:
     """
     Synchroner Teil der Pipeline — Competition Score + Market Cycle.
-    Läuft direkt nach dem async Teil, braucht keine DB-Calls.
-    async_result wird übergeben damit externe Competition-Signale
-    (via DuckDuckGo, in enrich_market_data gefetcht) genutzt werden können.
+    R-22: peers_context wird an compute_competition_score() weitergegeben.
     """
     result: dict = {}
     category = category or ""
 
-    # BUG-28: Sicherstellen dass leere Listen nie None sind.
     safe_companies = all_companies or []
     safe_rounds = all_funding_rounds or []
 
-    # _competition_signals aus async-Ergebnis extrahieren (internes Übergabe-Feld)
     external_signals = (async_result or {}).get("_competition_signals")
 
-    # MD-B05 — Competition Score (extern + DB-Kontext)
+    # MD-B05 — Competition Score (extern + Peer-Kontext + DB-Kontext)
     try:
-        comp = compute_competition_score(category, safe_companies, safe_rounds, external_signals)
+        comp = compute_competition_score(
+            category, safe_companies, safe_rounds,
+            external_signals, peers_context,
+        )
         result.update(comp)
     except Exception as e:
         logger.warning("Competition score failed for %s: %s", company_name, e)

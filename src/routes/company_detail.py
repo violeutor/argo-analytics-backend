@@ -1006,7 +1006,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     tam_usd_bn=tam.get("tam_usd_bn"),
                     all_companies=all_companies,
                     all_funding_rounds=all_rounds,
-                    async_result=async_result,  # übergibt _competition_signals
+                    async_result=async_result,
+                    peers_context=company.get("peers_context"),  # R-22
                 )
                 # _competition_signals ist internes Übergabe-Feld — nicht in DB schreiben
                 upsert_payload = {

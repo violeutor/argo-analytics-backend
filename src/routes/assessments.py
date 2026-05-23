@@ -144,6 +144,13 @@ def _build_narrative_context(
             f"  Market cycle: {market.get('market_cycle') or '—'} — {market.get('market_cycle_note') or ''}",
         ]
 
+    # R-22: Peer Positioning Notes → strategy + operations dimension context
+    peers_context: dict = company.get("peers_context") or {}
+    if peers_context:
+        lines += ["", "PEER POSITIONING (use for strategy + competitive risk notes):"]
+        for peer_name, positioning in list(peers_context.items())[:4]:
+            lines.append(f"  vs. {peer_name}: {positioning}")
+
     if pos_signals:
         lines += ["", "POSITIVE SIGNALS (recent):"]
         for s in pos_signals[:6]:

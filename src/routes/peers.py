@@ -321,8 +321,9 @@ async def _resolve_or_create_peer(
 
 async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
     """
-    Organic DB growth: Wikipedia-Enrichment für neu angelegten Peer.
-    Befüllt founding_year, headquarters, headcount, website, description.
+    R-21: Vollständiges Enrichment für neu angelegte Peer-Companies.
+    Stufe 1: Wikipedia (founding_year, headquarters, headcount, website, description)
+    Stufe 2: TAM-Lookup + Market Data Enrichment (async, non-blocking)
     """
     try:
         from src.services.enrichment import enrich_company
@@ -334,7 +335,6 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
         db = get_supabase()
         payload: dict = {}
 
-        # Direkte String-Felder
         for src_key, dst_key in [
             ("headquarters", "headquarters"),
             ("website",       "website"),
@@ -343,7 +343,6 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
             if val:
                 payload[dst_key] = str(val)
 
-        # founding_year: aus "founded" (Jahr-String oder Int)
         founded = enriched.get("founded")
         if founded:
             try:
@@ -351,7 +350,6 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
             except (ValueError, TypeError):
                 pass
 
-        # headcount: aus employee_count (ggf. "1,200" oder "ca. 500")
         hc_raw = enriched.get("employee_count")
         if hc_raw:
             try:
@@ -361,19 +359,78 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
             except (ValueError, TypeError):
                 pass
 
-        # description aus intro oder product_description
         desc = enriched.get("intro") or enriched.get("product_description")
         if desc:
             payload["description"] = str(desc)[:1000]
 
         if payload:
             db.table("companies").update(payload).eq("id", peer_id).execute()
-            logger.info("Peer %s enriched: %d Felder", peer_name, len(payload))
-        else:
-            logger.debug("Peer %s: kein Enrichment-Payload", peer_name)
+            logger.info("Peer %s enriched (Wikipedia): %d Felder", peer_name, len(payload))
 
     except Exception as e:
-        logger.warning("_enrich_new_peer failed für %s: %s", peer_name, e)
+        logger.warning("_enrich_new_peer Wikipedia failed für %s: %s", peer_name, e)
+
+    # ── R-21 Stufe 2: TAM + Market Data ──────────────────────────────────────
+    # Non-blocking — Fehler hier stoppen nicht die Peer-Generierung
+    try:
+        from src.services.tam import get_tam
+        from src.integrations.supabase import (
+            upsert_tam_cache, fetch_market_data, upsert_market_data,
+            set_enrichment_status, fetch_all_funding_rounds, fetch_companies,
+        )
+        from src.services.market_data_enrichment import (
+            enrich_market_data, enrich_market_data_sync_wrapper,
+        )
+
+        # Category aus DB holen (evtl. gerade geschrieben)
+        db = get_supabase()
+        peer_row = db.table("companies").select("category, peers_context").eq("id", peer_id).limit(1).execute()
+        peer_category = (peer_row.data or [{}])[0].get("category") if peer_row.data else None
+
+        # TAM
+        tam = await get_tam(peer_name, peer_category)
+        if tam.get("tam_usd_bn"):
+            upsert_tam_cache(
+                company_id=peer_id,
+                tam_usd_bn=tam["tam_usd_bn"],
+                cagr_pct=tam.get("cagr_pct"),
+                source=tam.get("source", "scrape"),
+            )
+            logger.info("Peer %s TAM enriched: %.1f Bn", peer_name, tam["tam_usd_bn"])
+
+        # Market Data — nur wenn noch nicht vorhanden
+        existing_md = fetch_market_data(peer_id)
+        if not existing_md or not existing_md.get("enriched_at"):
+            set_enrichment_status(peer_id, "running")
+            all_companies = fetch_companies(limit=500)
+            all_rounds    = fetch_all_funding_rounds()
+            async_result  = await enrich_market_data(
+                company_id=peer_id,
+                company_name=peer_name,
+                category=peer_category,
+                sector_tag=None,
+                tam_usd_bn=tam.get("tam_usd_bn"),
+            )
+            sync_result = enrich_market_data_sync_wrapper(
+                company_id=peer_id,
+                company_name=peer_name,
+                category=peer_category,
+                sector_tag=None,
+                tam_usd_bn=tam.get("tam_usd_bn"),
+                all_companies=all_companies,
+                all_funding_rounds=all_rounds,
+                async_result=async_result,
+            )
+            upsert_payload = {
+                **{k: v for k, v in async_result.items() if k != "_competition_signals"},
+                **sync_result,
+            }
+            upsert_market_data(peer_id, upsert_payload)
+            set_enrichment_status(peer_id, "done")
+            logger.info("Peer %s market data enriched", peer_name)
+
+    except Exception as e:
+        logger.warning("_enrich_new_peer TAM/Market failed für %s: %s", peer_name, e)
 
 
 # ── DB Helpers ────────────────────────────────────────────────────────────────
