@@ -1028,6 +1028,36 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         background_tasks.add_task(_market_enrichment_bg)
         logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
 
+    elif company_id and company.get("peers_context"):
+        # R-22 follow-up: competition_note mit aktuellem peers_context refreshen.
+        # Läuft wenn market_data bereits gecacht ist — kein teurer async-Teil (kein DDG/Claude).
+        # Nur competition_score + competition_note + market_cycle werden upgesertet.
+        async def _competition_refresh_bg():
+            try:
+                all_companies = fetch_companies(limit=500)
+                all_rounds    = fetch_all_funding_rounds()
+                comp_result   = enrich_market_data_sync_wrapper(
+                    company_id=company_id,
+                    company_name=company_name,
+                    category=company.get("category"),
+                    sector_tag=None,
+                    tam_usd_bn=tam.get("tam_usd_bn"),
+                    all_companies=all_companies,
+                    all_funding_rounds=all_rounds,
+                    async_result=None,   # keine neuen DDG-Signale — Peers-Kontext genügt
+                    peers_context=company.get("peers_context"),
+                )
+                upsert_market_data(company_id, {
+                    k: v for k, v in comp_result.items()
+                    if k in ("competition_score", "competition_note",
+                             "market_cycle", "market_cycle_note")
+                })
+                logger.debug("R-22 competition_note refreshed for %s", company_name)
+            except Exception as e:
+                logger.warning("R-22 competition refresh failed for %s: %s", company_name, e)
+
+        background_tasks.add_task(_competition_refresh_bg)
+
     # 5. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
         try:
