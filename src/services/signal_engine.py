@@ -1012,7 +1012,7 @@ def check_absence_signals(
                     source="internal_absence",
                     source_url=None,
                     severity="low",
-                    raw_title=f"Signal-Stille: {days_silent} Tage",
+                    raw_title="Signal-Stille: keine öffentlichen Signale",   # statisch — kein {days_silent}
                     direction="negative",
                     signal_category="general_news",
                 ))
