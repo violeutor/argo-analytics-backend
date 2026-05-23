@@ -1094,11 +1094,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             logger.warning("Intro failed for %s: %s", company_name, e)
             return f"{company_name} — no description available."
 
+    # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
+    # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
+    _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
     enrichment, yahoo, intro = await asyncio.gather(
         _safe_enrichment(),
-        # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
-        # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
-        _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
         _fetch_yahoo(_yahoo_ticker),
         _safe_intro(),
     )
