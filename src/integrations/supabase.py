@@ -590,13 +590,15 @@ def upsert_company_scores(company_id: str, scores: dict) -> bool:
 def fetch_potential_buyers(company_id: str) -> list[dict]:
     """
     R-23: Gibt company-spezifische Käufer aus potential_buyers zurück.
+    Sortiert nach generated_at DESC — stellt sicher dass is_cache_valid()
+    den neuesten Eintrag prüft (BUG-32: war order("confidence") → unzuverlässig).
     Leere Liste wenn noch nicht generiert oder TTL abgelaufen.
     """
     db = get_supabase()
     try:
         result = db.table("potential_buyers").select("*").eq(
             "company_id", company_id
-        ).order("confidence").execute()
+        ).order("generated_at", desc=True).execute()
         return result.data or []
     except Exception as e:
         logger.warning("fetch_potential_buyers failed für %s: %s", company_id, e)
