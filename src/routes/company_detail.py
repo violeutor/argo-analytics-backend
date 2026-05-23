@@ -1049,8 +1049,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 )
                 upsert_market_data(company_id, {
                     k: v for k, v in comp_result.items()
-                    if k in ("competition_score", "competition_note",
-                             "market_cycle", "market_cycle_note")
+                    if k in ("competition_note",)  # Score bleibt aus originalem DDG-Enrichment
                 })
                 logger.debug("R-22 competition_note refreshed for %s", company_name)
             except Exception as e:
