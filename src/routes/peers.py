@@ -426,6 +426,43 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
     except Exception as e:
         logger.warning("_enrich_new_peer TAM/Market failed für %s: %s", peer_name, e)
 
+    # ── R-21-ext Stufe 3: Scoring ─────────────────────────────────────────────
+    # compute_all_scores() mit frisch angereicherten Daten — gibt Peer sofort
+    # einen validen Score im Peer Review Benchmark.
+    try:
+        from src.services.score_calculator import compute_all_scores
+        from src.integrations.supabase import (
+            upsert_company_scores, fetch_market_data as _fetch_md,
+        )
+
+        db = get_supabase()
+        peer_full = db.table("companies").select("*").eq("id", peer_id).limit(1).execute()
+        peer_company = (peer_full.data or [{}])[0]
+        if not peer_company:
+            return
+
+        market_data = _fetch_md(peer_id) or {}
+
+        score_result = compute_all_scores(
+            company=peer_company,
+            market_data=market_data,
+            signals=[],
+            ownership_entries=[],
+            buyers=[],
+            value_drivers=[],
+        )
+        upsert_company_scores(peer_id, score_result.to_dict())
+        logger.info(
+            "Peer %s scored — hero=%s rating=%s composite=%.1f",
+            peer_name,
+            score_result.hero_path,
+            score_result.rating,
+            score_result.composite_score or 0.0,
+        )
+
+    except Exception as e:
+        logger.warning("_enrich_new_peer Scoring failed für %s: %s", peer_name, e)
+
 
 # ── DB Helpers ────────────────────────────────────────────────────────────────
 
