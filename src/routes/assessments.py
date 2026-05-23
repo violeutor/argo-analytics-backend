@@ -1,22 +1,31 @@
 """
-assessments.py — R-18: Company Assessments via Claude
+assessments.py — R-18 v2.0: Company Assessments (algorithmisch + Claude Narrativ)
 GET /api/v1/company/{name}/assessments
 
-Flow:
-  1. DB-Cache prüfen (company_assessments)
+Flow v2.0 (BUG-31 Fix):
+  1. DB-Cache prüfen (company_assessments) — frisch wenn score_source='algorithmic' + < 24h
   2. Cache hit → sofort zurück
-  3. Cache miss → Claude-Call (Wikipedia + market_data + signals + scorings)
-  4. Ergebnis in company_assessments + companies.description schreiben
-  5. Response zurück
+  3. Cache miss:
+     a. Algorithmische Scores via compute_dimension_risks() (score_calculator)
+     b. Claude-Call NUR für Narrativ-Notes (keine Scores mehr!)
+     c. Ergebnis in company_assessments schreiben
+  4. Response zurück
 
 Dimensionen (6):
   market · financials · strategy · political · technology · operations
+
+Scoring-Prinzip (BUG-31):
+  - Alle Scores kommen aus Daten (market_data, funding_stage, signals, value_drivers, peers)
+  - Datenmangel → neutral (4.0–5.0), KEIN halluziniertes Risiko
+  - Claude erklärt Scores, erfindet sie nicht
+  - data_confidence: 'high'|'medium'|'low' je Dimension
 """
 
 import json
 import logging
 import os
 import re
+import datetime
 from typing import Any
 
 import httpx
@@ -27,55 +36,17 @@ from src.integrations.supabase import (
     fetch_directional_signals,
     fetch_market_data,
     fetch_tam_cache,
+    fetch_value_drivers,
     get_supabase,
 )
+from src.services.score_calculator import compute_dimension_risks
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 MODEL = "claude-haiku-4-5-20251001"
-
-# ── Dimensionen-Definitionen ──────────────────────────────────────────────────
-
-DIMENSIONS = [
-    {
-        "id": "market",
-        "label": "Markt",
-        "signal_categories_opportunity": ["market_growth", "new_partnership", "new_customer"],
-        "signal_categories_risk": ["market_decline", "competitive_pressure"],
-    },
-    {
-        "id": "financials",
-        "label": "Finanzen",
-        "signal_categories_opportunity": ["funding_round", "revenue_growth"],
-        "signal_categories_risk": ["negative_earnings", "high_burn", "debt_increase"],
-    },
-    {
-        "id": "strategy",
-        "label": "Strategie",
-        "signal_categories_opportunity": ["new_partnership", "expansion", "acquisition"],
-        "signal_categories_risk": ["leadership_change", "strategy_pivot"],
-    },
-    {
-        "id": "political",
-        "label": "Political Environment",
-        "signal_categories_opportunity": ["regulatory_positive", "subsidy", "policy_support"],
-        "signal_categories_risk": ["regulatory_intervention", "policy_risk", "sanctions"],
-    },
-    {
-        "id": "technology",
-        "label": "Technologie",
-        "signal_categories_opportunity": ["patent", "new_product", "tech_milestone"],
-        "signal_categories_risk": ["ip_risk", "tech_obsolescence"],
-    },
-    {
-        "id": "operations",
-        "label": "Operative Stärke",
-        "signal_categories_opportunity": ["headcount_growth", "revenue_per_fte"],
-        "signal_categories_risk": ["supply_chain_issue", "key_person_risk", "customer_concentration"],
-    },
-]
+_CACHE_TTL_HOURS = 24
 
 
 # ── DB-Funktionen ─────────────────────────────────────────────────────────────
@@ -95,6 +66,24 @@ def fetch_assessments(company_id: str) -> dict | None:
         return None
 
 
+def _is_cache_fresh(cached: dict) -> bool:
+    """Cache gültig wenn: score_source='algorithmic' + < 24h alt."""
+    gen_at = cached.get("generated_at")
+    if not gen_at:
+        return False
+    try:
+        age = datetime.datetime.utcnow() - datetime.datetime.fromisoformat(gen_at.replace("Z", ""))
+        if age.total_seconds() > _CACHE_TTL_HOURS * 3600:
+            return False
+    except Exception:
+        return False
+    # Prüfe ob algorithmische Scores (nicht Legacy-Claude-Scores)
+    dims = cached.get("dimensions") or []
+    if dims and isinstance(dims[0], dict):
+        return dims[0].get("score_source") == "algorithmic"
+    return False
+
+
 def upsert_assessments(company_id: str, data: dict) -> None:
     db = get_supabase()
     try:
@@ -108,54 +97,41 @@ def upsert_assessments(company_id: str, data: dict) -> None:
 
 
 def upsert_company_description(company_id: str, description: str) -> None:
-    """Schreibt AI-generierte Beschreibung in companies.description (Tab 0)."""
     db = get_supabase()
     try:
         db.table("companies").update({"description": description}).eq("id", company_id).execute()
-        logger.info("upsert_company_description OK: %s", company_id)
     except Exception as e:
         logger.warning("upsert_company_description FAILED(%s): %s", company_id, e)
 
 
-def fetch_scorings(company_id: str) -> list[dict]:
-    """
-    Scores sind über deal_id verknüpft, nicht direkt company_id.
-    Join über deals-Tabelle: deals.company_id → scores.deal_id
-    """
-    db = get_supabase()
-    try:
-        # deals für company_id holen, dann letzten Score dazu
-        deals = db.table("deals").select("id").eq("company_id", company_id)            .order("created_at", desc=True).limit(1).execute()
-        if not deals.data:
-            return []
-        deal_id = deals.data[0]["id"]
-        r = db.table("scores").select(
-            "rating, srr_value, srr_category, mfr_value, mfr_signal, tr_value"
-        ).eq("deal_id", deal_id).limit(1).execute()
-        return r.data or []
-    except Exception as e:
-        logger.warning("fetch_scorings(%s): %s", company_id, e)
-        return []  # non-blocking — Scoring-Kontext ist optional
+# ── Context Builder für Claude-Narrativ ──────────────────────────────────────
 
+_DIM_LABELS = {
+    "market":     "Markt",
+    "financials": "Finanzen",
+    "strategy":   "Strategie",
+    "political":  "Political Environment",
+    "technology": "Technologie",
+    "operations": "Operative Stärke",
+}
 
-# ── Context Builder ───────────────────────────────────────────────────────────
-
-def _build_context(company: dict, market: dict | None, tam: dict | None,
-                   scorings: list[dict], pos_signals: list[dict],
-                   neg_signals: list[dict]) -> str:
-    """Baut strukturierten Kontext-String für Claude-Prompt."""
-
+def _build_narrative_context(
+    company: dict,
+    market: dict | None,
+    tam: dict | None,
+    pos_signals: list[dict],
+    neg_signals: list[dict],
+    dimension_scores: dict,
+) -> str:
+    """Baut strukturierten Kontext für Claude-Narrativ-Prompt."""
     lines = [
         f"COMPANY: {company.get('name')}",
         f"Category: {company.get('category') or company.get('industry') or '—'}",
-        f"HQ: {company.get('headquarters') or '—'}",
-        f"Founded: {company.get('founding_year') or '—'}",
         f"Stage: {company.get('funding_stage') or '—'}",
         f"Funding total: {company.get('funding_total_usd_mn') or '—'} USD mn",
-        f"Headcount: {company.get('headcount') or '—'}",
+        f"HQ: {company.get('headquarters') or '—'}",
         f"IPO status: {company.get('ipo_status') or '—'}",
         f"Region: {company.get('region') or '—'}",
-        f"Description (existing): {company.get('description') or '—'}",
     ]
 
     if market:
@@ -164,65 +140,57 @@ def _build_context(company: dict, market: dict | None, tam: dict | None,
             "MARKET DATA:",
             f"  TAM 2035: {market.get('tam_2035_usd_bn') or '—'} USD bn",
             f"  CAGR: {market.get('cagr_pct') or '—'}%",
-            f"  SAM: {market.get('sam_usd_bn') or '—'} USD bn",
             f"  Competition: {market.get('competition_score') or '—'} — {market.get('competition_note') or ''}",
             f"  Market cycle: {market.get('market_cycle') or '—'} — {market.get('market_cycle_note') or ''}",
-            f"  Growth drivers: {market.get('growth_drivers') or '—'}",
-        ]
-
-    if tam:
-        lines += [f"  TAM source: {tam.get('source') or '—'}"]
-
-    if scorings:
-        sc = scorings[0]
-        lines += [
-            "",
-            "SCORING:",
-            f"  Rating: {sc.get('rating') or '—'}",
-            f"  SRR: {sc.get('srr_value') or '—'} ({sc.get('srr_category') or '—'})",
-            f"  MFR: {sc.get('mfr_value') or '—'} → {sc.get('mfr_signal') or '—'}",
-            f"  TechReadiness: {sc.get('tr_value') or '—'}",
         ]
 
     if pos_signals:
         lines += ["", "POSITIVE SIGNALS (recent):"]
-        for s in pos_signals[:8]:
-            lines.append(f"  [{s.get('signal_category') or s.get('event_type')}] {s.get('summary') or s.get('raw_title') or ''}  ({s.get('event_date') or ''})")
+        for s in pos_signals[:6]:
+            lines.append(f"  [{s.get('signal_category')}] {s.get('summary') or s.get('raw_title') or ''}")
 
     if neg_signals:
         lines += ["", "NEGATIVE SIGNALS (recent):"]
-        for s in neg_signals[:8]:
-            lines.append(f"  [{s.get('signal_category') or s.get('event_type')}] {s.get('summary') or s.get('raw_title') or ''}  ({s.get('event_date') or ''})")
+        for s in neg_signals[:6]:
+            lines.append(f"  [{s.get('signal_category')}] {s.get('summary') or s.get('raw_title') or ''}")
+
+    lines += ["", "ALGORITHMIC SCORES (explain WHY, do not change):"]
+    for dim_id, scores in dimension_scores.items():
+        label = _DIM_LABELS.get(dim_id, dim_id)
+        conf  = scores.get("data_confidence", "low")
+        opp   = scores.get("opportunity_score", "—")
+        risk  = scores.get("risk_score", "—")
+        sources_opp = ", ".join(scores.get("opportunity_sources", []))
+        sources_rsk = ", ".join(scores.get("risk_sources", []))
+        lines.append(
+            f"  {label}: opp={opp} (from: {sources_opp}) / risk={risk} (from: {sources_rsk}) — confidence={conf}"
+        )
+        if conf == "low":
+            lines.append(f"    ↳ NOTE: {label} score is a sector baseline due to insufficient data.")
 
     return "\n".join(lines)
 
 
-# ── Claude Call ───────────────────────────────────────────────────────────────
+# ── Claude Narrativ-Call ──────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a factual M&A and investment analysis engine. 
-You assess companies for professional investors (VC, PE, M&A, Corporate, Asset Manager).
-No marketing language. Only facts, numbers, and evidence-based assessments.
+SYSTEM_PROMPT = """You are a factual M&A and investment analysis engine.
+You explain pre-computed algorithmic scores for professional investors (VC, PE, M&A, Corporate, Asset Manager).
+No marketing language. Only facts, evidence-based context, and concise notes.
 Respond ONLY with valid JSON. No preamble, no explanation, no markdown fences."""
 
-USER_PROMPT_TEMPLATE = """Assess the following company across 6 dimensions. 
-For each dimension provide opportunity_score (0-10), risk_score (0-10), and concise factual notes (max 2 sentences each).
-Also generate a company description (2-3 sentences, factual, investor-grade, no marketing).
+USER_PROMPT_TEMPLATE = """The following algorithmic scores have been computed for {company_name}.
+Your task: write concise factual notes explaining WHY each score is what it is.
+Do NOT change the scores. Do NOT invent numbers. Only explain with available evidence.
 
-Dimensions to assess:
-1. market — market size, growth rate, market cycle stage
-2. financials — funding health, burn efficiency, revenue signals, EBITDA if available
-3. strategy — SRR/MFR scoring signals, buyer fit, strategic positioning
-4. political — regulatory environment, subsidies, policy tailwinds/headwinds, geopolitical exposure
-5. technology — tech readiness, IP position, innovation signals, obsolescence risk
-6. operations — team signals, headcount trends, customer concentration, supply chain
+If confidence="low" for a dimension, explicitly state: "Insufficient data — score reflects sector baseline."
 
-Scoring guide:
-- opportunity_score 8-10: strong positive evidence
-- opportunity_score 5-7: moderate positive signals
-- opportunity_score 0-4: weak or no positive signals
-- risk_score 8-10: material risk with evidence
-- risk_score 5-7: moderate risk signals
-- risk_score 0-4: low or no risk signals
+Dimensions to annotate:
+1. market — market size, growth, competitive dynamics
+2. financials — funding health, stage risk, financial signals
+3. strategy — competitive positioning, peer landscape, strategic signals
+4. political — regulatory environment, policy signals
+5. technology — tech readiness, IP position, innovation signals
+6. operations — enabler dependencies, supplier/customer concentration
 
 Context:
 {context}
@@ -233,64 +201,44 @@ Respond with this exact JSON structure:
   "dimensions": [
     {{
       "id": "market",
-      "label": "Markt",
-      "opportunity_score": <0-10>,
-      "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
-      "risk_note": "<factual, max 2 sentences>"
+      "opportunity_note": "<factual, max 2 sentences, explain the score>",
+      "risk_note": "<factual, max 2 sentences, explain the score>"
     }},
     {{
       "id": "financials",
-      "label": "Finanzen",
-      "opportunity_score": <0-10>,
       "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
       "risk_note": "<factual, max 2 sentences>"
     }},
     {{
       "id": "strategy",
-      "label": "Strategie",
-      "opportunity_score": <0-10>,
       "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
       "risk_note": "<factual, max 2 sentences>"
     }},
     {{
       "id": "political",
-      "label": "Political Environment",
-      "opportunity_score": <0-10>,
       "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
       "risk_note": "<factual, max 2 sentences>"
     }},
     {{
       "id": "technology",
-      "label": "Technologie",
-      "opportunity_score": <0-10>,
       "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
       "risk_note": "<factual, max 2 sentences>"
     }},
     {{
       "id": "operations",
-      "label": "Operative Stärke",
-      "opportunity_score": <0-10>,
       "opportunity_note": "<factual, max 2 sentences>",
-      "risk_score": <0-10>,
       "risk_note": "<factual, max 2 sentences>"
     }}
-  ],
-  "composite_opportunity": <weighted average of opportunity_scores, 1 decimal>,
-  "composite_risk": <weighted average of risk_scores, 1 decimal>
+  ]
 }}"""
 
 
-async def _call_claude(context: str) -> dict:
+async def _call_claude_narrative(company_name: str, context: str) -> dict:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
 
-    prompt = USER_PROMPT_TEMPLATE.format(context=context)
+    prompt = USER_PROMPT_TEMPLATE.format(company_name=company_name, context=context)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
@@ -302,7 +250,7 @@ async def _call_claude(context: str) -> dict:
             },
             json={
                 "model": MODEL,
-                "max_tokens": 1500,
+                "max_tokens": 1200,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -310,13 +258,55 @@ async def _call_claude(context: str) -> dict:
         resp.raise_for_status()
         data = resp.json()
 
-    raw = "".join(
-        block.get("text", "") for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
-    # JSON aus Antwort extrahieren — strip markdown fences falls vorhanden
+    raw   = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
     return json.loads(clean)
+
+
+# ── Dimensions zusammenbauen: Scores + Narrativ mergen ───────────────────────
+
+def _merge_dimensions(
+    dimension_scores: dict,
+    narrative_dims: list[dict],
+) -> list[dict]:
+    """
+    Mergt algorithmische Scores mit Claude-Narrativ-Notes.
+    Scores sind autoritativ, Notes kommen von Claude.
+    """
+    note_map = {d["id"]: d for d in (narrative_dims or [])}
+
+    result = []
+    for dim_id, scores in dimension_scores.items():
+        note = note_map.get(dim_id, {})
+        result.append({
+            "id":               dim_id,
+            "label":            _DIM_LABELS.get(dim_id, dim_id),
+            # Algorithmische Scores (autoritativ)
+            "opportunity_score": scores["opportunity_score"],
+            "risk_score":        scores["risk_score"],
+            "data_confidence":   scores["data_confidence"],
+            "opportunity_sources": scores.get("opportunity_sources", []),
+            "risk_sources":        scores.get("risk_sources", []),
+            # Claude Narrativ
+            "opportunity_note":  note.get("opportunity_note", ""),
+            "risk_note":         note.get("risk_note", ""),
+            # Meta
+            "score_source":      "algorithmic",
+        })
+
+    return result
+
+
+# ── Composite aus Dimension-Scores ────────────────────────────────────────────
+
+def _compute_composites(dimension_scores: dict) -> tuple[float | None, float | None]:
+    """Berechnet composite_opportunity + composite_risk als Durchschnitt der Dimension-Scores."""
+    opp_vals  = [v["opportunity_score"] for v in dimension_scores.values() if v.get("opportunity_score") is not None]
+    risk_vals = [v["risk_score"]        for v in dimension_scores.values() if v.get("risk_score")        is not None]
+
+    comp_opp  = round(sum(opp_vals)  / len(opp_vals),  1) if opp_vals  else None
+    comp_risk = round(sum(risk_vals) / len(risk_vals), 1) if risk_vals else None
+    return comp_opp, comp_risk
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -324,85 +314,105 @@ async def _call_claude(context: str) -> dict:
 @router.get("/api/v1/company/{name}/assessments")
 async def get_assessments(name: str):
     """
-    R-18: Company Assessments — 6 Dimensionen mit Opportunity/Risk Scores.
-    Cache-first: DB → sofort. Cache miss → Claude-Call → DB-Write → Response.
+    R-18 v2.0: Company Assessments — 6 Dimensionen, algorithmische Scores + Claude Narrativ.
+    Cache-first: DB → sofort wenn frisch. Cache miss → Scores berechnen + Claude Narrativ → DB → Response.
     """
     # 1. Company laden
     company = fetch_company_by_name(name)
     if not company:
         raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
 
-    company_id = company["id"]
+    company_id   = company["id"]
+    company_name = company["name"]
 
-    # 2. Cache prüfen
+    # 2. Cache prüfen (nur algorithmische Scores akzeptieren)
     cached = fetch_assessments(company_id)
-    if cached:
-        logger.info("assessments cache hit: %s", name)
+    if cached and _is_cache_fresh(cached):
+        logger.info("assessments cache hit (algorithmic): %s", name)
         return {
-            "company": name,
-            "source": "cache",
-            "generated_at": cached.get("generated_at"),
-            "model": cached.get("model"),
-            "description": cached.get("description"),
-            "dimensions": cached.get("dimensions") or [],
+            "company":              name,
+            "source":               "cache",
+            "generated_at":         cached.get("generated_at"),
+            "model":                cached.get("model"),
+            "description":          cached.get("description"),
+            "dimensions":           cached.get("dimensions") or [],
             "composite_opportunity": cached.get("composite_opportunity"),
-            "composite_risk": cached.get("composite_risk"),
+            "composite_risk":        cached.get("composite_risk"),
         }
 
-    # 3. Kontext zusammenbauen
-    market = fetch_market_data(company_id)
-    tam    = fetch_tam_cache(company_id)
-    scorings = fetch_scorings(company_id)
-    pos_signals = fetch_directional_signals(company_id, "positive", limit=10)
-    neg_signals = fetch_directional_signals(company_id, "negative", limit=10)
+    # 3. Daten für algorithmische Scores laden
+    market      = fetch_market_data(company_id)
+    tam         = fetch_tam_cache(company_id)
+    pos_signals = fetch_directional_signals(company_id, "positive", limit=15)
+    neg_signals = fetch_directional_signals(company_id, "negative", limit=15)
+    vd_raw      = fetch_value_drivers(company_id)
 
-    context = _build_context(company, market, tam, scorings, pos_signals, neg_signals)
+    # Value Drivers als flache Liste für compute_dimension_risks
+    vd_flat: list[dict] = []
+    if vd_raw:
+        for key in ("enablers", "contributors"):
+            vd_flat.extend(vd_raw.get(key) or [])
 
-    # 4. Claude-Call
+    all_signals = pos_signals + neg_signals
+
+    # 4. Algorithmische Scores berechnen
+    dimension_scores = compute_dimension_risks(
+        company=company,
+        market_data=market,
+        signals=all_signals,
+        value_drivers=vd_flat,
+    )
+
+    # 5. Composite berechnen
+    comp_opp, comp_risk = _compute_composites(dimension_scores)
+
+    # 6. Claude-Call — nur Narrativ, keine Scores
+    narrative_dims: list[dict] = []
+    description = ""
     try:
-        result = await _call_claude(context)
+        context = _build_narrative_context(
+            company=company,
+            market=market,
+            tam=tam,
+            pos_signals=pos_signals,
+            neg_signals=neg_signals,
+            dimension_scores=dimension_scores,
+        )
+        result = await _call_claude_narrative(company_name, context)
+        narrative_dims = result.get("dimensions") or []
+        description    = result.get("description") or ""
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 529:
-            logger.warning("Claude 529 overloaded for %s — retry later", name)
-            raise HTTPException(status_code=503, detail="Assessment generation temporarily unavailable — Claude overloaded. Please retry in a moment.")
-        logger.error("Claude assessments call failed for %s: %s", name, e)
-        raise HTTPException(status_code=502, detail=f"Assessment generation failed: {e}")
+            logger.warning("Claude 529 overloaded for %s — using scores only", name)
+        else:
+            logger.error("Claude narrative call failed for %s: %s", name, e)
     except Exception as e:
-        logger.error("Claude assessments call failed for %s: %s", name, e)
-        raise HTTPException(status_code=502, detail=f"Assessment generation failed: {e}")
+        logger.warning("Claude narrative call failed for %s: %s — scores still returned", name, e)
 
-    # 5. Validierung
-    dimensions = result.get("dimensions") or []
-    description = result.get("description") or ""
-    composite_opp  = result.get("composite_opportunity")
-    composite_risk = result.get("composite_risk")
+    # 7. Scores + Narrativ mergen
+    merged_dims = _merge_dimensions(dimension_scores, narrative_dims)
 
-    if not dimensions:
-        raise HTTPException(status_code=502, detail="Claude returned empty dimensions")
-
-    # 6. In DB schreiben
-    import datetime
+    # 8. In DB cachen
     payload: dict[str, Any] = {
-        "dimensions":             dimensions,
-        "composite_opportunity":  composite_opp,
-        "composite_risk":         composite_risk,
-        "description":            description,
-        "generated_at":           datetime.datetime.utcnow().isoformat(),
-        "model":                  MODEL,
+        "dimensions":            merged_dims,
+        "composite_opportunity": comp_opp,
+        "composite_risk":        comp_risk,
+        "description":           description or company.get("description") or "",
+        "generated_at":          datetime.datetime.utcnow().isoformat(),
+        "model":                 MODEL,
     }
     upsert_assessments(company_id, payload)
 
-    # 7. companies.description aktualisieren (Tab 0)
     if description:
         upsert_company_description(company_id, description)
 
     return {
-        "company": name,
-        "source": "generated",
-        "generated_at": payload["generated_at"],
-        "model": MODEL,
-        "description": description,
-        "dimensions": dimensions,
-        "composite_opportunity": composite_opp,
-        "composite_risk": composite_risk,
+        "company":               company_name,
+        "source":                "generated",
+        "generated_at":          payload["generated_at"],
+        "model":                 MODEL,
+        "description":           description,
+        "dimensions":            merged_dims,
+        "composite_opportunity": comp_opp,
+        "composite_risk":        comp_risk,
     }

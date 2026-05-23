@@ -60,6 +60,9 @@ class ScoreResult:
     etf_score:           float | None = None
     enabler_score:       float | None = None
 
+    # SC-10: Compound Risk Score (aggregiert aus 6 Dimensions-Risiken)
+    compound_risk_score: float | None = None
+
     # Composite + Hero (SC-05, SC-11, SC-13)
     composite_score:     float | None = None
     hero_path:           str   | None = None   # 'ipo' | 'm_and_a' | 'etf' | 'enabler'
@@ -79,6 +82,7 @@ class ScoreResult:
             "risk_score":         self.risk_score,
             "ownership_score":    self.ownership_score,
             "value_driver_score": self.value_driver_score,
+            "compound_risk_score": self.compound_risk_score,
             "ipo_score":          self.ipo_score,
             "ma_score":           self.ma_score,
             "etf_score":          self.etf_score,
@@ -897,6 +901,208 @@ def derive_rating(hero_score: float | None, composite_score: float | None) -> st
 
 # ── Haupt-Funktion ─────────────────────────────────────────────────────────────
 
+def compute_dimension_risks(
+    company:       dict,
+    market_data:   dict | None       = None,
+    signals:       list[dict] | None = None,
+    value_drivers: list[dict] | None = None,
+) -> dict:
+    """
+    SC-10 Basis: Algorithmische Opportunity/Risk-Scores für 6 Dimensionen.
+    Datenmangel → neutral (4.0–5.0), kein halluziniertes Risiko (BUG-31).
+
+    Returns: {dim_id: {opportunity_score, risk_score, data_confidence, opportunity_sources, risk_sources}}
+    """
+    md   = market_data or {}
+    sigs = signals or []
+    vd   = value_drivers or []
+
+    dims: dict[str, dict] = {}
+
+    # ─── 1. MARKET ─────────────────────────────────────────────────────────
+    cagr        = md.get("cagr_pct")
+    competition = md.get("competition_score")   # "low"|"medium"|"high"
+    market_cycle= md.get("market_cycle")        # "early"|"growth"|"mature"|"consolidation"
+
+    _CYCLE_OPP  = {"early": 7.5, "growth": 7.0, "mature": 5.0, "consolidation": 4.0}
+    _CYCLE_RISK = {"early": 5.0, "growth": 3.5, "mature": 5.0, "consolidation": 7.5}
+    _COMP_RISK  = {"low": 2.5, "medium": 5.0, "high": 8.0}
+
+    mkt_opp = (
+        min(10.0, max(3.0, float(cagr) * 0.4 + 5.0)) if cagr is not None
+        else _CYCLE_OPP.get(market_cycle or "", 5.0)
+    )
+    comp_risk  = _COMP_RISK.get(competition or "", 4.0)
+    cycle_risk = _CYCLE_RISK.get(market_cycle or "", 4.0)
+    mkt_risk   = (comp_risk * 0.7 + cycle_risk * 0.3) if competition else 4.0
+
+    mkt_conf = "high" if (cagr and competition) else ("medium" if (cagr or competition) else "low")
+    dims["market"] = {
+        "opportunity_score": _safe_round(mkt_opp),
+        "risk_score":        _safe_round(mkt_risk),
+        "data_confidence":   mkt_conf,
+        "opportunity_sources": ["market_data.cagr_pct", "market_data.market_cycle"],
+        "risk_sources":        ["market_data.competition_score", "market_data.market_cycle"],
+    }
+
+    # ─── 2. FINANCIALS ─────────────────────────────────────────────────────
+    stage   = (company.get("funding_stage") or "").lower().replace(" ", "_").replace("-", "_")
+    funding = float(company.get("funding_total_usd_mn") or 0)
+
+    _STAGE_OPP  = {
+        "pre_seed": 3.0, "seed": 4.5, "series_a": 5.5, "series_b": 6.5,
+        "series_c": 7.5, "series_d": 8.0, "series_d_plus": 8.5,
+        "growth": 9.0, "pre_ipo": 9.5, "listed": 9.0,
+    }
+    _STAGE_RISK = {
+        "pre_seed": 8.0, "seed": 7.0, "series_a": 6.0, "series_b": 5.0,
+        "series_c": 4.0, "series_d": 3.5, "series_d_plus": 3.0,
+        "growth": 2.5, "pre_ipo": 2.0, "listed": 2.0,
+    }
+    fin_opp  = _STAGE_OPP.get(stage, 5.0)
+    fin_risk = _STAGE_RISK.get(stage, 5.0)
+
+    if funding >= 1000:
+        fin_opp = min(10.0, fin_opp + 0.5)
+    elif funding < 50 and stage not in ("pre_seed", "seed"):
+        fin_opp = max(0.0, fin_opp - 0.5)
+
+    neg_fin = [s for s in sigs if s.get("signal_category") in ("negative_earnings", "high_burn", "debt_increase") and s.get("direction") == "negative"]
+    fin_risk = min(10.0, fin_risk + len(neg_fin) * 0.75)
+
+    fin_conf = "high" if (stage and funding > 0) else ("medium" if stage else "low")
+    dims["financials"] = {
+        "opportunity_score": _safe_round(fin_opp),
+        "risk_score":        _safe_round(fin_risk),
+        "data_confidence":   fin_conf,
+        "opportunity_sources": ["companies.funding_stage", "companies.funding_total_usd_mn"],
+        "risk_sources":        ["companies.funding_stage", "signals[negative_earnings,high_burn]"],
+    }
+
+    # ─── 3. STRATEGY (Wettbewerbsposition aus peers_context) ───────────────
+    peers_resolved = company.get("peers_resolved") or []
+    peer_count     = len(peers_resolved)
+
+    strat_opp  = 5.0 + min(1.5, peer_count * 0.3)  # mehr Peers = Markt wird vermessen
+    strat_risk = 4.0 + min(3.0, peer_count * 0.5)  # mehr Peers = mehr Wettbewerb
+    strat_conf = "medium" if peer_count >= 2 else ("low" if peer_count == 1 else "low")
+
+    strat_neg = [s for s in sigs if s.get("signal_category") in ("leadership_change", "strategy_pivot")]
+    strat_pos = [s for s in sigs if s.get("signal_category") in ("new_partnership", "expansion", "acquisition") and s.get("direction") == "positive"]
+    strat_risk = min(10.0, strat_risk + len(strat_neg) * 1.0)
+    strat_opp  = min(10.0, strat_opp  + len(strat_pos) * 0.5)
+
+    dims["strategy"] = {
+        "opportunity_score": _safe_round(strat_opp),
+        "risk_score":        _safe_round(strat_risk),
+        "data_confidence":   strat_conf,
+        "opportunity_sources": ["peers.resolved_count", "signals[new_partnership,expansion]"],
+        "risk_sources":        ["peers.competitive_density", "signals[leadership_change]"],
+    }
+
+    # ─── 4. POLITICAL ──────────────────────────────────────────────────────
+    pol_pos = [s for s in sigs if s.get("signal_category") in ("regulatory_positive", "subsidy", "policy_support") and s.get("direction") == "positive"]
+    pol_neg = [s for s in sigs if s.get("signal_category") in ("regulatory_intervention", "policy_risk", "sanctions") and s.get("direction") == "negative"]
+
+    pol_opp  = min(10.0, 5.0 + len(pol_pos) * 1.0)
+    pol_risk = min(10.0, 3.5 + len(pol_neg) * 1.5)
+
+    pol_conf = "high" if (pol_pos or pol_neg) else "low"
+    dims["political"] = {
+        "opportunity_score": _safe_round(pol_opp),
+        "risk_score":        _safe_round(pol_risk),
+        "data_confidence":   pol_conf,
+        "opportunity_sources": ["signals[regulatory_positive,subsidy,policy_support]"],
+        "risk_sources":        ["signals[regulatory_intervention,policy_risk,sanctions]"],
+    }
+
+    # ─── 5. TECHNOLOGY (Stage-TR-Proxy + Signals) ──────────────────────────
+    _STAGE_TR = {
+        "pre_seed": 0.15, "seed": 0.20, "series_a": 0.35, "series_b": 0.50,
+        "series_c": 0.65, "series_d": 0.75, "series_d_plus": 0.80,
+        "growth": 0.85, "pre_ipo": 0.88, "listed": 0.90,
+    }
+    tr_proxy  = _STAGE_TR.get(stage, 0.50)
+    tech_opp  = min(10.0, round(tr_proxy * 9.0 + 0.5, 1))
+    tech_risk = min(10.0, round((1.0 - tr_proxy) * 6.5 + 1.0, 1))
+
+    tech_pos = [s for s in sigs if s.get("signal_category") in ("patent", "new_product", "tech_milestone") and s.get("direction") == "positive"]
+    tech_neg = [s for s in sigs if s.get("signal_category") in ("ip_risk", "tech_obsolescence") and s.get("direction") == "negative"]
+    tech_opp  = min(10.0, tech_opp  + len(tech_pos) * 0.4)
+    tech_risk = min(10.0, tech_risk + len(tech_neg) * 0.8)
+
+    tech_conf = "medium" if stage else "low"
+    dims["technology"] = {
+        "opportunity_score": _safe_round(tech_opp),
+        "risk_score":        _safe_round(tech_risk),
+        "data_confidence":   tech_conf,
+        "opportunity_sources": ["auto_tech_readiness(stage_proxy)", "signals[patent,tech_milestone]"],
+        "risk_sources":        ["auto_tech_readiness(stage_proxy,inverted)", "signals[ip_risk,obsolescence]"],
+    }
+
+    # ─── 6. OPERATIONS (Abhängigkeitsrisiko aus Value Drivers) ─────────────
+    enablers     = [v for v in vd if v.get("type") == "enabler"]
+    contributors = [v for v in vd if v.get("type") == "contributor"]
+    critical_e   = [e for e in enablers if e.get("dependency_level") == "critical"]
+    high_e       = [e for e in enablers if e.get("dependency_level") == "high"]
+    high_c       = [c for c in contributors if c.get("exposure_level") == "high"]
+
+    if enablers or contributors:
+        ops_opp  = min(10.0, 4.5 + len(contributors) * 0.4 + len(high_c) * 0.3)
+        ops_risk = min(10.0, 3.0 + len(critical_e) * 2.5 + len(high_e) * 0.8)
+        ops_conf = "high" if (critical_e or high_e) else "medium"
+    else:
+        ops_opp, ops_risk, ops_conf = 5.0, 4.0, "low"   # neutral, keine Bestrafung (BUG-31)
+
+    ops_neg = [s for s in sigs if s.get("signal_category") in ("key_person_risk", "customer_concentration", "supply_chain_issue")]
+    ops_pos = [s for s in sigs if s.get("signal_category") == "headcount_growth" and s.get("direction") == "positive"]
+    ops_risk = min(10.0, ops_risk + len(ops_neg) * 0.5)
+    ops_opp  = min(10.0, ops_opp  + len(ops_pos) * 0.3)
+
+    dims["operations"] = {
+        "opportunity_score": _safe_round(ops_opp),
+        "risk_score":        _safe_round(ops_risk),
+        "data_confidence":   ops_conf,
+        "opportunity_sources": ["value_drivers.contributors", "value_drivers.exposure_level"],
+        "risk_sources":        ["value_drivers.dependency_level(critical/high)", "signals[key_person_risk]"],
+    }
+
+    return dims
+
+
+def compute_compound_risk_score(dimension_risks: dict) -> tuple[float, dict]:
+    """
+    SC-10: Compound Risk Score aus 6 Dimensions-Risiken (0–10, höher = mehr Risiko).
+    Confidence-Dämpfung: low-confidence Dimensionen zählen 50% (kein Aufblasen durch Datenmangel).
+    """
+    _WEIGHTS: dict[str, float] = {
+        "market":     0.20, "financials": 0.20, "strategy":  0.20,
+        "operations": 0.15, "technology": 0.15, "political": 0.10,
+    }
+    _CONF_FACTOR = {"high": 1.0, "medium": 0.75, "low": 0.50}
+
+    total_w = 0.0
+    weighted_sum = 0.0
+    inputs: dict = {}
+
+    for dim_id, weight in _WEIGHTS.items():
+        dim  = dimension_risks.get(dim_id, {})
+        risk = dim.get("risk_score")
+        if risk is None:
+            continue
+        conf  = dim.get("data_confidence", "low")
+        eff_w = weight * _CONF_FACTOR.get(conf, 0.5)
+        weighted_sum += float(risk) * eff_w
+        total_w      += eff_w
+        inputs[f"{dim_id}_risk"] = risk
+        inputs[f"{dim_id}_conf"] = conf
+
+    if total_w == 0:
+        return 5.0, inputs
+
+    return _safe_round(weighted_sum / total_w), inputs
+
+
 def compute_all_scores(
     company: dict,
     market_data:       dict | None       = None,
@@ -940,6 +1146,16 @@ def compute_all_scores(
     _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
     _run(result, "ownership_score",    lambda: compute_ownership_score(company, own),        all_inputs, "ownership",    "SC-08")
     _run(result, "value_driver_score", lambda: compute_value_driver_score(company, vds),    all_inputs, "value_driver", "SC-09")
+
+    # SC-10: Compound Risk Score (algorithmisch aus 6 Dimensionen)
+    try:
+        _dim_risks = compute_dimension_risks(company=company, market_data=mkt, signals=sigs, value_drivers=vds)
+        _crs, _crs_inputs = compute_compound_risk_score(_dim_risks)
+        result.compound_risk_score = _crs
+        all_inputs["compound_risk"] = _crs_inputs
+        logger.debug("SC-10 Compound Risk: %.2f", _crs)
+    except Exception as e:
+        logger.warning("SC-10 Compound Risk failed: %s", e)
 
     # ── Path-Scores ─────────────────────────────────────────────────────────
     _run(result, "ipo_score",          lambda: compute_ipo_score(company, sigs),             all_inputs, "ipo",          "IPO")

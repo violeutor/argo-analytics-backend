@@ -387,3 +387,48 @@ async def enrich_value_drivers(
         "contributors": enriched_contributors,
         "etfs":         etfs,
     }
+
+
+# ── Concentration Risk ─────────────────────────────────────────────────────────
+
+def compute_concentration_risk(enablers: list[dict], contributors: list[dict]) -> dict:
+    """
+    Berechnet Konzentrations- und Abhängigkeitsrisiko aus Value Drivers.
+    Wird von assessments.py für die operations-Dimension verwendet.
+
+    Returns:
+        {risk_score (0–10 | None), concentration_note, key_dependencies: [str]}
+    """
+    if not enablers and not contributors:
+        return {"risk_score": None, "concentration_note": "Keine Daten", "key_dependencies": []}
+
+    critical = [e for e in enablers if e.get("dependency_level") == "critical"]
+    high_dep  = [e for e in enablers if e.get("dependency_level") == "high"]
+    high_exp  = [c for c in contributors if c.get("exposure_level") == "high"]
+
+    risk = 2.0
+    risk += len(critical) * 2.5
+    risk += len(high_dep) * 1.0
+    # Kundenseite: einzelner dominanter Abnehmer
+    if len(high_exp) == 1:
+        risk += 1.5
+    elif len(high_exp) > 3:
+        risk -= 0.5   # Diversifikation auf Kundenseite senkt Risiko leicht
+    risk = min(10.0, risk)
+
+    key_deps = [e["name"] for e in critical] + [e["name"] for e in high_dep[:2]]
+
+    note_parts = []
+    if critical:
+        note_parts.append(f"{len(critical)} kritische{'r' if len(critical)==1 else ''} Enabler")
+    if high_dep:
+        note_parts.append(f"{len(high_dep)} High-Dependency-Lieferant{'en' if len(high_dep)>1 else ''}")
+    if high_exp:
+        note_parts.append(f"{len(high_exp)} Abnehmer mit hoher Exposure")
+
+    return {
+        "risk_score":          round(risk, 1),
+        "concentration_note":  " · ".join(note_parts) if note_parts else "Abhängigkeiten diversifiziert",
+        "key_dependencies":    key_deps[:5],
+    }
+

@@ -1188,6 +1188,35 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         for r in db_rounds
     ]
 
+    # BUG-30: Funding History → Investoren immer in Ownership aufnehmen
+    # Investoren aus funding_rounds werden immer gemerged (Lead + Co-Investoren),
+    # deduped gegen bereits vorhandene Einträge (curated overrides / enrichment).
+    if db_rounds:
+        _existing_names = {o.name.lower() for o in ownership}
+        for r in db_rounds:
+            lead = r.get("lead_investor")
+            if lead and lead.lower() not in _existing_names:
+                _existing_names.add(lead.lower())
+                _round_label = f"{r.get('type', 'Funding')} {str(r.get('date', ''))[:4]}".strip()
+                ownership.append(OwnershipItem(
+                    name=lead,
+                    type="VC/Investor",
+                    role="Lead Investor",
+                    notes=_round_label or None,
+                ))
+            for co in (r.get("co_investors") or []):
+                if co and co.lower() not in _existing_names:
+                    _existing_names.add(co.lower())
+                    ownership.append(OwnershipItem(
+                        name=co,
+                        type="VC/Investor",
+                        role="Co-Investor",
+                        notes="Funding History",
+                    ))
+        # "Not publicly disclosed" entfernen wenn wir jetzt echte Einträge haben
+        ownership = [o for o in ownership if o.name != "Not publicly disclosed"] or ownership
+        logger.info("BUG-30: Ownership nach Funding-Merge: %d Einträge für %s", len(ownership), company_name)
+
     # 9. Scoring — R-23: company-spezifische Käufer (kein Fallback auf globale Seed-Buyers)
     potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []
     from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company
