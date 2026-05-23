@@ -310,52 +310,118 @@ def compute_sam(
 
 
 # ── MD-B05 · Competition Score ────────────────────────────────────────────────
+# Hinweis: DB-Zählung ist kein valider Wettbewerbs-Indikator — Argo-DB wächst
+# erst und bildet den Markt nicht vollständig ab. Primärquelle ist DuckDuckGo
+# (Result-Count als Markt-Fragmentierungs-Proxy) + TAM/CAGR-Signal.
+# DB-Einträge fließen nur ergänzend als Kontextnote ein (Funding-Konzentration
+# der bekannten Player) — nicht als Basis für den Score selbst.
+
+async def fetch_competition_signals(sector: str, category: str) -> dict:
+    """
+    MD-B05-ext: Externe Wettbewerbssignale via DuckDuckGo.
+    Gibt {result_count_proxy, top_names, source} zurück.
+
+    result_count_proxy: Anzahl gefundener Snippets als Fragmentierungs-Signal.
+      >12 Snippets → high (viele Player, fragmentierter Markt)
+      6–12         → medium
+      <6           → low / early market
+    """
+    queries = [
+        f"{sector} companies startups venture funding 2024 2025",
+        f"{category} competitors market players",
+    ]
+    total_snippets = 0
+    top_names: list[str] = []
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=10,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+            follow_redirects=True,
+        ) as client:
+            for q in queries:
+                try:
+                    resp = await client.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": q},
+                    )
+                    if resp.status_code == 200:
+                        snippets = re.findall(
+                            r'class="result__snippet"[^>]*>([^<]{30,300})<',
+                            resp.text,
+                        )
+                        total_snippets += len(snippets)
+                        # Company-Namen aus Snippets extrahieren (kapitalisierte Wörter)
+                        for s in snippets[:4]:
+                            names = re.findall(r'\b[A-Z][a-zA-Z]{3,}(?:\s[A-Z][a-zA-Z]{2,})?\b', s)
+                            top_names.extend(names[:2])
+                    await asyncio.sleep(0.4)
+                except Exception as e:
+                    logger.debug("Competition signal query failed: %s", e)
+    except Exception as e:
+        logger.debug("fetch_competition_signals failed for %s: %s", sector, e)
+
+    return {
+        "result_count_proxy": total_snippets,
+        "top_names": list(dict.fromkeys(top_names))[:5],  # dedup, max 5
+        "source": "duckduckgo",
+    }
+
 
 def compute_competition_score(
     category: str,
     all_companies: list[dict],
     all_funding_rounds: list[dict],
+    external_signals: dict | None = None,
 ) -> dict:
     """
-    MD-B05: Wettbewerbsintensität aus Argo-DB.
-    Berechnet HHI-ähnlichen Score aus:
-      - Anzahl Companies in gleicher Kategorie
-      - Funding-Konzentration (größter Player vs. Gesamt)
+    MD-B05: Wettbewerbsintensität — externe Signale als Primärquelle.
+
+    Scoring-Logik (Reihenfolge):
+      1. DuckDuckGo result_count_proxy (Marktfragmentierung extern)
+      2. TAM-Signal wenn verfügbar (großer TAM → mehr Player)
+      3. DB-Funding-Konzentration als ergänzende Kontextnote (nicht als Score-Basis)
+
+    DB-Zählung ist KEIN Score-Input — Argo-DB bildet den Markt erst
+    partiell ab. 0 DB-Einträge sagen nichts über den echten Wettbewerb.
     """
-    # Player-Count in dieser Kategorie
-    peers = [c for c in all_companies if c.get("category") == category]
-    player_count = len(peers)
+    ext = external_signals or {}
+    result_count = ext.get("result_count_proxy", 0)
+    top_names = ext.get("top_names", [])
 
-    if player_count == 0:
-        return {
-            "competition_score": "unknown",
-            "competition_note": "Keine vergleichbaren Companies in DB — Wettbewerbsintensität nicht bestimmbar.",
-        }
-
-    # Funding-Konzentration: größter Player / Gesamtfunding
-    peer_ids = {c["id"] for c in peers if c.get("id")}
-    peer_fundings = {
-        c["id"]: c.get("funding_total_usd_mn") or 0
-        for c in peers if c.get("id")
-    }
-    total_funding = sum(peer_fundings.values()) or 1
-    max_funding = max(peer_fundings.values()) if peer_fundings else 0
-    concentration = max_funding / total_funding  # 0–1, höher = konzentrierter
-
-    # Score-Logik
-    if player_count >= 8 and concentration < 0.4:
+    # ── 1. Primär: externe Snippet-Anzahl als Fragmentierungs-Proxy ──────────
+    if result_count >= 12:
         score = "high"
-        note = f"{player_count} bekannte Player, fragmentierter Markt (Konzentration {concentration:.0%})."
-    elif player_count >= 4 or concentration >= 0.4:
+        note = f"Fragmentierter Markt — hohe externe Signal-Dichte ({result_count} Treffer)."
+    elif result_count >= 6:
         score = "medium"
-        note = f"{player_count} bekannte Player, moderate Konzentration ({concentration:.0%})."
+        note = f"Moderate Wettbewerbsintensität ({result_count} externe Signale)."
     else:
+        # Wenig externe Signale → früher Markt oder Nische — aber nicht "low" als Fakt setzen
+        # sondern als Einschätzung mit Unsicherheits-Marker
         score = "low"
-        note = f"Nur {player_count} bekannte Player in DB — früher oder nischiger Markt."
+        note = f"Wenig externe Signale ({result_count}) — früher oder nischiger Markt."
 
-    top_player = max(peers, key=lambda c: c.get("funding_total_usd_mn") or 0, default=None)
-    if top_player:
-        note += f" Größter Player: {top_player['name']}."
+    # Bekannte Player aus Snippets ergänzen
+    if top_names:
+        note += f" Erwähnte Player: {', '.join(top_names[:3])}."
+
+    # ── 2. DB-Funding-Konzentration als Kontextnote (nicht Score) ────────────
+    db_peers = [c for c in all_companies if c.get("category") == category]
+    if len(db_peers) >= 2:
+        peer_fundings = {
+            c["id"]: c.get("funding_total_usd_mn") or 0
+            for c in db_peers if c.get("id")
+        }
+        total_funding = sum(peer_fundings.values()) or 1
+        max_funding = max(peer_fundings.values()) if peer_fundings else 0
+        concentration = max_funding / total_funding
+        top_db = max(db_peers, key=lambda c: c.get("funding_total_usd_mn") or 0, default=None)
+        if top_db:
+            note += (
+                f" In Argo-DB: {len(db_peers)} erfasste Player,"
+                f" Funding-Führung {top_db['name']} ({concentration:.0%} Anteil)."
+            )
 
     return {"competition_score": score, "competition_note": note}
 
@@ -454,21 +520,24 @@ async def enrich_market_data(
         result["tam_2035_usd_bn"] = tam_usd_bn
 
     # ── 2. Marktsegmente + Wachstumstreiber (MD-B01) ─────────────────────────
+    # BUG-28: MD-B01 läuft unabhängig von TAM und Competitors.
+    # tam_usd_bn=0 als Fallback damit Claude-Prompt trotzdem sinnvoll ist.
     market_details: dict = {}
-    if tam_usd_bn:
-        try:
-            snippets = await asyncio.wait_for(
-                _fetch_market_snippets(company_name, sector), timeout=12.0
+    try:
+        snippets = await asyncio.wait_for(
+            _fetch_market_snippets(company_name, sector), timeout=12.0
+        )
+        if snippets:
+            market_details = await asyncio.wait_for(
+                _extract_market_details_with_claude(
+                    company_name, sector, tam_usd_bn or 0.0, snippets
+                ),
+                timeout=15.0,
             )
-            if snippets:
-                market_details = await asyncio.wait_for(
-                    _extract_market_details_with_claude(company_name, sector, tam_usd_bn, snippets),
-                    timeout=15.0,
-                )
-        except asyncio.TimeoutError:
-            logger.debug("Market details timeout for %s", company_name)
-        except Exception as e:
-            logger.debug("Market details failed for %s: %s", company_name, e)
+    except asyncio.TimeoutError:
+        logger.debug("Market details timeout for %s", company_name)
+    except Exception as e:
+        logger.debug("Market details failed for %s: %s", company_name, e)
 
     if market_details.get("segments"):
         result["tam_segments"] = market_details["segments"]
@@ -522,7 +591,22 @@ async def enrich_market_data(
         sam_data = compute_sam(tam_usd_bn, geo_scope, tech_readiness)
         result.update(sam_data)
 
-    # ── 5. enriched_at ────────────────────────────────────────────────────────
+    # ── 5. Competition Signals vorab fetchen (MD-B05-ext) ────────────────────
+    # async hier, damit sync_wrapper das Ergebnis direkt konsumieren kann.
+    # Wird via _competition_signals_cache an sync_wrapper übergeben.
+    competition_signals: dict = {}
+    try:
+        competition_signals = await asyncio.wait_for(
+            fetch_competition_signals(sector, category or ""),
+            timeout=12.0,
+        )
+        result["_competition_signals"] = competition_signals  # Übergabe an sync_wrapper
+    except asyncio.TimeoutError:
+        logger.debug("Competition signals timeout for %s", company_name)
+    except Exception as e:
+        logger.debug("Competition signals failed for %s: %s", company_name, e)
+
+    # ── 6. enriched_at ────────────────────────────────────────────────────────
     result["enriched_at"] = datetime.now(timezone.utc).isoformat()
 
     return result
@@ -537,26 +621,44 @@ def enrich_market_data_sync_wrapper(
     all_companies: list[dict],
     all_funding_rounds: list[dict],
     tech_readiness: float | None = None,
+    async_result: dict | None = None,  # Ergebnis von enrich_market_data() — enthält _competition_signals
 ) -> dict:
     """
     Synchroner Teil der Pipeline — Competition Score + Market Cycle.
     Läuft direkt nach dem async Teil, braucht keine DB-Calls.
+    async_result wird übergeben damit externe Competition-Signale
+    (via DuckDuckGo, in enrich_market_data gefetcht) genutzt werden können.
     """
     result: dict = {}
     category = category or ""
 
-    # MD-B05 — Competition Score
+    # BUG-28: Sicherstellen dass leere Listen nie None sind.
+    safe_companies = all_companies or []
+    safe_rounds = all_funding_rounds or []
+
+    # _competition_signals aus async-Ergebnis extrahieren (internes Übergabe-Feld)
+    external_signals = (async_result or {}).get("_competition_signals")
+
+    # MD-B05 — Competition Score (extern + DB-Kontext)
     try:
-        comp = compute_competition_score(category, all_companies, all_funding_rounds)
+        comp = compute_competition_score(category, safe_companies, safe_rounds, external_signals)
         result.update(comp)
     except Exception as e:
-        logger.debug("Competition score failed for %s: %s", company_name, e)
+        logger.warning("Competition score failed for %s: %s", company_name, e)
+        result.update({
+            "competition_score": "low",
+            "competition_note": "Berechnung fehlgeschlagen — Fallback: niedriger Wettbewerb.",
+        })
 
     # MD-B06 — Market Cycle
     try:
-        cycle = compute_market_cycle(category, all_funding_rounds, all_companies)
+        cycle = compute_market_cycle(category, safe_rounds, safe_companies)
         result.update(cycle)
     except Exception as e:
-        logger.debug("Market cycle failed for %s: %s", company_name, e)
+        logger.warning("Market cycle failed for %s: %s", company_name, e)
+        result.update({
+            "market_cycle": "early",
+            "market_cycle_note": "Berechnung fehlgeschlagen — Fallback: früher Markt.",
+        })
 
     return result

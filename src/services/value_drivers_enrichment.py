@@ -186,6 +186,55 @@ async def _fetch_yahoo_signal(client: httpx.AsyncClient, ticker: str, exchange: 
     return {}
 
 
+# ── BUG-27 · Kategorie-basierter Fallback ─────────────────────────────────────
+
+# Minimales Mapping: Kategorie → generische Enabler (börsennotiert, überprüfbar)
+# Nur die häufigsten Argo-Kategorien — lieber wenig als falsch.
+_CATEGORY_FALLBACK_ENABLERS: dict[str, list[dict]] = {
+    "battery":            [{"ticker": "ALB",  "name": "Albemarle",          "exchange": "NYSE",   "role": "Lithium-Rohstoff",        "relevance": 0.8}],
+    "solid-state battery":[{"ticker": "ALB",  "name": "Albemarle",          "exchange": "NYSE",   "role": "Lithium-Rohstoff",        "relevance": 0.8}],
+    "solar":              [{"ticker": "ENPH", "name": "Enphase Energy",      "exchange": "Nasdaq", "role": "Inverter-Technologie",    "relevance": 0.75}],
+    "grid":               [{"ticker": "AME",  "name": "AMETEK",              "exchange": "NYSE",   "role": "Grid-Elektronik",         "relevance": 0.7}],
+    "hydrogen":           [{"ticker": "APD",  "name": "Air Products",        "exchange": "NYSE",   "role": "Industriegase / H₂-Infra","relevance": 0.8}],
+    "geothermal":         [{"ticker": "SLB",  "name": "SLB (Schlumberger)",  "exchange": "NYSE",   "role": "Bohrtechnologie",         "relevance": 0.75}],
+    "carbon-capture":     [{"ticker": "HON",  "name": "Honeywell",           "exchange": "Nasdaq", "role": "Prozessautomation",       "relevance": 0.7}],
+    "direct-air-capture": [{"ticker": "HON",  "name": "Honeywell",           "exchange": "Nasdaq", "role": "Prozessautomation",       "relevance": 0.7}],
+    "agritech":           [{"ticker": "DE",   "name": "Deere & Company",     "exchange": "NYSE",   "role": "Landmaschinentechnologie","relevance": 0.7}],
+    "co2-to-fuels":       [{"ticker": "HON",  "name": "Honeywell",           "exchange": "Nasdaq", "role": "Katalysator-Technologie", "relevance": 0.7}],
+    "cement":             [{"ticker": "CRH",  "name": "CRH",                 "exchange": "NYSE",   "role": "Zement-Infrastruktur",   "relevance": 0.8}],
+    "software":           [{"ticker": "MSFT", "name": "Microsoft",           "exchange": "Nasdaq", "role": "Cloud-Infrastruktur",     "relevance": 0.65}],
+    "saas":               [{"ticker": "MSFT", "name": "Microsoft",           "exchange": "Nasdaq", "role": "Cloud-Infrastruktur",     "relevance": 0.65}],
+}
+
+
+def _build_category_fallback(category: str | None) -> list[dict]:
+    """
+    BUG-27: Gibt generische Enabler zurück wenn kein supply_chain Mapping vorhanden.
+    Matcht Kategorie case-insensitive gegen _CATEGORY_FALLBACK_ENABLERS.
+    Gibt leere Liste zurück wenn kein Match (besser als falscher Fallback).
+    """
+    if not category:
+        return []
+    cat_lower = category.lower().replace(" ", "-").replace("_", "-")
+    # Direkter Match
+    if cat_lower in _CATEGORY_FALLBACK_ENABLERS:
+        entries = _CATEGORY_FALLBACK_ENABLERS[cat_lower]
+    else:
+        # Teilstring-Match (z.B. "Solid-State Battery" → "battery")
+        entries = next(
+            (v for k, v in _CATEGORY_FALLBACK_ENABLERS.items() if k in cat_lower or cat_lower in k),
+            [],
+        )
+    # Fallback-Entries mit Quelle markieren
+    return [
+        {**e, "source": "category_fallback", "dependency_level": "medium",
+         "market_position": "contested", "context": None,
+         "partnership_likely": False, "price": None, "market_cap_bn": None,
+         "currency": None, "yahoo_symbol": None, "type": "enabler"}
+        for e in entries
+    ]
+
+
 async def enrich_value_drivers(
     company_id: str,
     company_name: str,
@@ -210,8 +259,27 @@ async def enrich_value_drivers(
     etfs       = sc.get("etfs", [])
 
     if not upstream and not downstream:
-        logger.info("No supply chain data for %s (tags=%s)", company_name, tags)
-        return {"enablers": [], "contributors": [], "etfs": etfs}
+        logger.info("No supply chain data for %s (tags=%s) — using category fallback", company_name, tags)
+        # BUG-27: Kategorie-basierter Fallback statt leerem Tab.
+        fallback = _build_category_fallback(category)
+        if fallback:
+            # Yahoo-Preise für Fallback-Ticker fetchen
+            async with httpx.AsyncClient() as client:
+                yahoo_tasks = [
+                    _fetch_yahoo_signal(client, e["ticker"], e.get("exchange"))
+                    for e in fallback
+                ]
+                yahoo_results = await asyncio.gather(*yahoo_tasks, return_exceptions=True)
+            for i, entry in enumerate(fallback):
+                yr = yahoo_results[i]
+                if isinstance(yr, dict) and yr:
+                    entry.update({
+                        "price":         yr.get("price"),
+                        "market_cap_bn": yr.get("market_cap_bn"),
+                        "currency":      yr.get("currency"),
+                        "yahoo_symbol":  yr.get("symbol"),
+                    })
+        return {"enablers": fallback, "contributors": [], "etfs": etfs}
 
     # 2. Claude-Enrichment + Yahoo parallel
     async with httpx.AsyncClient() as client:

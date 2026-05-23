@@ -488,6 +488,53 @@ def _build_benchmark(company: dict, peers: list[dict]) -> list[PeerBenchmark]:
             note="Peer-Median · nur wo Daten verfügbar",
         ))
 
+    # BUG-26: Funding-Pace — Funding-Gesamt ÷ Jahre seit Gründung (USD Mn/Jahr)
+    # Proxy für Wachstumsgeschwindigkeit — aussagekräftiger als absolutes Funding
+    import datetime
+    current_year = datetime.datetime.now().year
+
+    def _funding_pace(c: dict) -> float | None:
+        fy = c.get("founding_year")
+        ft = c.get("funding_total_usd_mn")
+        if not fy or not ft:
+            return None
+        years = max(current_year - int(fy), 1)
+        return round(ft / years, 1)
+
+    peer_pace = [p for p in [_funding_pace(peer) for peer in peers] if p is not None]
+    company_pace = _funding_pace(company)
+    if len(peer_pace) >= 2:
+        pace_median = _median(peer_pace)
+        benchmarks.append(PeerBenchmark(
+            metric="Funding-Pace",
+            company_value=f"${company_pace:.0f}M/Jahr" if company_pace else None,
+            peer_median=f"${pace_median:.0f}M/Jahr" if pace_median else None,
+            note="Funding-Gesamt ÷ Jahre seit Gründung · Wachstumsgeschwindigkeit",
+        ))
+
+    # BUG-26: TechReadiness-Stage-Proxy — grobe Einordnung der Reife
+    # Echte TR-Werte aus scores fehlen für Peers → Stage als strukturierter Proxy
+    _STAGE_TR: dict[str, float] = {
+        "pre_seed": 0.15, "seed": 0.2, "series_a": 0.35,
+        "series_b": 0.5, "series_c": 0.65, "series_d": 0.75,
+        "series_d_plus": 0.8, "growth": 0.85, "public": 0.9,
+    }
+    peer_tr = [
+        _STAGE_TR[p["funding_stage"]]
+        for p in peers
+        if p.get("funding_stage") and p["funding_stage"] in _STAGE_TR
+    ]
+    company_stage = company.get("funding_stage") or ""
+    company_tr = _STAGE_TR.get(company_stage)
+    if len(peer_tr) >= 2:
+        tr_median = _median(peer_tr)
+        benchmarks.append(PeerBenchmark(
+            metric="TechReadiness (Stage-Proxy)",
+            company_value=f"{company_tr:.2f}" if company_tr else None,
+            peer_median=f"{tr_median:.2f}" if tr_median else None,
+            note="Stage-basierte Näherung · 0.15 (Pre-Seed) → 0.9 (Public)",
+        ))
+
     # Stage-Verteilung (kein Median — descriptiv)
     stage_counts: dict[str, int] = {}
     for p in peers:

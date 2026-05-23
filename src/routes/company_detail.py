@@ -1006,8 +1006,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     tam_usd_bn=tam.get("tam_usd_bn"),
                     all_companies=all_companies,
                     all_funding_rounds=all_rounds,
+                    async_result=async_result,  # übergibt _competition_signals
                 )
-                upsert_market_data(company_id, {**async_result, **sync_result})
+                # _competition_signals ist internes Übergabe-Feld — nicht in DB schreiben
+                upsert_payload = {
+                    **{k: v for k, v in async_result.items() if k != "_competition_signals"},
+                    **sync_result,
+                }
+                upsert_market_data(company_id, upsert_payload)
                 set_enrichment_status(company_id, "done")
                 logger.info("Market enrichment done for %s", company_name)
             except Exception as e:
