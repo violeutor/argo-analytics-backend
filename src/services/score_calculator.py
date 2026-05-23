@@ -440,16 +440,23 @@ def compute_risk_score(
     inputs["absence_signals"]   = len(abs_)
     inputs["positive_signals"]  = len(pos)
 
-    # Beta / Markt-Volatilität (0–2) — nur sinnvoll für listed
+    # Beta / Volatilität (0–2)
+    # Market Beta (listed)    → volle Gewichtung — direkt beobachtbar
+    # Damodaran Beta (private) → 60% Gewichtung — Branchen-Proxy, nicht company-spezifisch
     beta = company.get("beta_1y") or company.get("beta")
+    beta_source = company.get("beta_source", "")
     if beta is not None:
         beta = float(beta)
         inputs["beta"] = beta
-        if beta >= 2.0:    score += 2.0
-        elif beta >= 1.5:  score += 1.5
-        elif beta >= 1.0:  score += 1.0
-        elif beta >= 0.5:  score += 0.5
-        # low beta: kein Beitrag
+        inputs["beta_source"] = beta_source
+        damodaran_factor = 0.6 if beta_source == "damodaran" else 1.0
+        raw_pts = (
+            2.0 if beta >= 2.0 else
+            1.5 if beta >= 1.5 else
+            1.0 if beta >= 1.0 else
+            0.5 if beta >= 0.5 else 0.0
+        )
+        score += raw_pts * damodaran_factor
 
     # Governance (0–3): Ownership-Intransparenz = Risiko
     is_listed = _is_listed(company)

@@ -178,6 +178,10 @@ class CompanyDetailResponse(BaseModel):
     tam_confidence: str
     investment_path: str | None
     proxy_ticker: str | None
+    # DQ-04: Proxy Beta (Market Beta des Investment-Instruments)
+    proxy_beta_1y: float | None = None
+    proxy_beta_benchmark: str | None = None
+    proxy_beta_source: str | None = None
     # Funding
     funding_total_usd_mn: float | None
     funding_last_round: str | None
@@ -1144,6 +1148,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         category=company.get("category"),
         is_listed=is_listed,
     )
+
+    # DQ-04: Proxy Beta — Beta des Investment-Instruments (z.B. NEE, CRH) für Tab 1
+    # Nur wenn die Company selbst NICHT listed ist (sonst ist Company = Instrument)
+    proxy_beta: dict = {}
+    if not is_listed and proxy:
+        proxy_symbol = proxy.split("·")[0].split("→")[-1].strip()
+        if proxy_symbol and proxy_symbol != "—":
+            try:
+                proxy_beta = await _fetch_beta_from_bridge(
+                    ticker=proxy_symbol,
+                    category=None,
+                    is_listed=True,   # Proxy ist immer listed
+                )
+            except Exception as _pb_err:
+                logger.debug("Proxy beta fetch failed for %s: %s", proxy_symbol, _pb_err)
+
     fundamentals = _build_fundamentals(
         is_listed=is_listed,
         yahoo=yahoo,
@@ -1356,7 +1376,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 ]
 
                 sc_result = compute_all_scores(
-                    company=company,
+                    company={
+                        **company,
+                        # DQ-04: Beta aus FundamentalsData in company-dict übergeben
+                        # SC-04 liest beta_1y + beta_source für Risk-Score
+                        "beta_1y":    beta.get("beta_1y"),
+                        "beta_source": beta.get("beta_source"),
+                    },
                     market_data=market_data_cached or {},
                     signals=signals_raw,
                     ownership_entries=ownership_raw,
@@ -1405,6 +1431,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         tam_confidence=tam.get("confidence","medium"),
         investment_path=_resolve_investment_path(company),
         proxy_ticker=proxy,
+        proxy_beta_1y=proxy_beta.get("beta_1y"),
+        proxy_beta_benchmark=proxy_beta.get("beta_benchmark"),
+        proxy_beta_source=proxy_beta.get("beta_source"),
         funding_total_usd_mn=company.get("funding_total_usd_mn"),
         funding_last_round=company.get("funding_last_round"),
         funding_stage=company.get("funding_stage"),
