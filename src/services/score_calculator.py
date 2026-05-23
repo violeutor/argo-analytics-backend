@@ -108,6 +108,18 @@ _ETF_COVERED_CATEGORIES = {
     "heat-pump", "electrolysis", "fuel-cell", "direct-air-capture",
 }
 
+# Sektoren wo Patent-Tiefe den tech_readiness-Score beeinflusst (SE-14).
+# Kanonische Definition in services/signal_engine.py (PATENT_SCORING_SECTORS).
+# Datensammlung via EPO OPS läuft universell — Scoring-Einfluss nur hier.
+_PATENT_SCORING_SECTORS: frozenset[str] = frozenset({
+    "battery", "energy storage", "hydrogen", "fuel cell", "electrochemical",
+    "carbon removal", "dac", "direct air capture", "cdr", "mineralization",
+    "materials", "chemistry", "chemical", "pharma", "biotech", "medtech",
+    "semiconductor", "hardware", "geothermal", "electrolysis",
+    "cement", "concrete", "industrial", "circular", "biomass",
+    "solid-state", "long-duration storage", "co₂", "co2",
+})
+
 # IPO-Attraktivität je Funding Stage (raw base)
 _STAGE_IPO_SCORE: dict[str, float] = {
     "s-1 filed":  9.0,
@@ -1023,7 +1035,7 @@ def compute_dimension_risks(
         "risk_sources":        ["signals[regulatory_intervention,policy_risk,sanctions]"],
     }
 
-    # ─── 5. TECHNOLOGY (Stage-TR-Proxy + Signals) ──────────────────────────
+    # ─── 5. TECHNOLOGY (Stage-TR-Proxy + Signals + SE-14 Patent Depth) ────
     _STAGE_TR = {
         "pre_seed": 0.15, "seed": 0.20, "series_a": 0.35, "series_b": 0.50,
         "series_c": 0.65, "series_d": 0.75, "series_d_plus": 0.80,
@@ -1038,13 +1050,38 @@ def compute_dimension_risks(
     tech_opp  = min(10.0, tech_opp  + len(tech_pos) * 0.4)
     tech_risk = min(10.0, tech_risk + len(tech_neg) * 0.8)
 
-    tech_conf = "medium" if stage else "low"
+    # SE-14: Patent-Tiefe aus EPO OPS — nur für PATENT_SCORING_SECTORS
+    # Datensammlung universell; Scoring nur wo IP ein echter Moat ist (Deep Tech, Chemie, Pharma …)
+    tech_conf    = "medium" if stage else "low"
+    tech_sources = ["auto_tech_readiness(stage_proxy)", "signals[patent,tech_milestone]"]
+    patent_bonus = 0.0
+    category_raw = (company.get("category") or company.get("industry") or "").lower()
+    in_patent_sector = any(s in category_raw for s in _PATENT_SCORING_SECTORS)
+    patent_count   = int(company.get("patent_count") or 0)
+    granted_ratio  = float(company.get("patent_granted_ratio") or 0.0)
+
+    if in_patent_sector and patent_count > 0:
+        # Stufenbonus: Patente vorhanden (+0.5) → ≥30% granted (+0.5) → ≥60% granted (+0.5)
+        patent_bonus = (
+            0.5                              # Patente überhaupt vorhanden
+            + (0.5 if granted_ratio >= 0.3 else 0.0)   # solides Portfolio
+            + (0.5 if granted_ratio >= 0.6 else 0.0)   # starkes Portfolio
+        )
+        tech_opp  = min(10.0, tech_opp + patent_bonus)
+        tech_conf = "high" if granted_ratio >= 0.3 else "medium"
+        tech_sources.append(f"epo_ops(patent_count={patent_count}, granted_ratio={round(granted_ratio, 2)})")
+
     dims["technology"] = {
         "opportunity_score": _safe_round(tech_opp),
         "risk_score":        _safe_round(tech_risk),
         "data_confidence":   tech_conf,
-        "opportunity_sources": ["auto_tech_readiness(stage_proxy)", "signals[patent,tech_milestone]"],
+        "opportunity_sources": tech_sources,
         "risk_sources":        ["auto_tech_readiness(stage_proxy,inverted)", "signals[ip_risk,obsolescence]"],
+        # Debug-Felder für Tooltip
+        "patent_count":        patent_count,
+        "patent_granted_ratio": round(granted_ratio, 2),
+        "patent_sector_active": in_patent_sector,
+        "patent_bonus":         round(patent_bonus, 2),
     }
 
     # ─── 6. OPERATIONS (Abhängigkeitsrisiko aus Value Drivers) ─────────────
@@ -1191,6 +1228,7 @@ def compute_all_scores(
         sigs,
         own,
         vds,
+        company.get("patent_count"),   # SE-14: EPO-Daten erhöhen Confidence
     ])
     result.confidence   = "high" if data_richness >= 5 else "medium" if data_richness >= 3 else "low"
     result.score_inputs = all_inputs

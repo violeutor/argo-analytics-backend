@@ -29,7 +29,8 @@ def fetch_companies(limit: int = 100, source: str | None = None) -> list[dict]:
         "id, name, category, industry, potential, risk, ipo_potential, ipo_status, "
         "investment_path, proxy_ticker, ticker, exchange, funding_total_usd_mn, funding_stage, "
         "funding_last_round, last_signal, last_signal_date, source, "
-        "founding_year, headquarters, headcount, description, peers, region"
+        "founding_year, headquarters, headcount, description, peers, region, "
+        "patent_count, patent_granted_ratio, patent_ipc_codes, patents_fetched_at"
     ).limit(limit).order("name")
 
     if source:
@@ -673,3 +674,119 @@ def fetch_recent_absence_categories(company_ids: list[str], days: int = 30) -> d
     except Exception as e:
         logger.warning("fetch_recent_absence_categories failed: %s", e)
     return result_map
+
+
+# ── SE-14: Patents (EPO OPS) ──────────────────────────────────────────────────
+
+def bulk_upsert_patents(patent_records: list[dict]) -> int:
+    """
+    SE-14: Schreibt EPO-Patent-Records in company_patents-Tabelle.
+    Duplikat-sicher via UNIQUE (company_id, patent_number).
+    Batch-Verarbeitung in Chunks à 50 — vermeidet zu große Payloads.
+
+    Erwartet Records mit:
+        company_id, patent_number, title, filing_date, grant_date,
+        status, ipc_codes (list), citation_count, geo_coverage (list), source
+
+    Gibt Anzahl erfolgreich geschriebener Records zurück.
+    """
+    if not patent_records:
+        return 0
+
+    db      = get_supabase()
+    written = 0
+    chunk_size = 50
+
+    for i in range(0, len(patent_records), chunk_size):
+        chunk = patent_records[i : i + chunk_size]
+        try:
+            db.table("company_patents").upsert(
+                chunk,
+                on_conflict="company_id,patent_number",
+            ).execute()
+            written += len(chunk)
+        except Exception as e:
+            # Fallback: einzeln versuchen um fehlerhafte Records zu isolieren
+            logger.warning("bulk_upsert_patents chunk %d failed (%s) — Einzelversuch", i // chunk_size, e)
+            for record in chunk:
+                try:
+                    db.table("company_patents").upsert(
+                        record,
+                        on_conflict="company_id,patent_number",
+                    ).execute()
+                    written += 1
+                except Exception as re:
+                    logger.warning(
+                        "bulk_upsert_patents FAILED: %s / %s — %s",
+                        record.get("company_id"), record.get("patent_number"), re,
+                    )
+
+    logger.info(
+        "bulk_upsert_patents: %d/%d Records geschrieben",
+        written, len(patent_records),
+    )
+    return written
+
+
+def update_patent_aggregates(patent_records: list[dict]) -> None:
+    """
+    SE-14: Aggregiert Patent-Records pro Company und schreibt zurück in companies.
+    Felder: patent_count, patent_granted_ratio, patent_ipc_codes, patents_fetched_at.
+
+    Wird direkt nach bulk_upsert_patents() aufgerufen — kein separater DB-Read nötig
+    da die Records bereits in memory vorliegen.
+
+    Aggregationslogik:
+        patent_count          = Anzahl Records (alle Status)
+        patent_granted_ratio  = granted / gesamt (0.0–1.0)
+        patent_ipc_codes      = deduplizierte IPC-Codes aller Patents der Company
+        patents_fetched_at    = jetzt (UTC)
+    """
+    from datetime import datetime, timezone
+    from collections import defaultdict
+
+    if not patent_records:
+        return
+
+    db  = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Records nach company_id gruppieren
+    by_company: dict[str, list[dict]] = defaultdict(list)
+    for r in patent_records:
+        cid = r.get("company_id")
+        if cid:
+            by_company[cid].append(r)
+
+    for company_id, records in by_company.items():
+        total   = len(records)
+        granted = sum(1 for r in records if r.get("status") == "granted")
+
+        # IPC-Codes aller Patents dedupliziert zusammenführen
+        all_ipc: list[str] = []
+        for r in records:
+            codes = r.get("ipc_codes") or []
+            all_ipc.extend(codes)
+        unique_ipc = list(dict.fromkeys(all_ipc))   # Reihenfolge erhalten
+
+        payload: dict = {
+            "patent_count":         total,
+            "patent_granted_ratio": round(granted / total, 4) if total > 0 else 0.0,
+            "patents_fetched_at":   now,
+        }
+        if unique_ipc:
+            payload["patent_ipc_codes"] = unique_ipc
+
+        try:
+            db.table("companies").update(payload).eq("id", company_id).execute()
+            logger.debug(
+                "update_patent_aggregates: %s → count=%d granted_ratio=%.2f ipc=%d codes",
+                company_id, total, payload["patent_granted_ratio"], len(unique_ipc),
+            )
+        except Exception as e:
+            logger.warning("update_patent_aggregates FAILED for %s: %s", company_id, e)
+
+    logger.info(
+        "update_patent_aggregates: %d Companies aktualisiert",
+        len(by_company),
+    )

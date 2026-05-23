@@ -21,9 +21,12 @@ from contextlib import asynccontextmanager
 logger = logging.getLogger(__name__)
 
 async def _cron_signal_engine():
-    """SE-01 — Signal-Engine Cron, täglich 06:00 UTC."""
+    """SE-01 + SE-14 — Signal-Engine Cron, täglich 04:00 UTC."""
     try:
-        from src.integrations.supabase import fetch_companies, upsert_signals, fetch_recent_absence_categories
+        from src.integrations.supabase import (
+            fetch_companies, upsert_signals, fetch_recent_absence_categories,
+            bulk_upsert_patents, update_patent_aggregates,
+        )
         from src.services.signal_engine import run_signal_engine
 
         companies = fetch_companies(limit=500)
@@ -34,14 +37,26 @@ async def _cron_signal_engine():
         absence_cooldown_map = fetch_recent_absence_categories(company_ids, days=30)
 
         logger.info("Signal-Engine Cron gestartet — %d Companies", len(companies))
-        events = await run_signal_engine(companies, ownership_map, absence_cooldown_map)
+
+        # SE-14: run_signal_engine gibt jetzt Tuple zurück (events, patent_records)
+        events, patent_records = await run_signal_engine(companies, ownership_map, absence_cooldown_map)
 
         if events:
-            dicts = [e.to_dict() for e in events]
+            dicts   = [e.to_dict() for e in events]
             written = upsert_signals(dicts)
             logger.info("Signal-Engine Cron fertig — %d events, %d geschrieben", len(events), written)
         else:
             logger.info("Signal-Engine Cron — keine neuen Events")
+
+        # SE-14: Patent-Records in company_patents-Tabelle upserten
+        if patent_records:
+            pat_written = bulk_upsert_patents(patent_records)
+            logger.info("SE-14: %d Patent-Records upserted (%d Companies)", pat_written, len({r["company_id"] for r in patent_records}))
+            # Aggregate (patent_count, granted_ratio, ipc_codes) in companies zurückschreiben
+            update_patent_aggregates(patent_records)
+        else:
+            logger.info("SE-14: Keine Patent-Records (EPO_OPS_KEY fehlt oder keine Patente gefunden)")
+
     except Exception as e:
         logger.exception("Signal-Engine Cron FEHLER: %s", e)
 
@@ -146,23 +161,20 @@ async def lifespan(app):
     async def _schedule_cron():
         while True:
             now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-            # Nächste 06:00 UTC berechnen
-            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+            # Nächste 04:00 UTC berechnen (vorher: 06:00 UTC)
+            target = now.replace(hour=4, minute=0, second=0, microsecond=0)
             if target <= now:
                 target = target + __import__("datetime").timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
             logger.info("Signal-Engine Cron: nächster Run in %.0f Minuten", wait_seconds / 60)
             await asyncio.sleep(wait_seconds)
-            await _cron_signal_engine()
-            # B-05: Funding Enrichment 30 Min nach Signal-Engine
+            await _cron_signal_engine()          # 04:00 UTC — Signal + Patents
             await asyncio.sleep(30 * 60)
-            await _cron_funding_enrichment()
-            # R-23: Buyer Enrichment 30 Min nach Funding (frische Daten, vor Scoring)
+            await _cron_funding_enrichment()     # 04:30 UTC — Funding
             await asyncio.sleep(30 * 60)
-            await _cron_buyer_enrichment()
-            # SC-01–SC-13: Scoring nach Buyer-Enrichment (nutzt neue Buyer-Daten)
+            await _cron_buyer_enrichment()       # 05:00 UTC — Buyer
             await asyncio.sleep(30 * 60)
-            await _cron_scoring()
+            await _cron_scoring()                # 05:30 UTC — Scoring
 
     cron_task = asyncio.create_task(_schedule_cron())
     yield
@@ -172,7 +184,7 @@ async def lifespan(app):
 app = FastAPI(
     title="Argo Analytics API",
     description="M&A Deal Scoring Engine — SRR × MFR × TechReadiness + Company Enrichment",
-    version="0.5.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -220,4 +232,4 @@ app.include_router(assessments_router)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.7.0"}

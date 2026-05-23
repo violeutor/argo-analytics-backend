@@ -349,6 +349,31 @@ def _severity_for_event(event_type: EventType) -> Severity:
 _CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 _CLAUDE_MODEL   = "claude-haiku-4-5-20251001"   # schnell + günstig für NER-Batch
 
+# ── SE-14: EPO OPS Konstanten ─────────────────────────────────────────────────
+_EPO_AUTH_URL   = "https://ops.epo.org/3.2/auth/access_token"
+_EPO_SEARCH_URL = "https://ops.epo.org/3.2/rest-services/published-data/search"
+_EPO_TOKEN_CACHE: dict = {}   # {"token": str, "expires_at": datetime}
+
+# XML-Namespaces EPO OPS 3.2
+_NS_OPS = "http://ops.epo.org/3.2"
+_NS_EPO = "http://www.epo.org/exchange"
+
+# Kind-Codes gültig erteilter Patente (B1/B2 = EP erteilt, C = korrigiert, W = PCT granted)
+_GRANTED_KINDS: frozenset[str] = frozenset({"B1", "B2", "B3", "C", "C1", "C2"})
+
+# Sektoren in denen Patent-Tiefe den tech_readiness-Score beeinflusst.
+# Datensammlung läuft universell — Scoring-Einfluss nur wo IP ein echter Moat ist.
+# Importierbar von score_calculator.py + assessments.py:
+#   from services.signal_engine import PATENT_SCORING_SECTORS
+PATENT_SCORING_SECTORS: frozenset[str] = frozenset({
+    "battery", "energy storage", "hydrogen", "fuel cell", "electrochemical",
+    "carbon removal", "dac", "direct air capture", "cdr", "mineralization",
+    "materials", "chemistry", "chemical", "pharma", "biotech", "medtech",
+    "semiconductor", "hardware", "geothermal", "electrolysis",
+    "cement", "concrete", "industrial", "circular", "biomass",
+    "solid-state", "long-duration storage", "co₂", "co2",
+})
+
 _NER_SYSTEM = """\
 Du bist ein präziser Signal-Klassifikator für M&A- und Investment-Screening.
 Analysiere Unternehmens-News und klassifiziere das Signal.
@@ -503,6 +528,267 @@ def _apply_keyword_fallback(events: list[SignalEvent]) -> None:
         ev.direction, ev.signal_category = _keyword_direction(
             f"{ev.raw_title or ''} {ev.summary}"
         )
+
+
+# ── SE-14: EPO OPS Patent Parser ─────────────────────────────────────────────
+
+async def _epo_get_token(client: httpx.AsyncClient) -> str | None:
+    """
+    OAuth2 client_credentials flow für EPO OPS API.
+    Token wird 19 Minuten gecacht (EPO-Standard: 20 Min TTL).
+
+    Umgebungsvariablen:
+      EPO_OPS_KEY    — Consumer Key (EPO Developer Portal, kostenlos)
+      EPO_OPS_SECRET — Consumer Secret
+    """
+    now = datetime.now(timezone.utc)
+    if _EPO_TOKEN_CACHE.get("token") and _EPO_TOKEN_CACHE.get("expires_at", now) > now:
+        return _EPO_TOKEN_CACHE["token"]
+
+    consumer_key    = os.environ.get("EPO_OPS_KEY")
+    consumer_secret = os.environ.get("EPO_OPS_SECRET")
+    if not consumer_key or not consumer_secret:
+        logger.warning("SE-14: EPO_OPS_KEY / EPO_OPS_SECRET nicht gesetzt — Patent-Signal übersprungen")
+        return None
+
+    try:
+        resp = await client.post(
+            _EPO_AUTH_URL,
+            data={"grant_type": "client_credentials"},
+            auth=(consumer_key, consumer_secret),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            logger.warning("SE-14: EPO Auth HTTP %s", resp.status_code)
+            return None
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            return None
+        expires_in = int(data.get("expires_in", 1200))
+        _EPO_TOKEN_CACHE["token"] = token
+        _EPO_TOKEN_CACHE["expires_at"] = now + timedelta(seconds=expires_in - 60)
+        logger.info("SE-14: EPO OPS Token erneuert (gültig %ds)", expires_in)
+        return token
+    except Exception as e:
+        logger.warning("SE-14: EPO Auth fehlgeschlagen: %s", e)
+        return None
+
+
+def _epo_kind_to_status(kind: str) -> str:
+    """Kind-Code → Patentstatus ('granted' | 'filed' | 'withdrawn')."""
+    if kind in _GRANTED_KINDS:
+        return "granted"
+    if kind.upper() in ("D1", "D2"):
+        return "withdrawn"
+    return "filed"   # A1/A2/A3 = publizierte Anmeldung; W = PCT
+
+
+def _epo_parse_date(date_str: str | None) -> date | None:
+    """Parst EPO-Datumsformat YYYYMMDD → date. Gibt None bei ungültigem Input."""
+    if not date_str or len(date_str) < 8:
+        return None
+    try:
+        return date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
+    except (ValueError, TypeError):
+        return None
+
+
+def _epo_extract_ipc(ex_doc: "ET.Element") -> list[str]:
+    """
+    Extrahiert IPC-Codes aus exchange-document.
+    Format im XML: 'Y02E 10/50 20130101' → normalisiert zu 'Y02E10/50'.
+    """
+    codes: list[str] = []
+    for cl in ex_doc.findall(
+        f".//{{{_NS_EPO}}}classifications-ipcr/{{{_NS_EPO}}}classification-ipcr"
+    ):
+        text_el = cl.find(f"{{{_NS_EPO}}}text")
+        if text_el is not None and text_el.text:
+            parts = text_el.text.strip().split()
+            if len(parts) >= 2:
+                codes.append(f"{parts[0]}{parts[1]}")
+    return list(dict.fromkeys(codes))   # dedupliziert, Reihenfolge erhalten
+
+
+async def parse_epo(
+    company_id: str,
+    company_name: str,
+    client: httpx.AsyncClient,
+    lookback_days: int = 90,
+) -> tuple[list[SignalEvent], list[dict]]:
+    """
+    SE-14: EPO OPS Patent-Parser.
+
+    Sucht Patente nach Anmelder-Name via CQL (alle Regionen: EP, WO, US, DE, …).
+    Gibt zurück:
+      signals        — SignalEvents für Patente mit signal_date ≤ lookback_days
+      patent_records — Alle gefundenen Patente für company_patents-Tabelle (Bulk-Upsert)
+
+    Datensammlung universal (Chemie, Pharma, Deep Tech, alle Sektoren).
+    Scoring-Einfluss auf tech_readiness nur für PATENT_SCORING_SECTORS —
+    gesteuert in score_calculator.py via `from services.signal_engine import PATENT_SCORING_SECTORS`.
+
+    Rate-Limit Free Tier: 4 req/s, 10k req/Woche.
+    Bei 43 Companies à 1 Call ≈ 43 req/Tag — unkritisch.
+    """
+    signals:        list[SignalEvent] = []
+    patent_records: list[dict]        = []
+
+    token = await _epo_get_token(client)
+    if not token:
+        return signals, patent_records
+
+    cutoff = date.today() - timedelta(days=lookback_days)
+    norm   = _normalize_name(company_name)
+    cql    = f'pa all "{norm}"'   # CQL: Anmelder (pa) enthält normalisierten Namen
+
+    try:
+        resp = await client.get(
+            _EPO_SEARCH_URL,
+            params={"q": cql, "Range": "1-25"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept":        "application/xml",
+                "X-OPS-Range":   "1-25",
+            },
+            timeout=15.0,
+        )
+    except Exception as e:
+        logger.warning("SE-14: EPO Netzwerkfehler für %s: %s", company_name, e)
+        return signals, patent_records
+
+    if resp.status_code == 404:
+        logger.info("SE-14: Keine Patente für %s (CQL: %s)", company_name, cql)
+        return signals, patent_records
+
+    if resp.status_code == 403:
+        # Rate-Limit oder Token abgelaufen → Cache leeren, nächster Company-Call holt neuen Token
+        logger.warning("SE-14: EPO OPS 403 für %s — Token-Cache geleert", company_name)
+        _EPO_TOKEN_CACHE.clear()
+        return signals, patent_records
+
+    if resp.status_code != 200:
+        logger.warning("SE-14: EPO OPS HTTP %s für %s", resp.status_code, company_name)
+        return signals, patent_records
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        logger.warning("SE-14: XML-Parse-Fehler für %s: %s", company_name, e)
+        return signals, patent_records
+
+    for ex_doc in root.findall(f".//{{{_NS_EPO}}}exchange-document"):
+        country = ex_doc.get("country", "")
+        doc_num = ex_doc.get("doc-number", "")
+        kind    = ex_doc.get("kind", "")
+        pat_num = f"{country}{doc_num}" if country and doc_num else doc_num
+        if not pat_num:
+            continue
+
+        # Publikationsdatum (= Erteilungsdatum bei granted)
+        pub_date_str: str | None = None
+        for doc_id in ex_doc.findall(
+            f".//{{{_NS_EPO}}}publication-reference/{{{_NS_EPO}}}document-id"
+        ):
+            d = doc_id.find(f"{{{_NS_EPO}}}date")
+            if d is not None and d.text:
+                pub_date_str = d.text.strip()
+                break
+
+        # Anmeldedatum
+        filing_date_str: str | None = None
+        for doc_id in ex_doc.findall(
+            f".//{{{_NS_EPO}}}application-reference/{{{_NS_EPO}}}document-id"
+        ):
+            d = doc_id.find(f"{{{_NS_EPO}}}date")
+            if d is not None and d.text:
+                filing_date_str = d.text.strip()
+                break
+
+        filing_date = _epo_parse_date(filing_date_str) or _epo_parse_date(pub_date_str)
+        status      = _epo_kind_to_status(kind)
+        grant_date  = _epo_parse_date(pub_date_str) if status == "granted" else None
+
+        # Titel — Englisch bevorzugt, Fallback auf ersten verfügbaren
+        title = ""
+        for t in ex_doc.findall(f".//{{{_NS_EPO}}}invention-title"):
+            if t.get("lang", "") == "en" and t.text:
+                title = t.text.strip()
+                break
+        if not title:
+            t_el = ex_doc.find(f".//{{{_NS_EPO}}}invention-title")
+            if t_el is not None and t_el.text:
+                title = t_el.text.strip()
+
+        ipc_codes    = _epo_extract_ipc(ex_doc)
+        geo_coverage = [country] if country else []
+
+        patent_records.append({
+            "company_id":     company_id,
+            "patent_number":  pat_num,
+            "title":          title or None,
+            "filing_date":    filing_date.isoformat() if filing_date else None,
+            "grant_date":     grant_date.isoformat() if grant_date else None,
+            "status":         status,
+            "ipc_codes":      ipc_codes or None,
+            "citation_count": None,   # Phase 2: separater Citation-Call je Patent
+            "geo_coverage":   geo_coverage or None,
+            "source":         "epo_ops",
+        })
+
+        # SignalEvent nur für Patente innerhalb des Lookback-Fensters
+        signal_date = grant_date or filing_date
+        if not signal_date or signal_date < cutoff:
+            continue
+
+        ipc_display = ", ".join(ipc_codes[:2]) if ipc_codes else "IPC n/v"
+        if status == "granted":
+            summary   = (
+                f"{company_name} — Patent erteilt: \"{title[:100]}\" "
+                f"({pat_num} · {ipc_display} · erteilt {grant_date})."
+            )
+            severity  = "medium"
+            relevance = 0.85
+            raw_title = f"Patent erteilt: {title[:80]}"
+        else:
+            summary   = (
+                f"{company_name} — Neue Patentanmeldung: \"{title[:100]}\" "
+                f"({pat_num} · {ipc_display} · angemeldet {filing_date})."
+            )
+            severity  = "low"
+            relevance = 0.50
+            raw_title = f"Patentanmeldung: {title[:80]}"
+
+        signals.append(SignalEvent(
+            company_id=company_id,
+            company_name=company_name,
+            event_type="news",
+            event_date=signal_date,
+            summary=summary,
+            source="epo_ops",
+            source_url=(
+                f"https://worldwide.espacenet.com/publicationDetails/biblio"
+                f"?CC={country}&NR={doc_num}"
+                if country and doc_num else None
+            ),
+            severity=severity,
+            raw_title=raw_title,
+            direction="positive",
+            signal_category="patent",
+            source_domain="epo.org",
+            relevance_score=relevance,
+        ))
+
+    logger.info(
+        "SE-14: %s → %d Patente (%d neu im Lookback, %d granted gesamt)",
+        company_name,
+        len(patent_records),
+        len(signals),
+        sum(1 for r in patent_records if r["status"] == "granted"),
+    )
+    return signals, patent_records
 
 
 # ── EDGAR Parser ─────────────────────────────────────────────────────────────
@@ -1070,10 +1356,13 @@ async def run_signal_engine(
     companies: list[dict],
     ownership_map: dict[str, list[dict]],
     absence_cooldown_map: dict[str, set[str]] | None = None,
-) -> list[SignalEvent]:
+) -> tuple[list[SignalEvent], list[dict]]:
     """
     SE-01 — Haupt-Pipeline.
-    Läuft täglich via Cron. Gibt alle gesammelten Signals zurück.
+    Läuft täglich via Cron. Gibt zurück:
+      all_events     — alle gesammelten SignalEvents (für signals-Tabelle)
+      patent_records — alle EPO-Patentdaten (für company_patents-Tabelle, Bulk-Upsert)
+
     Aufgerufen von main.py _cron_signal_engine().
 
     Args:
@@ -1084,8 +1373,15 @@ async def run_signal_engine(
                               BUG-01: Absence-Kategorien die in letzten 30d bereits emittiert
                               wurden. Verhindert täglich neue negative Absence-Signale.
                               Caller (main.py) befüllt via fetch_recent_absence_categories().
+
+    main.py muss Rückgabe entpacken:
+        all_events, patent_records = await run_signal_engine(companies, ownership_map, ...)
+        # → signals-Tabelle: upsert_signals(all_events)
+        # → company_patents:  bulk_upsert_patents(patent_records)
+        # → companies:        update_patent_aggregates(patent_records)
     """
-    all_events: list[SignalEvent] = []
+    all_events:     list[SignalEvent] = []
+    all_patents:    list[dict]         = []
     timeout = httpx.Timeout(12.0, connect=4.0)
 
     async with httpx.AsyncClient(
@@ -1160,8 +1456,16 @@ async def run_signal_engine(
             )
             company_events.extend(absence_events)
 
+            # 7. SE-14: EPO OPS Patent-Signal (universell — alle Sektoren)
+            epo_signals, epo_patents = await parse_epo(cid, cname, client)
+            company_events.extend(epo_signals)
+            all_patents.extend(epo_patents)
+            if epo_patents:
+                await asyncio.sleep(0.25)   # EPO Rate-Limit: 4 req/s
+
             logger.info(
-                "Signal-Engine: %s → %d events (edgar=%d news=%d tc=%d ownership=%d absence=%d) "
+                "Signal-Engine: %s → %d events "
+                "(edgar=%d news=%d tc=%d ownership=%d absence=%d patent=%d) "
                 "pos=%d neg=%d neu=%d",
                 cname, len(company_events),
                 sum(1 for e in company_events if e.source == "edgar"),
@@ -1169,13 +1473,14 @@ async def run_signal_engine(
                 sum(1 for e in company_events if e.source == "techcrunch"),
                 sum(1 for e in company_events if e.source == "internal"),
                 sum(1 for e in company_events if e.source == "internal_absence"),
+                sum(1 for e in company_events if e.source == "epo_ops"),
                 sum(1 for e in company_events if e.direction == "positive"),
                 sum(1 for e in company_events if e.direction == "negative"),
                 sum(1 for e in company_events if e.direction == "neutral"),
             )
             all_events.extend(company_events)
 
-    return all_events
+    return all_events, all_patents
 
 
 async def _filter_techcrunch_cached(
