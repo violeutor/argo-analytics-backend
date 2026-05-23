@@ -1,17 +1,20 @@
 """
-Market Data Enrichment Pipeline — v1.0
+Market Data Enrichment Pipeline — v1.1
 =======================================
 Befüllt market_data-Tabelle für jede Company vollautomatisch.
 Kein manuelles Datenpflegen — wird bei One-Click-Search getriggert.
 
-Pipelines:
-  MD-B01  TAM-Scraping erweitert → Segmente + Wachstumstreiber (KI-Extraktion)
-  MD-B02  World Bank API → regionale Marktverteilung
-  MD-B03  OECD API → EU-Ergänzung
+Pipelines (aktiv):
+  MD-B01  TAM-Scraping erweitert → DDG Suche + Page-Fetch + Claude NER
+           → Segmente + Wachstumstreiber (4000-Zeichen-Kontext statt Snippets)
   MD-B04  compute_sam() → SAM aus TAM × geo_factor × tech_filter
-  MD-B05  compute_competition_score() → aus Argo-DB (companies + funding_rounds)
+  MD-B05  compute_competition_score() → DuckDuckGo + Peer-Kontext + DB
   MD-B06  compute_market_cycle() → Funding-Trend YoY aus DB
-  Trigger enrichment_status: pending → running → done | error
+
+Deaktiviert (kein Mehrwert für VC/PE-Segment):
+  MD-B02  World Bank API → regional_breakdown — WB-Indikatoren sind Nutzungsstatistiken,
+          keine Marktanteile. Bleibt leer bis sinnvolle Quelle gefunden.
+  MD-B03  OECD API → EU-Ergänzung — liefert nur Verfügbarkeits-Flag, kein Nutzen.
 """
 
 import asyncio
@@ -99,53 +102,117 @@ Rules:
         return {}
 
 
-async def _fetch_market_snippets(company: str, sector: str) -> list[str]:
+async def _fetch_market_page_content(urls: list[str], max_chars: int = 4000) -> str:
     """
-    MD-B01: Snippets für Marktsegmente + Wachstumstreiber.
-    Primär: DuckDuckGo HTML-Suche (kein API-Key, kein CAPTCHA-Problem).
-    Fallback: Direkte IEA/BNEF-PR-Seiten via httpx.
-    Google-Scraping entfernt — CSS-Klassen zu instabil, CAPTCHA auf Render.
+    Fetcht echten Seiteninhalt aus Top-Suchergebnissen.
+    Gibt kombinierten Text zurück (bis max_chars) — viel reichhaltigere Basis für Claude.
     """
+    from bs4 import BeautifulSoup
+    combined: list[str] = []
+    fetched = 0
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, headers=HEADERS, follow_redirects=True
+        ) as client:
+            for url in urls[:3]:
+                if fetched >= max_chars:
+                    break
+                # Paywall-Seiten überspringen
+                if any(x in url for x in ["bloomberg", "wsj.com", "ft.com", "pitchbook", "crunchbase.com/organization"]):
+                    continue
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    # Nur Body-Text, kein Nav/Footer
+                    for tag in soup(["script", "style", "nav", "footer", "header"]):
+                        tag.decompose()
+                    text = soup.get_text(" ", strip=True)
+                    # Ersten substanziellen Block nehmen
+                    chunk = text[:2000].strip()
+                    if len(chunk) > 200:
+                        combined.append(chunk)
+                        fetched += len(chunk)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug("Page fetch failed for %s: %s", url, e)
+    except Exception as e:
+        logger.debug("_fetch_market_page_content failed: %s", e)
+
+    return "\n---\n".join(combined)[:max_chars]
+
+
+async def _fetch_market_snippets(company: str, sector: str, category: str = "") -> list[str]:
+    """
+    MD-B01: Snippets + Seiteninhalt für Marktsegmente + Wachstumstreiber.
+    Primär: DuckDuckGo HTML → URLs extrahieren → Top-2 Seiten fetchen.
+    Fallback: Snippets aus DDG-Suchergebnissen.
+
+    Rückgabe: Liste von Text-Chunks die Claude als Kontext bekommt.
+    max_chars pro Chunk: 4000 — deutlich mehr als bisherige 400-Zeichen-Snippets.
+    """
+    # Category-aware Queries — spezifischer als generisches sector-Keyword
+    label = category or sector
     queries = [
-        f"{sector} market size segments 2035 billion USD site:iea.org OR site:bnef.com OR site:mckinsey.com",
-        f"{sector} market growth drivers 2030 2035",
-        f"{company} total addressable market {sector} segments",
+        f'"{label}" market segments share size 2025 2026',
+        f'"{label}" growth drivers trends investment 2025 2026',
     ]
-    snippets: list[str] = []
+    all_urls:    list[str] = []
+    all_snippets: list[str] = []
+
     try:
         async with httpx.AsyncClient(
             timeout=10,
-            headers={
-                **HEADERS,
-                "Accept": "text/html,application/xhtml+xml",
-            },
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
             follow_redirects=True,
         ) as client:
-            for q in queries[:2]:
+            for q in queries:
                 try:
                     resp = await client.get(
                         "https://html.duckduckgo.com/html/",
                         params={"q": q},
                     )
-                    if resp.status_code == 200:
-                        # DuckDuckGo HTML: Snippets in <a class="result__snippet">
-                        found = re.findall(
-                            r'class="result__snippet"[^>]*>([^<]{30,400})<',
+                    if resp.status_code != 200:
+                        continue
+
+                    # Snippets als Fallback
+                    snippets = re.findall(
+                        r'class="result__snippet"[^>]*>([^<]{30,400})<',
+                        resp.text,
+                    )
+                    all_snippets.extend(s.strip() for s in snippets[:5])
+
+                    # URLs für Page-Fetch extrahieren (DuckDuckGo HTML: result__url Links)
+                    raw_urls = re.findall(
+                        r'href="(https?://(?!duckduckgo)[^"]{10,200})"[^>]*class="result__a"',
+                        resp.text,
+                    )
+                    # Fallback: alle externen hrefs
+                    if not raw_urls:
+                        raw_urls = re.findall(
+                            r'href="(https?://(?!duckduckgo)[^"]{10,150})"',
                             resp.text,
                         )
-                        # Fallback: generische <span> mit Zahlen (enthält oft Marktdaten)
-                        if not found:
-                            found = re.findall(
-                                r'<a[^>]+class="result__url"[^>]*>([^<]{10,200})<',
-                                resp.text,
-                            )
-                        snippets.extend(s.strip() for s in found[:6])
-                    await asyncio.sleep(0.5)  # DuckDuckGo Rate-Limit respektieren
+                    all_urls.extend(raw_urls[:4])
+                    await asyncio.sleep(0.5)
                 except Exception as e:
-                    logger.debug("DuckDuckGo query failed ('%s'): %s", q[:50], e)
+                    logger.debug("DDG query failed ('%s'): %s", q[:50], e)
     except Exception as e:
         logger.debug("Market snippet fetch failed for %s: %s", company, e)
-    return snippets[:12]
+
+    # Seiteninhalt fetchen wenn URLs gefunden
+    page_content = ""
+    if all_urls:
+        page_content = await _fetch_market_page_content(list(dict.fromkeys(all_urls)))
+
+    # Kombination: Seiteninhalt bevorzugt, Snippets als Ergänzung
+    results: list[str] = []
+    if page_content:
+        results.append(page_content)
+    results.extend(all_snippets[:6])
+    return results[:8]
 
 
 # ── MD-B02 · World Bank API ───────────────────────────────────────────────────
@@ -522,16 +589,17 @@ async def enrich_market_data(
 
     # ── 2. Marktsegmente + Wachstumstreiber (MD-B01) ─────────────────────────
     # BUG-28: MD-B01 läuft unabhängig von TAM und Competitors.
-    # tam_usd_bn=0 als Fallback damit Claude-Prompt trotzdem sinnvoll ist.
+    # Seiteninhalt statt Snippets — deutlich reichhaltigere Basis für Claude.
     market_details: dict = {}
     try:
         snippets = await asyncio.wait_for(
-            _fetch_market_snippets(company_name, sector), timeout=12.0
+            _fetch_market_snippets(company_name, sector, category or ""),
+            timeout=20.0,   # höher wegen Page-Fetch
         )
         if snippets:
             market_details = await asyncio.wait_for(
                 _extract_market_details_with_claude(
-                    company_name, sector, tam_usd_bn or 0.0, snippets
+                    company_name, category or sector, tam_usd_bn or 0.0, snippets
                 ),
                 timeout=15.0,
             )
@@ -562,30 +630,10 @@ async def enrich_market_data(
 
     geo_scope = market_details.get("geo_scope", "global")
 
-    # ── 3. Regionale Verteilung — World Bank (MD-B02) ────────────────────────
-    wb_indicator = None
-    for tag, indicator in {
-        "battery": "EG.ELC.RNEW.ZS", "solar": "EG.ELC.RNEW.ZS",
-        "grid": "EG.USE.ELEC.KH.PC", "hydrogen": "EN.ATM.CO2E.KT",
-        "carbon": "EN.ATM.CO2E.KT", "agritech": "AG.LND.AGRI.ZS",
-        "irrigation": "AG.LND.IRIG.AG.ZS", "geothermal": "EG.ELC.RNEW.ZS",
-    }.items():
-        if tag in sector:
-            wb_indicator = indicator
-            break
-
-    if wb_indicator:
-        try:
-            wb_data = await asyncio.wait_for(
-                _fetch_worldbank_regional(wb_indicator), timeout=10.0
-            )
-            if wb_data:
-                result["regional_breakdown"] = wb_data["breakdown"]
-                result["regional_sources"] = [wb_data["source"]]
-        except asyncio.TimeoutError:
-            logger.debug("World Bank timeout for %s", company_name)
-        except Exception as e:
-            logger.debug("World Bank failed for %s: %s", company_name, e)
+    # MD-B02 (World Bank) + MD-B03 (OECD) entfernt:
+    # WB-Indikatoren (z.B. EG.ELC.RNEW.ZS für Batterie) sind keine Marktanteile
+    # sondern Nutzungsstatistiken — für VC/PE-Segment irreführend.
+    # regional_breakdown bleibt leer bis sinnvolle Quelle gefunden.
 
     # ── 4. SAM-Berechnung (MD-B04) ────────────────────────────────────────────
     if tam_usd_bn:
