@@ -1066,10 +1066,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # 4b. Enrichment-Ergebnisse in DB persistieren (nur wenn Werte vorhanden)
     #     DB-Werte als Fallback wenn Enrichment leer (z.B. bei Timeout)
     if company_id:
+        _ba_emp_for_upsert = (
+            getattr(enrichment.bundesanzeiger, "employees", None)
+            if enrichment.bundesanzeiger else None
+        )
         upsert_payload = {
             "founding_year": _parse_year(enrichment.founded_year),
             "headquarters":  enrichment.headquarters or None,
-            "headcount":     _parse_headcount(enrichment.employee_count),
+            "headcount":     (
+                _parse_headcount(enrichment.employee_count)
+                or (int(_ba_emp_for_upsert) if _ba_emp_for_upsert else None)
+            ),
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
         }
@@ -1132,9 +1139,18 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 )
 
     # DB-Werte als Fallback wenn Enrichment-Felder leer
+    # BA-Bridge: ba_employees als weiterer Fallback für Headcount (private DE)
+    _ba_employees = (
+        getattr(enrichment.bundesanzeiger, "employees", None)
+        if enrichment.bundesanzeiger else None
+    )
     founded_display   = enrichment.founded_year   or (str(company.get("founding_year")) if company.get("founding_year") else None)
     headquarters_disp = enrichment.headquarters   or company.get("headquarters")
-    headcount_disp    = enrichment.employee_count or (str(company.get("headcount")) if company.get("headcount") else None)
+    headcount_disp    = (
+        enrichment.employee_count
+        or (str(company.get("headcount")) if company.get("headcount") else None)
+        or (str(_ba_employees) if _ba_employees else None)
+    )
     description_disp  = enrichment.description    or company.get("description")
 
     # 5. Fundamentals + Beta (YH-06) + Routing (FD-01)

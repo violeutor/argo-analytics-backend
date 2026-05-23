@@ -640,6 +640,150 @@ _DE_HINTS = ["gmbh", "ag", " se", " kg", "germany", "deutschland",
              "stuttgart", "düsseldorf", "köln"]
 
 
+# ─── EDGAR Basics (US-HQ) ────────────────────────────────────────────────────
+
+_EDGAR_ENR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+_EDGAR_HEADERS    = {"User-Agent": "ArgoAnalytics/1.0 (research; contact@argo-analytics.io)"}
+
+
+def _normalize_for_edgar(name: str) -> str:
+    """Entfernt rechtliche Suffixe für EDGAR-Suche."""
+    return re.sub(
+        r"\s+(GmbH\s*&\s*Co\.?\s*KG|GmbH|AG|SE|KG|UG|OHG|Inc\.?|Ltd\.?|Corp\.?|LLC|PLC|NV|BV|SAS)$",
+        "", name, flags=re.I,
+    ).strip()
+
+
+async def _fetch_edgar_basics(company_name: str) -> dict:
+    """
+    EDGAR HQ-Lookup für US-Companies via CIK → submissions JSON.
+
+    Flow:
+      1. EDGAR Full-Text Search (forms=10-K,S-1,D) → erster Hit → CIK aus Accession-Number
+      2. data.sec.gov/submissions/CIK{cik}.json → addresses.business (city + state)
+
+    Liefert: {"headquarters": "Austin, TX"} oder {}
+    Rate-Limit: EDGAR toleriert ~10 req/s mit korrektem User-Agent.
+    """
+    out: dict = {}
+    norm = _normalize_for_edgar(company_name)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, headers=_EDGAR_HEADERS, follow_redirects=True
+        ) as client:
+            # Schritt 1: CIK via EDGAR Search
+            resp = await client.get(
+                _EDGAR_ENR_SEARCH,
+                params={
+                    "q":       f'"{norm}"',
+                    "forms":   "10-K,S-1,D",
+                    "_source": "entity_name,display_names",
+                },
+            )
+            if resp.status_code != 200:
+                return out
+
+            hits = resp.json().get("hits", {}).get("hits", [])
+            if not hits:
+                logger.debug("EDGAR basics: kein Treffer für '%s'", company_name)
+                return out
+
+            # CIK aus Accession-Number: "0001876789-22-000001" → "0001876789"
+            acc = hits[0].get("_id", "")
+            cik = acc.split("-")[0] if "-" in acc else acc[:10]
+            if not cik or not cik.isdigit():
+                return out
+
+            # Schritt 2: Submissions-JSON → business address
+            sub = await client.get(f"https://data.sec.gov/submissions/CIK{cik}.json")
+            if sub.status_code != 200:
+                return out
+
+            biz   = sub.json().get("addresses", {}).get("business", {})
+            city  = (biz.get("city") or "").strip()
+            state = (biz.get("stateOrCountryDescription") or biz.get("stateOrCountry") or "").strip()
+
+            if city:
+                out["headquarters"] = f"{city}, {state}".strip(", ") if state else city
+                logger.debug("EDGAR basics: %s → HQ=%s", company_name, out["headquarters"])
+
+    except Exception as e:
+        logger.debug("_fetch_edgar_basics failed for '%s': %s", company_name, e)
+
+    return out
+
+
+# ─── DuckDuckGo Instant Answer (letzter Fallback) ────────────────────────────
+
+_DDG_API = "https://api.duckduckgo.com/"
+
+_DDG_FOUNDED_LABELS: frozenset[str] = frozenset({
+    "founded", "founded date", "foundation", "formation", "year founded",
+    "founded in", "incorporated",
+})
+_DDG_HQ_LABELS: frozenset[str] = frozenset({
+    "headquarters", "hq location", "hq", "location", "base", "office",
+})
+
+
+async def _fetch_duckduckgo_basics(company_name: str) -> dict:
+    """
+    DuckDuckGo Instant Answer API — letzter Fallback für founded_year + headquarters.
+    Gibt strukturierte Infobox-Daten aus Wikipedia/Wikidata zurück.
+    Kein API-Key, kostenlos, weltweite Abdeckung.
+
+    Liefert: {"founded_year": "2009", "headquarters": "Austin, TX"} oder {}
+    """
+    out: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=6, headers=HEADERS) as client:
+            resp = await client.get(
+                _DDG_API,
+                params={
+                    "q":             company_name,
+                    "format":        "json",
+                    "no_html":       "1",
+                    "skip_disambig": "1",
+                },
+            )
+        if resp.status_code != 200:
+            return out
+
+        data    = resp.json()
+        content = data.get("Infobox", {}).get("content", [])
+
+        for item in content:
+            label = (item.get("label") or "").lower().strip()
+            value = (item.get("value") or "").strip()
+            if not value:
+                continue
+
+            if label in _DDG_FOUNDED_LABELS and not out.get("founded_year"):
+                m = re.search(r"\b(19|20)\d{2}\b", value)
+                if m:
+                    out["founded_year"] = m.group()
+
+            elif label in _DDG_HQ_LABELS and not out.get("headquarters"):
+                hq = re.sub(r"\[\d+\]", "", value).strip()
+                if hq and len(hq) < 60:
+                    out["headquarters"] = hq
+
+        # Fallback: Abstract-Text wenn Infobox kein Jahr liefert
+        if not out.get("founded_year"):
+            m = re.search(r"founded\s+in\s+((?:19|20)\d{2})", data.get("Abstract", ""), re.I)
+            if m:
+                out["founded_year"] = m.group(1)
+
+        if out:
+            logger.debug("DuckDuckGo basics: %s → %s", company_name, out)
+
+    except Exception as e:
+        logger.debug("_fetch_duckduckgo_basics failed for '%s': %s", company_name, e)
+
+    return out
+
+
 def _is_likely_german(company_record: dict) -> bool:
     name = company_record.get("name", "")
     if name in _SKIP_BA:
@@ -1026,6 +1170,39 @@ async def enrich_company(
             logger.debug("Company website timeout for %s", company_name)
         except Exception as e:
             logger.debug("Company website failed for %s: %s", company_name, e)
+
+    # EDGAR + DuckDuckGo: Fallback für fehlende HQ und Gründungsjahr
+    # EDGAR: strukturierte US-Adresse (city + state) — nur für US/unbekannte Region
+    # DuckDuckGo: weltweiter Fallback via Wikipedia/Wikidata Infobox
+    _needs_hq      = not result.headquarters
+    _needs_founded = not result.founded_year
+    if _needs_hq or _needs_founded:
+        _region = (company_record.get("region") or "").upper()
+
+        if _needs_hq and _region in ("US", ""):
+            try:
+                edgar_data = await asyncio.wait_for(
+                    _fetch_edgar_basics(company_name), timeout=8.0
+                )
+                if edgar_data.get("headquarters"):
+                    result.headquarters = edgar_data["headquarters"]
+                    _needs_hq = False
+            except asyncio.TimeoutError:
+                logger.debug("EDGAR basics timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("EDGAR basics failed for %s: %s", company_name, e)
+
+        if _needs_hq or _needs_founded:
+            try:
+                ddg_data = await asyncio.wait_for(
+                    _fetch_duckduckgo_basics(company_name), timeout=6.0
+                )
+                result.founded_year = result.founded_year or ddg_data.get("founded_year")
+                result.headquarters = result.headquarters or ddg_data.get("headquarters")
+            except asyncio.TimeoutError:
+                logger.debug("DuckDuckGo basics timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("DuckDuckGo basics failed for %s: %s", company_name, e)
 
     # Bundesanzeiger: private DE companies only
     if not is_listed and _is_likely_german(company_record):
