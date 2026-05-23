@@ -19,6 +19,7 @@ from src.integrations.supabase import (
     get_supabase,
     fetch_companies,
     fetch_buyers,
+    fetch_potential_buyers,
     fetch_funding_rounds,
     fetch_all_funding_rounds,
     upsert_company_enrichment,
@@ -1181,74 +1182,76 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         for r in db_rounds
     ]
 
-    # 9. Scoring
-    all_buyers = fetch_buyers(limit=50)
-    # BUG-13: nur company-relevante Buyers scoren
-    buyers = _filter_relevant_buyers_detail(all_buyers, company)
-    logger.info(
-        "Scoring: %d/%d Buyers relevant für %s (industry=%s)",
-        len(buyers), len(all_buyers), company_name, company.get("industry"),
-    )
-    scorings: list[ScoringDetail] = []
+    # 9. Scoring — R-23: company-spezifische Käufer (kein Fallback auf globale Seed-Buyers)
+    potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []
+    from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company
 
-    # Auto-TR einmalig berechnen — gilt für alle Buyer-Loops
-    # is_listed Gate: für börsennotierte Companies keinen TR berechnen
-    # (Markt hat TR bereits eingepreist — Kurs/Multiples sind der Konsens-TR)
-    if is_listed:
-        auto_tr = 0.5          # wird im Frontend nicht angezeigt
-        tr_confidence = "listed"
+    if not is_cache_valid(potential_buyers_raw):
+        # Noch nicht generiert oder abgelaufen → BackgroundTask, scorings=[]
+        if company_id:
+            background_tasks.add_task(enrich_buyers_for_company, company, company_id)
+            logger.info("Buyer-Enrichment scheduled als BackgroundTask für %s", company_name)
+        scorings: list[ScoringDetail] = []
+        buyers = []
     else:
-        auto_tr, tr_confidence = compute_auto_tech_readiness(
-            stage=company.get("funding_stage"),
-            category=company.get("category"),
-            funding_total_usd_mn=company.get("funding_total_usd_mn"),
-            funding_last_round=company.get("funding_last_round"),
-        )
-        logger.info(
-            "Auto-TR for %s: %.3f (confidence=%s, stage=%s, category=%s)",
-            company_name, auto_tr, tr_confidence,
-            company.get("funding_stage"), company.get("category"),
-        )
+        buyers = potential_buyers_raw
+        logger.info("Scoring: %d company-spezifische Buyer für %s", len(buyers), company_name)
+        scorings = []
 
-    for buyer in buyers:
-        if not buyer.get("market_cap_usd_bn"):
-            continue
-        try:
-            req = AnalyzeRequest(
-                company_name=company_name, buyer_name=buyer["name"],
-                tam_usd_bn=tam["tam_usd_bn"],
-                buyer_market_cap_usd_bn=buyer["market_cap_usd_bn"],
-                buyer_cash_usd_bn=buyer.get("cash_usd_bn") or buyer["market_cap_usd_bn"]*0.05,
-                buyer_debt_ebitda=buyer.get("debt_ebitda") or 1.5,
-                target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
-                target_stage=company.get("funding_stage") or "series_b",
-                tech_readiness_override=auto_tr,
+        if is_listed:
+            auto_tr = 0.5
+            tr_confidence = "listed"
+        else:
+            auto_tr, tr_confidence = compute_auto_tech_readiness(
+                stage=company.get("funding_stage"),
+                category=company.get("category"),
+                funding_total_usd_mn=company.get("funding_total_usd_mn"),
+                funding_last_round=company.get("funding_last_round"),
             )
-            scores = compute_scores(req)
-            scorings.append(ScoringDetail(
-                buyer_name=buyer["name"], ticker=buyer.get("ticker"),
-                srr_value=scores.srr.value, srr_category=scores.srr.category,
-                mfr_value=scores.mfr.value, mfr_signal=scores.mfr.signal,
-                tech_readiness=TechReadinessDetail(
-                    overall=auto_tr,
-                    inputs_provided=tr_confidence == "user",
-                    factors=scores.tech_readiness.factor_scores,
-                    factor_weights=_TR_WEIGHTS,
-                    confidence=tr_confidence,
-                ),
-                deal_success_score=scores.deal_success_score,
-                rating=scores.rating, execution_warning=scores.srr.execution_warning,
-            ))
-        except Exception as e:
-            logger.debug("Scoring failed %s/%s: %s", company_name, buyer["name"], e)
+            logger.info("Auto-TR for %s: %.3f (confidence=%s)", company_name, auto_tr, tr_confidence)
 
-    scorings.sort(key=lambda x: -x.deal_success_score)
+        for buyer in buyers:
+            mcap = buyer.get("market_cap_usd_bn")
+            if not mcap:
+                continue
+            try:
+                req = AnalyzeRequest(
+                    company_name=company_name,
+                    buyer_name=buyer["name"],
+                    tam_usd_bn=tam["tam_usd_bn"],
+                    buyer_market_cap_usd_bn=float(mcap),
+                    buyer_cash_usd_bn=float(mcap) * 0.05,
+                    buyer_debt_ebitda=1.5,
+                    target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
+                    target_stage=company.get("funding_stage") or "series_b",
+                    tech_readiness_override=auto_tr,
+                )
+                scores = compute_scores(req)
+                scorings.append(ScoringDetail(
+                    buyer_name=buyer["name"],
+                    ticker=buyer.get("ticker"),
+                    srr_value=scores.srr.value,
+                    srr_category=scores.srr.category,
+                    mfr_value=scores.mfr.value,
+                    mfr_signal=scores.mfr.signal,
+                    tech_readiness=TechReadinessDetail(
+                        overall=auto_tr,
+                        inputs_provided=tr_confidence == "user",
+                        factors=scores.tech_readiness.factor_scores,
+                        factor_weights=_TR_WEIGHTS,
+                        confidence=tr_confidence,
+                    ),
+                    deal_success_score=scores.deal_success_score,
+                    rating=scores.rating,
+                    execution_warning=scores.srr.execution_warning,
+                ))
+            except Exception as e:
+                logger.debug("Scoring failed %s/%s: %s", company_name, buyer["name"], e)
 
-    # tech_readiness für Market-Enrichment nachreichen (bester Scoring-Wert)
-    # Background-Task läuft nach Response-Aufbau → _tr_ref[0] ist dann gesetzt
-    if scorings:
-        _tr_ref[0] = scorings[0].tech_readiness.overall
-        logger.debug("_tr_ref set to %.2f for %s", _tr_ref[0], company_name)
+        scorings.sort(key=lambda x: -x.deal_success_score)
+
+        if scorings:
+            _tr_ref[0] = scorings[0].tech_readiness.overall
 
     # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)

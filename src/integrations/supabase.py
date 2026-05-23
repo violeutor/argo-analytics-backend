@@ -362,11 +362,16 @@ def fetch_all_signals(limit: int = 500) -> list[dict]:
 def upsert_signals(events: list[dict]) -> int:
     """
     Schreibt Signal-Events in die signals-Tabelle.
-    Duplikat-sicher via ON CONFLICT DO NOTHING (alle UNIQUE Constraints, inkl. Partial Indices).
+    Duplikat-sicher via UNIQUE CONSTRAINT signals_dedup_v2
+    (company_id, event_type, event_date, source, source_domain).
+    Gibt Anzahl geschriebener Rows zurück.
 
-    BUG-29: on_conflict ohne Spaltenangabe → PostgreSQL prüft alle UNIQUE Constraints.
-    Damit greift auch der partial Index signals_absence_dedup für internal_absence-Signale,
-    unabhängig von event_date (der sich täglich ändert).
+    Erwartet dicts mit:
+        company_id, event_type, event_date, summary,
+        source, source_url, severity, raw_title,
+        direction, signal_category,           ← SE-09/SE-11/SE-12/SE-13
+        source_domain, relevance_score,       ← Session 10: Qualität + Deduplizierung
+        funding_amount_usd_mn,               ← B-05 Funding Enrichment
     """
     if not events:
         return 0
@@ -384,10 +389,8 @@ def upsert_signals(events: list[dict]) -> int:
             }
             db.table("signals").upsert(
                 payload,
+                on_conflict="company_id,event_type,event_date,source,source_domain",
                 ignore_duplicates=True,
-                # Kein on_conflict → ON CONFLICT DO NOTHING auf allen UNIQUE Constraints
-                # Deckt sowohl signals_dedup_v2 (externe Signale) als auch
-                # signals_absence_dedup (partial index für internal_absence) ab
             ).execute()
             written += 1
         except Exception as e:
@@ -583,6 +586,45 @@ def upsert_company_scores(company_id: str, scores: dict) -> bool:
         return False
 
 
+def fetch_potential_buyers(company_id: str) -> list[dict]:
+    """
+    R-23: Gibt company-spezifische Käufer aus potential_buyers zurück.
+    Leere Liste wenn noch nicht generiert oder TTL abgelaufen.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("potential_buyers").select("*").eq(
+            "company_id", company_id
+        ).order("confidence").execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_potential_buyers failed für %s: %s", company_id, e)
+        return []
+
+
+def upsert_potential_buyers(rows: list[dict]) -> int:
+    """
+    R-23: Schreibt potential_buyers in DB.
+    UNIQUE(company_id, name) → ON CONFLICT DO UPDATE (aktualisiert market_cap + generated_at).
+    Gibt Anzahl geschriebener Rows zurück.
+    """
+    if not rows:
+        return 0
+    db = get_supabase()
+    written = 0
+    for row in rows:
+        try:
+            db.table("potential_buyers").upsert(
+                row,
+                on_conflict="company_id,name",
+            ).execute()
+            written += 1
+        except Exception as e:
+            logger.warning("upsert_potential_buyers failed für %s: %s", row.get("name"), e)
+    logger.info("upsert_potential_buyers: %d/%d geschrieben", written, len(rows))
+    return written
+
+
 def fetch_company_scores(company_id: str) -> dict | None:
     """SC: Gibt gecachte Scores für eine Company zurück (None wenn nicht vorhanden)."""
     db = get_supabase()
@@ -598,11 +640,10 @@ def fetch_company_scores(company_id: str) -> dict | None:
 
 def fetch_recent_absence_categories(company_ids: list[str], days: int = 30) -> dict[str, set[str]]:
     """
-    BUG-01/BUG-29: Gibt Absence-Signal-Kategorien zurück die in den letzten N Tagen
+    BUG-01: Gibt Absence-Signal-Kategorien zurück die in den letzten N Tagen
     pro Company bereits emittiert wurden.
     Verhindert täglich neue negative Absence-Signale (Cooldown-Mechanismus).
 
-    Fix BUG-29: Liest jetzt raw_title UND signal_category — robuster gegen fehlende Felder.
     Returns: {company_id: {'ownership', 'headcount', 'revenue', 'signal_stille'}}
     """
     if not company_ids:
@@ -618,43 +659,17 @@ def fetch_recent_absence_categories(company_ids: list[str], days: int = 30) -> d
             "event_date", cutoff
         ).in_("company_id", company_ids).execute()
 
-        if not result.data:
-            logger.debug("fetch_recent_absence_categories: keine Einträge für %d Companies", len(company_ids))
-            return result_map
-
-        for row in result.data:
-            cid   = row.get("company_id")
-            cat   = (row.get("signal_category") or "").lower()
+        for row in (result.data or []):
+            cid  = row.get("company_id")
+            cat  = row.get("signal_category") or ""
             title = (row.get("raw_title") or "").lower()
             if cid not in result_map:
                 continue
-
-            # Primär: raw_title (deterministisch, da statisch seit BUG-29 Fix)
-            if "ownership" in title:
-                result_map[cid].add("ownership")
-            if "headcount" in title:
-                result_map[cid].add("headcount")
-            if "revenue" in title:
-                result_map[cid].add("revenue")
-            if "signal-stille" in title:
-                result_map[cid].add("signal_stille")
-
-            # Sekundär: signal_category als Fallback (falls raw_title fehlt)
-            if not title:
-                if cat == "regulatory":
-                    result_map[cid].add("ownership")
-                elif cat == "filing":
-                    result_map[cid].add("headcount")
-                elif cat == "negative_earnings":
-                    result_map[cid].add("revenue")
-                elif cat == "general_news":
-                    result_map[cid].add("signal_stille")
-
-        logger.debug(
-            "fetch_recent_absence_categories: %d Rows → %d Companies mit Cooldown",
-            len(result.data),
-            sum(1 for s in result_map.values() if s),
-        )
+            # Kategorie-Keys müssen mit check_absence_signals cooldown-Keys übereinstimmen
+            if "ownership" in title:       result_map[cid].add("ownership")
+            elif "headcount" in title:     result_map[cid].add("headcount")
+            elif "revenue" in title:       result_map[cid].add("revenue")
+            elif "signal-stille" in title: result_map[cid].add("signal_stille")
     except Exception as e:
         logger.warning("fetch_recent_absence_categories failed: %s", e)
     return result_map

@@ -46,6 +46,43 @@ async def _cron_signal_engine():
         logger.exception("Signal-Engine Cron FEHLER: %s", e)
 
 
+async def _cron_buyer_enrichment():
+    """R-23 — Buyer-Enrichment Cron, täglich 07:30 UTC (nach Scoring-Cron)."""
+    try:
+        from src.integrations.supabase import fetch_companies, fetch_potential_buyers
+        from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company
+
+        companies = fetch_companies(limit=500)
+        logger.info("Buyer-Enrichment Cron gestartet — %d Companies", len(companies))
+
+        enriched = 0
+        skipped  = 0
+        for company in companies:
+            cid = company.get("id")
+            if not cid:
+                continue
+            try:
+                existing = fetch_potential_buyers(cid)
+                if is_cache_valid(existing):
+                    skipped += 1
+                    continue
+                buyers = await enrich_buyers_for_company(company, cid)
+                if buyers:
+                    enriched += 1
+                # Rate-Limit: kurze Pause zwischen Companies
+                import asyncio as _asyncio
+                await _asyncio.sleep(1.5)
+            except Exception as ce:
+                logger.warning("Buyer-Enrichment Cron: %s failed — %s", company.get("name"), ce)
+
+        logger.info(
+            "Buyer-Enrichment Cron fertig — %d enriched, %d skipped (cached)",
+            enriched, skipped,
+        )
+    except Exception as e:
+        logger.exception("Buyer-Enrichment Cron FEHLER: %s", e)
+
+
 async def _cron_scoring():
     """SC-01–SC-13 — Scoring-Engine Cron, täglich 07:30 UTC (nach Signal + Funding)."""
     try:
@@ -117,10 +154,13 @@ async def lifespan(app):
             logger.info("Signal-Engine Cron: nächster Run in %.0f Minuten", wait_seconds / 60)
             await asyncio.sleep(wait_seconds)
             await _cron_signal_engine()
-            # B-05: Funding Enrichment 30 Min nach Signal-Engine (Signals als Quelle nutzen)
+            # B-05: Funding Enrichment 30 Min nach Signal-Engine
             await asyncio.sleep(30 * 60)
             await _cron_funding_enrichment()
-            # SC-01–SC-13: Scoring 30 Min nach Funding Enrichment (frische Signals + Funding)
+            # R-23: Buyer Enrichment 30 Min nach Funding (frische Daten, vor Scoring)
+            await asyncio.sleep(30 * 60)
+            await _cron_buyer_enrichment()
+            # SC-01–SC-13: Scoring nach Buyer-Enrichment (nutzt neue Buyer-Daten)
             await asyncio.sleep(30 * 60)
             await _cron_scoring()
 
