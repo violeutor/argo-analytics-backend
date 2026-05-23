@@ -335,33 +335,27 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
         db = get_supabase()
         payload: dict = {}
 
-        for src_key, dst_key in [
-            ("headquarters", "headquarters"),
-            ("website",       "website"),
-        ]:
-            val = enriched.get(src_key)
-            if val:
-                payload[dst_key] = str(val)
+        if enriched.headquarters:
+            payload["headquarters"] = str(enriched.headquarters)
+        if enriched.website:
+            payload["website"] = str(enriched.website)
 
-        founded = enriched.get("founded")
-        if founded:
+        if enriched.founded_year:
             try:
-                payload["founding_year"] = int(str(founded)[:4])
+                payload["founding_year"] = int(str(enriched.founded_year)[:4])
             except (ValueError, TypeError):
                 pass
 
-        hc_raw = enriched.get("employee_count")
-        if hc_raw:
+        if enriched.employee_count:
             try:
-                cleaned = re.sub(r"[^\d]", "", str(hc_raw).split()[0])
+                cleaned = re.sub(r"[^\d]", "", str(enriched.employee_count).split()[0])
                 if cleaned:
                     payload["headcount"] = int(cleaned)
             except (ValueError, TypeError):
                 pass
 
-        desc = enriched.get("intro") or enriched.get("product_description")
-        if desc:
-            payload["description"] = str(desc)[:1000]
+        if enriched.description:
+            payload["description"] = str(enriched.description)[:1000]
 
         if payload:
             db.table("companies").update(payload).eq("id", peer_id).execute()
