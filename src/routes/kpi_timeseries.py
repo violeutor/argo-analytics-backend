@@ -157,15 +157,15 @@ async def get_kpi_timeseries(name: str):
 def _add_derived_metrics(metrics: dict[str, list[dict]]) -> None:
     """
     Berechnet abgeleitete Metriken wenn Basis-Daten vorhanden:
-      - ebitda_margin_pct  = ebitda_eur_mn / revenue_eur_mn × 100
-      - revenue_per_fte    = revenue_eur_mn / headcount × 1000 (EUR k/Kopf)
-      - equity_ratio_pct   = equity_eur_mn / total_assets_eur_mn × 100
-      - revenue_cagr_pct   = CAGR über alle verfügbaren Jahre (≥2 Jahre)
+      - ebitda_margin_pct  = ebitda_mn / revenue_mn × 100
+      - revenue_per_fte_k   = revenue_mn × 1000 / headcount (k€ oder k$ je currency)
+      - equity_ratio_pct   = equity_mn / total_assets_mn × 100
+      - revenue_cagr_pct    = CAGR über alle verfügbaren Jahre (≥2 Jahre)
     """
     # EBITDA-Marge
-    if "ebitda_eur_mn" in metrics and "revenue_eur_mn" in metrics:
-        rev_by_fy  = {r["fiscal_year"]: r["value"] for r in metrics["revenue_eur_mn"]}
-        ebit_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["ebitda_eur_mn"]}
+    if "ebitda_mn" in metrics and "revenue_mn" in metrics:
+        rev_by_fy  = {r["fiscal_year"]: r["value"] for r in metrics["revenue_mn"]}
+        ebit_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["ebitda_mn"]}
         derived = []
         for fy, ebitda in sorted(ebit_by_fy.items()):
             rev = rev_by_fy.get(fy)
@@ -176,8 +176,8 @@ def _add_derived_metrics(metrics: dict[str, list[dict]]) -> None:
             metrics["ebitda_margin_pct"] = derived
 
     # Revenue per FTE
-    if "revenue_eur_mn" in metrics and "headcount" in metrics:
-        rev_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["revenue_eur_mn"]}
+    if "revenue_mn" in metrics and "headcount" in metrics:
+        rev_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["revenue_mn"]}
         hc_by_fy  = {r["fiscal_year"]: r["value"] for r in metrics["headcount"]}
         derived = []
         for fy, hc in sorted(hc_by_fy.items()):
@@ -186,12 +186,12 @@ def _add_derived_metrics(metrics: dict[str, list[dict]]) -> None:
                 derived.append({"fiscal_year": fy, "value": round(rev * 1000 / hc, 1),
                                  "currency": "EUR_k", "source": "derived", "confidence": "high"})
         if derived:
-            metrics["revenue_per_fte_eur_k"] = derived
+            metrics["revenue_per_fte_k"] = derived
 
     # Equity Ratio
-    if "equity_eur_mn" in metrics and "total_assets_eur_mn" in metrics:
-        eq_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["equity_eur_mn"]}
-        ta_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["total_assets_eur_mn"]}
+    if "equity_mn" in metrics and "total_assets_mn" in metrics:
+        eq_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["equity_mn"]}
+        ta_by_fy = {r["fiscal_year"]: r["value"] for r in metrics["total_assets_mn"]}
         derived = []
         for fy, eq in sorted(eq_by_fy.items()):
             ta = ta_by_fy.get(fy)
@@ -202,8 +202,8 @@ def _add_derived_metrics(metrics: dict[str, list[dict]]) -> None:
             metrics["equity_ratio_pct"] = derived
 
     # Revenue CAGR (braucht ≥2 Datenpunkte)
-    if "revenue_eur_mn" in metrics:
-        rev_rows = sorted(metrics["revenue_eur_mn"], key=lambda r: r["fiscal_year"])
+    if "revenue_mn" in metrics:
+        rev_rows = sorted(metrics["revenue_mn"], key=lambda r: r["fiscal_year"])
         if len(rev_rows) >= 2:
             first = rev_rows[0]
             last  = rev_rows[-1]
