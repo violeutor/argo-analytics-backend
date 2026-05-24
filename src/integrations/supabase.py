@@ -11,6 +11,66 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ── ARCH-01 Shadow Promote ────────────────────────────────────────────────────
+
+def promote_shadow_to_supabase(shadow: dict) -> dict | None:
+    """
+    ARCH-01: Schreibt Shadow-DB Daten in Supabase.
+    Legt companies-Row an und schreibt Ownership aus Shareholdern.
+
+    shadow: dict aus GET /shadow/company/{name} (BA-Bridge)
+    Returns: companies-Row wenn erfolgreich, None bei Fehler.
+    """
+    db   = get_supabase()
+    name = shadow.get("name", "")
+    if not name:
+        return None
+
+    payload: dict = {
+        "name":              name,
+        "investment_path":   "Beobachten",
+        "enrichment_status": "done",
+    }
+    if shadow.get("hq"):           payload["headquarters"]  = shadow["hq"]
+    if shadow.get("founded_year"): payload["founding_year"] = shadow["founded_year"]
+    if shadow.get("headcount"):    payload["headcount"]     = shadow["headcount"]
+
+    try:
+        result  = db.table("companies").insert(payload).execute()
+        company = result.data[0] if result.data else None
+        if not company:
+            logger.warning("promote_shadow_to_supabase: insert lieferte kein Ergebnis für '%s'", name)
+            return None
+    except Exception as e:
+        logger.warning("promote_shadow_to_supabase companies insert FAILED für '%s': %s", name, e)
+        return None
+
+    company_id = company["id"]
+
+    # Ownership aus BA-Shareholdern
+    for sh in (shadow.get("shareholders") or []):
+        sh_name = (sh.get("name") or "").strip()
+        if not sh_name:
+            continue
+        try:
+            db.table("ownership_entries").insert({
+                "company_id": company_id,
+                "name":       sh_name,
+                "role":       "shareholder",
+                "share_pct":  sh.get("share_pct"),
+                "source":     "bundesanzeiger_shadow",
+            }).execute()
+        except Exception as e:
+            logger.debug("promote_shadow ownership skip '%s': %s", sh_name, e)
+
+    logger.info(
+        "promote_shadow_to_supabase OK: '%s' company_id=%s shareholders=%d",
+        name, company_id, len(shadow.get("shareholders") or []),
+    )
+    return company
+
+
 def upsert_ticker_yf(company_id: str, ticker_yf: str) -> None:
     """
     Schreibt den yfinance-Ticker (z.B. 'SIE.DE') in companies.ticker_yf.
@@ -136,7 +196,8 @@ def upsert_company_enrichment(company_id: str, data: dict) -> None:
     (keine None-Overwrites auf bereits vorhandene DB-Werte).
 
     Felder: founding_year, headquarters, headcount, description, website,
-            category, industry  ← neu: aus Tag-Inferenz für One-Click-Companies
+            category, industry, ticker, exchange, ipo_status
+            (BUG-47: ipo_status + ticker + exchange jetzt aus Wikipedia-Infobox)
     Aufgerufen von: company_detail.py nach _safe_enrichment()
     """
     db = get_supabase()
