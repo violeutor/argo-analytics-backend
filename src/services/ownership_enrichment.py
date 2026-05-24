@@ -46,8 +46,9 @@ async def _fetch_edgar_form_d(company_name: str) -> list[dict]:
     Sucht EDGAR nach Form D Filings für eine US-Company.
     Gibt Liste von Ownership-Einträgen zurück (Investoren aus exempt offerings).
 
-    Endpoint: efts.sec.gov/LATEST/search-index?q="company"&dateRange=custom&...
-    Fallback: data.sec.gov/submissions/CIK{cik}.json für bekannte CIKs
+    BUG-48: War: Issuer (= Company selbst) als einzigen Eintrag geschrieben.
+    Fix: relatedPersonsList aus Filing-JSON holen — das sind die echten Investoren/Directors.
+    Issuer wird explizit gefiltert (Company ist nicht ihr eigener Investor).
     """
     results: list[dict] = []
 
@@ -75,47 +76,123 @@ async def _fetch_edgar_form_d(company_name: str) -> list[dict]:
                 return []
 
             # Schritt 2: Neuestes Filing nehmen
-            hit = hits[0].get("_source", {})
-            accession = hits[0].get("_id", "").replace("-", "")
-            entity = hit.get("entity_name", company_name)
+            hit        = hits[0]
+            source     = hit.get("_source", {})
+            accession  = hit.get("_id", "")
+            entity     = source.get("entity_name", company_name)
+            period     = source.get("period_of_report", "")
+            cik        = source.get("entity_id") or accession.split("-")[0] if accession else ""
+            as_of_date = period[:10] if period else None
 
-            # Schritt 3: Filing-Detail holen
-            if not accession:
-                return []
+            # Schritt 3: Filing-JSON von EDGAR holen (enthält relatedPersonsList)
+            # URL-Schema: https://data.sec.gov/submissions/CIK{cik:010d}.json
+            # Alternativ: Filing-Index JSON via accession number
+            accession_clean = accession.replace("-", "")
+            related_persons: list[dict] = []
 
-            # EDGAR filing XML — Investoren stehen in Relationship-Sektion
-            filing_url = f"https://www.sec.gov/Archives/edgar/data/{accession[:10]}/{accession}.txt"
-            detail_resp = await client.get(
-                f"https://efts.sec.gov/LATEST/search-index?q=%22{company_name.replace(' ', '+')}%22&forms=D&hits.hits.total.value=1",
-                timeout=8,
-            )
+            if cik:
+                try:
+                    cik_padded = str(cik).zfill(10)
+                    sub_resp = await client.get(
+                        f"https://data.sec.gov/submissions/CIK{cik_padded}.json",
+                        timeout=8,
+                    )
+                    if sub_resp.status_code == 200:
+                        sub_data = sub_resp.json()
+                        # relatedPersonsList aus letztem Form D Filing
+                        filings = sub_data.get("filings", {}).get("recent", {})
+                        forms   = filings.get("form", [])
+                        accessions = filings.get("accessionNumber", [])
+                        dates   = filings.get("filingDate", [])
+                        # Neuestes Form D finden
+                        for i, form in enumerate(forms):
+                            if form in ("D", "D/A"):
+                                acc = accessions[i].replace("-", "") if i < len(accessions) else ""
+                                filing_date = dates[i] if i < len(dates) else as_of_date
+                                if acc:
+                                    # Form D XML/JSON holen
+                                    fd_url = (
+                                        f"https://www.sec.gov/Archives/edgar/data/"
+                                        f"{cik}/{acc}/{acc}-index.json"
+                                    )
+                                    fd_resp = await client.get(fd_url, timeout=8)
+                                    if fd_resp.status_code == 200:
+                                        fd_idx = fd_resp.json()
+                                        # primaryDocument aus Index
+                                        for doc in fd_idx.get("directory", {}).get("item", []):
+                                            if doc.get("type") == "primary_doc":
+                                                doc_url = (
+                                                    f"https://www.sec.gov/Archives/edgar/data/"
+                                                    f"{cik}/{acc}/{doc['name']}"
+                                                )
+                                                doc_resp = await client.get(doc_url, timeout=8)
+                                                if doc_resp.status_code == 200:
+                                                    import xml.etree.ElementTree as ET
+                                                    try:
+                                                        root = ET.fromstring(doc_resp.text)
+                                                        ns = {"d": "http://www.sec.gov/edgar/document/formd"}
+                                                        for rp in root.findall(".//d:relatedPerson", ns) or root.findall(".//relatedPerson"):
+                                                            name_el = rp.find("d:relatedPersonName", ns) or rp.find("relatedPersonName")
+                                                            rel_el  = rp.find("d:relatedPersonRelationshipList", ns) or rp.find("relatedPersonRelationshipList")
+                                                            if name_el is not None:
+                                                                first = (name_el.findtext("d:relatedPersonFirstName", namespaces=ns) or name_el.findtext("relatedPersonFirstName") or "").strip()
+                                                                last  = (name_el.findtext("d:relatedPersonLastName",  namespaces=ns) or name_el.findtext("relatedPersonLastName")  or "").strip()
+                                                                full  = f"{first} {last}".strip()
+                                                                rels  = []
+                                                                if rel_el is not None:
+                                                                    rels = [r.text.strip() for r in list(rel_el) if r.text]
+                                                                if full:
+                                                                    related_persons.append({
+                                                                        "name": full,
+                                                                        "relationships": rels,
+                                                                        "as_of_date": filing_date,
+                                                                    })
+                                                    except ET.ParseError:
+                                                        pass
+                                break
+                except Exception as e:
+                    logger.debug("EDGAR submissions JSON failed for %s: %s", company_name, e)
 
-            # Schritt 4: Aus Hit Metadaten Investor-Infos extrahieren
-            # Form D enthält: issuerName, relatedPersonsList, totalOfferingAmount
-            filing_meta = hits[0].get("_source", {})
-            period = filing_meta.get("period_of_report", "")
-            amount_raw = filing_meta.get("totalOfferingAmount")
+            # Schritt 4: relatedPersons → Ownership-Einträge
+            # BUG-48: Issuer explizit NICHT eintragen — Company ist nicht ihr eigener Investor
+            company_name_lower = company_name.lower()
+            for rp in related_persons:
+                name = rp["name"]
+                rels = rp.get("relationships", [])
+                # Skip wenn Name wie die Company selbst klingt (Issuer-Duplikat)
+                if name.lower() in company_name_lower or company_name_lower in name.lower():
+                    continue
+                # Rolle aus Relationship ableiten
+                role = "director" if any("Director" in r for r in rels) else \
+                       "officer"  if any("Officer"  in r for r in rels) else \
+                       "significant_shareholder" if any("10%" in r for r in rels) else \
+                       "related_person"
+                inv_type = "individual" if role in ("director", "officer") else \
+                           _classify_investor_type(name)
+                results.append({
+                    "name":       name,
+                    "type":       inv_type,
+                    "role":       role,
+                    "share_pct":  None,
+                    "source":     "edgar_form_d",
+                    "as_of_date": rp.get("as_of_date"),
+                    "notes":      ", ".join(rels) if rels else None,
+                })
 
-            # Issuer als Company-Eintrag
-            results.append({
-                "name": entity,
-                "type": "issuer",
-                "role": "issuer",
-                "share_pct": None,
-                "source": "edgar_form_d",
-                "as_of_date": period[:10] if period else None,
-                "notes": f"Total offering: ${amount_raw:,.0f}" if amount_raw else None,
-            })
+            # Fallback wenn XML-Parse nichts ergab: Volltext-Suche
+            if not results:
+                logger.debug("EDGAR Form D XML leer für %s — Volltext-Fallback", company_name)
 
     except Exception as e:
         logger.debug("EDGAR Form D fetch failed for %s: %s", company_name, e)
 
     # Fallback: Volltext-Suche nach bekannten Investoren via EDGAR full-text
-    try:
-        edgar_entries = await _edgar_fulltext_investors(company_name)
-        results.extend(edgar_entries)
-    except Exception as e:
-        logger.debug("EDGAR fulltext fallback failed for %s: %s", company_name, e)
+    if not results:
+        try:
+            edgar_entries = await _edgar_fulltext_investors(company_name)
+            results.extend(edgar_entries)
+        except Exception as e:
+            logger.debug("EDGAR fulltext fallback failed for %s: %s", company_name, e)
 
     return results
 

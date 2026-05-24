@@ -279,11 +279,20 @@ def get_company_debug(name: str) -> dict:
         "signals": {
             "_source": "Signal-Engine SE-01–SE-15 (Cron 04:00 UTC)",
             "signals_count": len(signals),
-            "latest": {
-                "event_type": signals[0].get("event_type") if signals else None,
-                "event_date": signals[0].get("event_date") if signals else None,
-                "source":     signals[0].get("source") if signals else None,
-            } if signals else None,
+            # BUG-49: internal_absence nie als "latest" zeigen — kein echter Event
+            "latest": next(
+                (
+                    {
+                        "event_type": s.get("event_type"),
+                        "event_date": s.get("event_date"),
+                        "source":     s.get("source"),
+                    }
+                    for s in signals
+                    if s.get("source") != "internal_absence"
+                ),
+                None,
+            ),
+            "absence_count": sum(1 for s in signals if s.get("source") == "internal_absence"),
         },
 
         # ── Block 11: Patents ─────────────────────────────────────────────────
