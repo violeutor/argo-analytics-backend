@@ -547,10 +547,7 @@ def compute_market_cycle(
             continue
 
     if not yearly:
-        return {
-            "market_cycle": "early",
-            "market_cycle_note": "Keine Funding-Daten verfügbar — Markt vermutlich sehr früh.",
-        }
+        return {"market_cycle": _default_cycle, "market_cycle_note": _default_note}
 
     years = sorted(yearly.keys())
     recent_years = years[-3:] if len(years) >= 3 else years
@@ -691,6 +688,7 @@ def enrich_market_data_sync_wrapper(
     tech_readiness: float | None = None,
     async_result: dict | None = None,
     peers_context: dict | None = None,   # R-22: Positioning Notes aus Peer Review
+    is_listed: bool = False,             # BUG-51: listed → mature statt early als Default
 ) -> dict:
     """
     Synchroner Teil der Pipeline — Competition Score + Market Cycle.
@@ -720,7 +718,7 @@ def enrich_market_data_sync_wrapper(
 
     # MD-B06 — Market Cycle
     try:
-        cycle = compute_market_cycle(category, safe_rounds, safe_companies)
+        cycle = compute_market_cycle(category, safe_rounds, safe_companies, is_listed=is_listed)
         result.update(cycle)
     except Exception as e:
         logger.warning("Market cycle failed for %s: %s", company_name, e)

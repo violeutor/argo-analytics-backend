@@ -1056,6 +1056,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     all_funding_rounds=all_rounds,
                     async_result=async_result,
                     peers_context=company.get("peers_context"),  # R-22
+                    is_listed=is_listed,                         # BUG-51: mature statt early für listed
                 )
                 # _competition_signals ist internes Übergabe-Feld — nicht in DB schreiben
                 upsert_payload = {
@@ -1090,6 +1091,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     all_funding_rounds=all_rounds,
                     async_result=None,   # keine neuen DDG-Signale — Peers-Kontext genügt
                     peers_context=company.get("peers_context"),
+                    is_listed=is_listed,  # BUG-51: mature statt early für listed
                 )
                 upsert_market_data(company_id, {
                     k: v for k, v in comp_result.items()

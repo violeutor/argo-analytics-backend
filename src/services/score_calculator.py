@@ -335,7 +335,7 @@ def compute_financial_score(company: dict) -> tuple[float, dict]:
         0.5 if "series a" in stage.lower() else
         0.5 if "seed" in stage.lower() else
         1.5 if "bootstrap" in stage.lower() else   # Bootstrapped → profitabel
-        1.5 if "listed" in stage.lower() else       # listed = hat Kapitalmarkttest bestanden
+        1.5 if any(s in stage.lower() for s in ["listed", "public"]) else       # listed/public = hat Kapitalmarkttest bestanden
         1.0
     )
     score += stage_pts
@@ -508,7 +508,7 @@ def compute_risk_score(
         1.0 if "series b" in stage_lower else
         0.5 if "series c" in stage_lower else
         0.3 if any(s in stage_lower for s in ["series d", "pre-ipo"]) else
-        0.1 if "listed" in stage_lower else
+        0.1 if any(s in stage_lower for s in ["listed", "public"]) else
         1.0   # unbekannt
     )
     score += stage_risk
