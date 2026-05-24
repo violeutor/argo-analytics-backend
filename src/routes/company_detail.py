@@ -1156,6 +1156,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
         }
+        # BUG-47: ipo_status aus EnrichmentResult in DB schreiben
+        # Nur wenn Enrichment einen Wert liefert UND DB noch keinen hat
+        if enrichment.ipo_status and not company.get("ipo_status"):
+            upsert_payload["ipo_status"] = enrichment.ipo_status
         # BUG-34 complete: Wikipedia-Titel als kanonischen Namen übernehmen
         # ("Linde" → "Linde plc", "SpaceX" → korrekte Schreibweise)
         # Nur wenn enrichment.name vom DB-Namen abweicht und plausibel ist

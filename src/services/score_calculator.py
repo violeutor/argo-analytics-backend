@@ -236,6 +236,17 @@ def _is_listed(company: dict) -> bool:
     return ipo_status in ("listed", "public", "ipo_erfolgt", "ipo erfolgt")
 
 
+def _resolve_funding_stage(company: dict) -> str:
+    """
+    BUG-51: Normalisiert funding_stage für alle Score-Funktionen.
+    Listed Companies haben keine Venture-Runden in DB → funding_stage wäre NULL.
+    Fix: ipo_status == 'listed' → 'public' direkt setzen, unabhängig von funding_rounds.
+    """
+    if _is_listed(company):
+        return "public"
+    return company.get("funding_stage") or ""
+
+
 def _investor_tier(name: str, investor_type: str) -> int:
     name_lower = name.lower()
     for kw, tier in _INVESTOR_TIER_KW:
@@ -315,7 +326,7 @@ def compute_financial_score(company: dict) -> tuple[float, dict]:
         data_points += 1
 
     # Funding Stage Proxy (0–2): immer verfügbar als Minimum-Signal
-    stage = company.get("funding_stage") or ""
+    stage = _resolve_funding_stage(company)
     inputs["funding_stage"] = stage
     stage_pts = (
         2.0 if any(s in stage.lower() for s in ["series d", "series e", "pre-ipo", "growth"]) else
@@ -489,7 +500,7 @@ def compute_risk_score(
         inputs["governance"] = "partial"
 
     # Stage-Risiko (0–2)
-    stage = company.get("funding_stage") or ""
+    stage = _resolve_funding_stage(company)
     stage_lower = stage.lower()
     stage_risk = (
         2.0 if "seed" in stage_lower else
@@ -651,7 +662,7 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
         inputs["note"] = "already_listed"
         return 0.0, inputs
 
-    stage         = company.get("funding_stage") or ""
+    stage         = _resolve_funding_stage(company)
     tr            = float(company.get("tech_readiness") or 0.5)
     ipo_potential = company.get("ipo_potential") or ""
     ipo_status    = company.get("ipo_status") or ""
@@ -700,7 +711,7 @@ def compute_ma_score(company: dict, buyers: list[dict]) -> tuple[float, dict]:
     srr = company.get("srr") or company.get("strategic_relevance_rating")
     mfr = company.get("mfr_confidence")
     tr  = float(company.get("tech_readiness") or 0.5)
-    stage = company.get("funding_stage") or ""
+    stage = _resolve_funding_stage(company)
 
     inputs.update({"srr": srr, "mfr": mfr, "tech_readiness": tr, "funding_stage": stage})
 
@@ -976,7 +987,7 @@ def compute_dimension_risks(
     }
 
     # ─── 2. FINANCIALS ─────────────────────────────────────────────────────
-    stage   = (company.get("funding_stage") or "").lower().replace(" ", "_").replace("-", "_")
+    stage   = (_resolve_funding_stage(company)).lower().replace(" ", "_").replace("-", "_")
     funding = float(company.get("funding_total_usd_mn") or 0)
 
     _STAGE_OPP  = {
