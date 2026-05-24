@@ -189,6 +189,28 @@ def fetch_buyer_by_name(name: str) -> dict | None:
 
 # ── Company Enrichment Upsert ────────────────────────────────────────────────
 
+def fetch_companies_for_rolling_refresh(batch_size: int = 55) -> list[dict]:
+    """
+    ARCH-02: Gibt Companies zurück die seit >30 Tagen nicht strukturell angereichert wurden.
+    Sortierung: enriched_at IS NULL zuerst (nie angereichert), dann älteste zuerst.
+    Batch-Größe 55 → stündlich = ~1.333/Tag = vollständiger Refresh alle 30 Tage.
+    """
+    from datetime import datetime, timezone, timedelta
+    db     = get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    try:
+        result = db.table("companies").select(
+            "id, name, category, industry, ipo_status, ticker, exchange, "
+            "region, headquarters, founding_year, headcount, enriched_at"
+        ).or_(
+            f"enriched_at.is.null,enriched_at.lt.{cutoff}"
+        ).order("enriched_at", desc=False, nullsfirst=True).limit(batch_size).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_companies_for_rolling_refresh failed: %s", e)
+        return []
+
+
 def upsert_company_enrichment(company_id: str, data: dict) -> None:
     """
     Schreibt Enrichment-Ergebnisse zurück in die companies-Tabelle.
@@ -205,6 +227,10 @@ def upsert_company_enrichment(company_id: str, data: dict) -> None:
     payload = {k: v for k, v in data.items() if v is not None}
     if not payload:
         return
+
+    # ARCH-02: enriched_at setzen für Rolling-Refresh-TTL
+    from datetime import datetime, timezone
+    payload["enriched_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
         result = db.table("companies").update(payload).eq("id", company_id).execute()
@@ -302,6 +328,61 @@ def fetch_all_ownership_entries() -> list[dict]:
     except Exception as e:
         logger.warning("fetch_all_ownership_entries failed: %s", e)
         return []
+
+
+def fetch_ownership_entries(company_id: str) -> list[dict]:
+    """
+    EN-08: Gibt Ownership-Einträge für eine Company zurück (ownership_entries-Tabelle).
+    Felder: name, type, role, share_pct, source, as_of_date
+    Sortiert nach as_of_date DESC — neueste Einträge zuerst.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("ownership_entries").select(
+            "name, type, role, share_pct, source, as_of_date"
+        ).eq("company_id", company_id).order("as_of_date", desc=True, nullsfirst=False).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_ownership_entries failed for %s: %s", company_id, e)
+        return []
+
+
+def upsert_ownership_entries(company_id: str, entries: list[dict]) -> int:
+    """
+    EN-08: Schreibt Ownership-Einträge in ownership_entries.
+    Deduplication obliegt dem Aufrufer (enrich_ownership filtert bereits via existing_names).
+    Felder ohne DB-Spalte (notes) werden gefiltert — Schema: name, type, role,
+    share_pct, source, as_of_date.
+
+    Gibt Anzahl erfolgreich geschriebener Rows zurück.
+    """
+    if not entries:
+        return 0
+
+    _ALLOWED_FIELDS = {"name", "type", "role", "share_pct", "source", "as_of_date"}
+    db      = get_supabase()
+    written = 0
+
+    for entry in entries:
+        name = (entry.get("name") or "").strip()
+        if not name:
+            continue
+        payload = {k: v for k, v in entry.items() if k in _ALLOWED_FIELDS and v is not None}
+        payload["company_id"] = company_id
+        payload["name"]       = name
+        try:
+            db.table("ownership_entries").insert(payload).execute()
+            written += 1
+        except Exception as e:
+            logger.warning(
+                "upsert_ownership_entries skip '%s' für %s: %s", name, company_id, e
+            )
+
+    logger.info(
+        "upsert_ownership_entries: %d/%d geschrieben für company_id=%s",
+        written, len(entries), company_id,
+    )
+    return written
 
 
 # ── Value Drivers ────────────────────────────────────────────────────────────

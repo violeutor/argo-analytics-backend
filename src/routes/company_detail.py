@@ -33,6 +33,8 @@ from src.integrations.supabase import (
     fetch_company_scores,
     upsert_company_scores,
     fetch_signals,
+    fetch_ownership_entries,
+    upsert_ownership_entries,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.score_calculator import compute_all_scores
@@ -1349,6 +1351,76 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         # "Not publicly disclosed" entfernen wenn wir jetzt echte Einträge haben
         ownership = [o for o in ownership if o.name != "Not publicly disclosed"] or ownership
         logger.info("BUG-30: Ownership nach Funding-Merge: %d Einträge für %s", len(ownership), company_name)
+
+    # EN-08: DB-Ownership-Einträge (ownership_entries-Tabelle) laden + in Response mergen.
+    # Für listed Companies: Yahoo institutional_holders (yfinance, via BA-Bridge).
+    # Für private Companies: EDGAR Form D / BA-Bridge (enrich_ownership).
+    # Einträge werden deduped gegen bereits vorhandene (curated overrides + enrichment + funding).
+    db_ownership_entries = fetch_ownership_entries(company_id) if company_id else []
+    if db_ownership_entries:
+        _existing_names_db = {o.name.lower() for o in ownership}
+        _added_from_db = 0
+        for e in db_ownership_entries:
+            entry_name = (e.get("name") or "").strip()
+            if not entry_name or entry_name.lower() in _existing_names_db:
+                continue
+            _existing_names_db.add(entry_name.lower())
+            ownership.append(OwnershipItem(
+                name=entry_name,
+                type=e.get("type") or "Unknown",
+                role=e.get("role"),
+                notes=None,  # notes-Feld nicht in ownership_entries Schema
+            ))
+            _added_from_db += 1
+        ownership = [o for o in ownership if o.name != "Not publicly disclosed"] or ownership
+        if _added_from_db:
+            logger.info(
+                "EN-08: %d DB-Ownership-Einträge für %s gemerged (source=%s)",
+                _added_from_db, company_name,
+                db_ownership_entries[0].get("source") if db_ownership_entries else "?",
+            )
+
+    # Ownership Enrichment Background Task — feuert nur wenn DB leer (kein Re-Trigger).
+    # Refresh via Rolling Refresh Cron (ARCH-02) in einer späteren Session.
+    if company_id and not db_ownership_entries:
+        _existing_for_bg = [
+            {"name": o.name, "type": o.type, "role": o.role}
+            for o in ownership
+            if o.name != "Not publicly disclosed"
+        ]
+        _db_rounds_for_bg = db_rounds  # aus Schritt 8
+
+        async def _ownership_enrichment_bg():
+            try:
+                from src.services.ownership_enrichment import enrich_ownership
+                result = await enrich_ownership(
+                    company_id=company_id,
+                    company_name=company_name,
+                    company=company,
+                    existing_entries=_existing_for_bg,
+                    funding_rounds=_db_rounds_for_bg,
+                )
+                new_entries = result.get("entries", [])
+                if new_entries:
+                    written = upsert_ownership_entries(company_id, new_entries)
+                    logger.info(
+                        "EN-08: %d Ownership-Einträge geschrieben für %s "
+                        "(source=%s region=%s written=%d)",
+                        len(new_entries), company_name,
+                        result.get("source_used"), result.get("region"), written,
+                    )
+                else:
+                    logger.debug(
+                        "EN-08: keine neuen Ownership-Einträge für %s (source=%s)",
+                        company_name, result.get("source_used"),
+                    )
+            except Exception:
+                logger.exception("Ownership enrichment FAILED für %s", company_name)
+
+        background_tasks.add_task(_ownership_enrichment_bg)
+        logger.info(
+            "Ownership enrichment queued für %s (is_listed=%s)", company_name, is_listed
+        )
 
     # 9. Scoring — R-23: company-spezifische Käufer (kein Fallback auf globale Seed-Buyers)
     potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []

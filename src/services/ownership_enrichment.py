@@ -197,6 +197,70 @@ async def _fetch_edgar_form_d(company_name: str) -> list[dict]:
     return results
 
 
+async def _fetch_yahoo_ownership(
+    ticker: str,
+    bridge_url: str,
+    bridge_key: str | None,
+) -> list[dict]:
+    """
+    EN-08: Institutionelle Investoren via yfinance institutional_holders (BA-Bridge).
+    GET /yahoo/ownership/{ticker} → holders-Liste mit name, share_pct, shares,
+    value_usd, date_reported.
+
+    Nur für listed Companies — kein EDGAR/BA/Wikipedia-Fallback.
+    Gibt leere Liste zurück bei Fehler — kein Hard-Fail.
+    """
+    results: list[dict] = []
+    headers = {"X-API-Key": bridge_key} if bridge_key else {}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            resp = await client.get(
+                f"{bridge_url.rstrip('/')}/yahoo/ownership/{ticker}",
+            )
+        if resp.status_code != 200:
+            logger.debug("Yahoo ownership HTTP %s for ticker=%s", resp.status_code, ticker)
+            return []
+
+        data = resp.json()
+        # Bridge liefert {"holders": [...]} oder flat list
+        holders = data.get("holders") if isinstance(data, dict) else data
+        if not isinstance(holders, list):
+            logger.debug("Yahoo ownership: unerwartetes Format für %s", ticker)
+            return []
+
+        for h in holders:
+            name = (h.get("name") or "").strip()
+            if not name:
+                continue
+            shares = h.get("shares")
+            notes: str | None = None
+            if shares:
+                try:
+                    notes = f"{int(shares):,} Shares"
+                except (ValueError, TypeError):
+                    pass
+            results.append({
+                "name":       name,
+                "type":       _classify_investor_type(name),
+                "role":       "institutional_investor",
+                "share_pct":  h.get("share_pct"),
+                "source":     "yahoo_institutional",
+                "as_of_date": h.get("date_reported"),
+                "notes":      notes,
+            })
+
+        logger.info(
+            "Yahoo ownership OK: ticker=%s → %d institutionelle Investoren",
+            ticker, len(results),
+        )
+
+    except Exception as e:
+        logger.debug("_fetch_yahoo_ownership failed for %s: %s", ticker, e)
+
+    return results
+
+
 async def _edgar_fulltext_investors(company_name: str) -> list[dict]:
     """
     EDGAR EFTS Volltext-Suche — findet Investoren aus SC 13G/13D und Form D.
@@ -559,7 +623,45 @@ async def enrich_ownership(
     # Bereits vorhandene Namen — keine Duplikate
     existing_names = {e.get("name", "").lower() for e in existing_entries}
 
-    if region == "US":
+    # EN-08: Listed Companies → Yahoo institutional_holders (Prio über EDGAR/BA)
+    # BUG-50: Keine Wikipedia-Founders für börsennotierte Companies
+    is_listed = (company.get("ipo_status") or "").lower() == "listed"
+
+    if is_listed:
+        ticker_yf = company.get("ticker_yf") or company.get("ticker")
+        if ticker_yf:
+            logger.info(
+                "Ownership enrichment via Yahoo institutional for %s (listed, ticker=%s)",
+                company_name, ticker_yf,
+            )
+            try:
+                from src.config import settings as argo_settings
+                bridge_url = getattr(argo_settings, "ba_bridge_url", None)
+                bridge_key = getattr(argo_settings, "ba_bridge_api_key", None)
+                if bridge_url:
+                    yahoo_entries = await asyncio.wait_for(
+                        _fetch_yahoo_ownership(ticker_yf, bridge_url, bridge_key),
+                        timeout=10.0,
+                    )
+                    for e in yahoo_entries:
+                        if e.get("name", "").lower() not in existing_names:
+                            new_entries.append(e)
+                            existing_names.add(e["name"].lower())
+                    if new_entries:
+                        source_used = "yahoo_institutional"
+                else:
+                    logger.debug("BA-Bridge nicht konfiguriert — kein Yahoo-Ownership-Call")
+            except asyncio.TimeoutError:
+                logger.debug("Yahoo ownership timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("Yahoo ownership failed for %s: %s", company_name, e)
+        else:
+            logger.debug(
+                "Listed Company %s ohne ticker_yf/ticker — kein Yahoo-Ownership-Call",
+                company_name,
+            )
+
+    elif region == "US":
         # EN-02: EDGAR
         logger.info("Ownership enrichment via EDGAR for %s (US)", company_name)
         try:
