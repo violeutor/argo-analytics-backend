@@ -56,6 +56,25 @@ def fetch_companies(limit: int = 100, source: str | None = None) -> list[dict]:
     return result.data or []
 
 
+def fetch_listed_companies_missing_ticker_yf() -> list[dict]:
+    """
+    BUG-42: Gibt alle listed Companies zurück die ticker_yf noch nicht gesetzt haben.
+    Wird vom ticker_yf-Enrichment-Cron in main.py aufgerufen (vor Beta-Cron).
+    Felder: id, name, ticker, exchange, ticker_yf
+    """
+    db = get_supabase()
+    try:
+        result = db.table("companies").select(
+            "id, name, ticker, exchange, ticker_yf"
+        ).eq("ipo_status", "listed").not_.is_("ticker", "null").execute()
+        rows = result.data or []
+        # Nur Companies ohne ticker_yf oder mit leerem ticker_yf zurückgeben
+        return [r for r in rows if not r.get("ticker_yf") and r.get("ticker")]
+    except Exception as e:
+        logger.warning("fetch_listed_companies_missing_ticker_yf failed: %s", e)
+        return []
+
+
 def fetch_company_by_name(name: str) -> dict | None:
     db = get_supabase()
     result = db.table("companies").select("*").ilike("name", name).limit(1).execute()

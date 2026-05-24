@@ -99,12 +99,67 @@ async def _cron_buyer_enrichment():
         logger.exception("Buyer-Enrichment Cron FEHLER: %s", e)
 
 
+async def _cron_ticker_yf():
+    """
+    BUG-42: ticker_yf-Enrichment — täglich 04:45 UTC (zwischen Funding + Buyer).
+    Berechnet yfinance-Ticker (z.B. SIE.DE) für alle listed Companies ohne ticker_yf
+    und schreibt ihn direkt in companies.ticker_yf.
+    Trennung: Argo-Backend schreibt ticker_yf, BA-Bridge liest nur noch.
+    """
+    # TICKER_SUFFIX_MAP — gleiche Logik wie price_fetcher.py in BA-Bridge
+    _SUFFIX_MAP: dict[str, str] = {
+        "xetra":              ".DE",
+        "frankfurt":          ".DE",
+        "fse":                ".F",
+        "euronext paris":     ".PA",
+        "euronext amsterdam": ".AS",
+        "euronext":           ".PA",
+        "london":             ".L",
+        "lse":                ".L",
+        "swiss":              ".SW",
+        "six":                ".SW",
+        "milan":              ".MI",
+        "bmv":                ".MX",
+        "tsx":                ".TO",
+        "asx":                ".AX",
+        "hkex":               ".HK",
+        "tokyo":              ".T",
+    }
+    try:
+        from src.integrations.supabase import (
+            fetch_listed_companies_missing_ticker_yf, upsert_ticker_yf,
+        )
+
+        companies = fetch_listed_companies_missing_ticker_yf()
+        logger.info("ticker_yf Cron: %d listed Companies ohne ticker_yf", len(companies))
+
+        written = 0
+        for c in companies:
+            ticker   = (c.get("ticker") or "").strip().upper()
+            exchange = (c.get("exchange") or "").lower()
+            cid      = c.get("id") or ""
+            if not ticker or not cid:
+                continue
+            suffix   = _SUFFIX_MAP.get(exchange, "")
+            yf_ticker = ticker + suffix if suffix and "." not in ticker else ticker
+            if yf_ticker == ticker and not suffix:
+                # US-Ticker — kein Suffix nötig, trotzdem schreiben damit Feld befüllt ist
+                yf_ticker = ticker
+            upsert_ticker_yf(cid, yf_ticker)
+            logger.info("ticker_yf: %s → %s (exchange=%s)", ticker, yf_ticker, exchange or "US")
+            written += 1
+
+        logger.info("ticker_yf Cron fertig — %d geschrieben", written)
+    except Exception as e:
+        logger.exception("ticker_yf Cron FEHLER: %s", e)
+
+
 async def _cron_scoring():
     """SC-01–SC-13 — Scoring-Engine Cron, täglich 07:30 UTC (nach Signal + Funding)."""
     try:
         from src.integrations.supabase import (
             fetch_companies, fetch_company_scores, upsert_company_scores,
-            fetch_signals, fetch_value_drivers,
+            fetch_signals, fetch_value_drivers, fetch_market_data,
         )
         from src.services.score_calculator import compute_all_scores
 
@@ -119,6 +174,7 @@ async def _cron_scoring():
             try:
                 signals_raw   = fetch_signals(cid, limit=50)
                 vd_cached     = fetch_value_drivers(cid)
+                market_data   = fetch_market_data(cid)  # BUG-40: market_data fehlte im Cron
                 vd_list: list[dict] = []
                 if vd_cached:
                     for key in ("enablers", "contributors", "buyers"):
@@ -128,6 +184,7 @@ async def _cron_scoring():
                     company=company,
                     signals=signals_raw,
                     value_drivers=vd_list,
+                    market_data=market_data,  # BUG-40
                 )
                 if upsert_company_scores(cid, result.to_dict()):
                     written += 1
@@ -172,7 +229,9 @@ async def lifespan(app):
             await _cron_signal_engine()          # 04:00 UTC — Signal + Patents
             await asyncio.sleep(30 * 60)
             await _cron_funding_enrichment()     # 04:30 UTC — Funding
-            await asyncio.sleep(30 * 60)
+            await asyncio.sleep(15 * 60)
+            await _cron_ticker_yf()              # 04:45 UTC — ticker_yf (BUG-42)
+            await asyncio.sleep(15 * 60)
             await _cron_buyer_enrichment()       # 05:00 UTC — Buyer
             await asyncio.sleep(30 * 60)
             await _cron_scoring()                # 05:30 UTC — Scoring

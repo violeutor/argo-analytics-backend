@@ -73,6 +73,7 @@ class ScoreResult:
     # SC-12: Inputs für Tooltip + Debugging
     confidence:          str = "auto"
     score_inputs:        dict = field(default_factory=dict)
+    score_source:        str = "algorithmic"   # BUG-41: war nie gesetzt
 
     def to_dict(self) -> dict:
         return {
@@ -93,6 +94,7 @@ class ScoreResult:
             "hero_path_label":    self.hero_path_label,
             "rating":             self.rating,
             "confidence":         self.confidence,
+            "score_source":       self.score_source,   # BUG-41
             "score_inputs":       self.score_inputs,
         }
 
@@ -1199,7 +1201,7 @@ def compute_all_scores(
         all_inputs["compound_risk"] = _crs_inputs
         logger.debug("SC-10 Compound Risk: %.2f", _crs)
     except Exception as e:
-        logger.warning("SC-10 Compound Risk failed: %s", e)
+        logger.warning("SC-10 Compound Risk failed for %s: %s", company.get("name", "?"), e, exc_info=True)
 
     # ── Path-Scores ─────────────────────────────────────────────────────────
     _run(result, "ipo_score",          lambda: compute_ipo_score(company, sigs),             all_inputs, "ipo",          "IPO")
