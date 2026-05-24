@@ -336,7 +336,15 @@ async def _fetch_wikipedia_management(company_name: str) -> list[dict]:
                 return []
 
             # Schritt 3: Infobox-Felder extrahieren
-            results.extend(_parse_infobox_people(wikitext, company_name))
+            # BUG-50: founding_year übergeben — Gründer alter Companies werden gefiltert
+            founding_year = None
+            fy_match = re.search(r"\|\s*founded\s*=.*?(\d{4})", wikitext, re.I)
+            if fy_match:
+                try:
+                    founding_year = int(fy_match.group(1))
+                except ValueError:
+                    pass
+            results.extend(_parse_infobox_people(wikitext, company_name, founding_year))
 
     except asyncio.TimeoutError:
         logger.debug("Wikipedia timeout for %s", company_name)
@@ -346,15 +354,25 @@ async def _fetch_wikipedia_management(company_name: str) -> list[dict]:
     return results
 
 
-def _parse_infobox_people(wikitext: str, company_name: str) -> list[dict]:
+def _parse_infobox_people(wikitext: str, company_name: str, founding_year: int | None = None) -> list[dict]:
     """
     Extrahiert Personen aus Wikipedia-Infobox-Feldern.
     Patterns: | founder = [[Name]] oder | key_people = Name (Role)
+
+    BUG-50: founder-Felder nur aufnehmen wenn Company jünger als ~20 Jahre.
+    Für alte Companies (Siemens 1847, BASF 1865 etc.) ist der Gründer kein
+    relevanter Ownership-Eintrag — nur aktuelles Management ist sinnvoll.
     """
     results: list[dict] = []
     seen: set[str] = set()
+    current_year = datetime.utcnow().year
+    company_is_old = founding_year is not None and (current_year - founding_year) > 20
 
     for field in _WIKI_PEOPLE_FIELDS:
+        # BUG-50: founder-Felder bei alten Companies überspringen
+        if company_is_old and field in ("founder", "founders", "gründer"):
+            continue
+
         # Infobox-Zeile: | field = value (bis zur nächsten Zeile mit |)
         pattern = rf"\|\s*{field}\s*=\s*([^\|{{}}]+?)(?=\n\s*\||\n\s*}}}})"
         matches = re.findall(pattern, wikitext, re.IGNORECASE | re.DOTALL)
@@ -631,7 +649,11 @@ async def enrich_ownership(
             logger.debug("BA-Bridge failed for %s: %s", company_name, e)
 
         # Fallback: Wikipedia Management-Extraktion
-        if not ba_success:
+        # BUG-50: listed Companies nicht via Wikipedia anreichern —
+        # Founders als Ownership-Einträge sind für börsennotierte Konzerne irrelevant.
+        # BA-Bridge oder North Data (Phase 3) sind die korrekten Quellen.
+        is_listed = (company.get("ipo_status") or "").lower() == "listed"
+        if not ba_success and not is_listed:
             logger.info("Ownership fallback via Wikipedia for %s (DE)", company_name)
             try:
                 wiki_entries = await asyncio.wait_for(
