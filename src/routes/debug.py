@@ -41,6 +41,81 @@ def _ts(iso: str | None) -> str | None:
         return iso
 
 
+def _fetch_beta_debug(company: dict) -> dict:
+    """
+    Holt Beta-Daten für den Debug-Block.
+    Listed Companies → BA-Bridge beta_cache (market beta).
+    Private Companies → Damodaran-Lookup via Bridge.
+    Fehler → leerer Block mit Fehlerinfo.
+    """
+    import os, httpx
+    bridge_url = os.getenv("BA_BRIDGE_URL", "")
+    bridge_key = os.getenv("BA_BRIDGE_API_KEY", os.getenv("API_KEY", ""))
+    base = {
+        "_source": "BA-Bridge · yfinance beta_cache (listed) / Damodaran (private)",
+        "_calculated_at": None,
+        "yf_ticker":     company.get("ticker_yf") or None,
+        "beta_source":   None,
+    }
+
+    if not bridge_url:
+        base["_error"] = "BA_BRIDGE_URL nicht gesetzt"
+        return base
+
+    ticker_yf = company.get("ticker_yf") or ""
+    ticker    = company.get("ticker") or ""
+    exchange  = company.get("exchange") or ""
+    category  = company.get("category") or company.get("industry") or ""
+    is_listed = company.get("ipo_status") == "listed"
+
+    try:
+        if is_listed and ticker:
+            # Market Beta aus beta_cache
+            resp = httpx.get(
+                f"{bridge_url}/beta/{ticker}",
+                params={"exchange": exchange, "ticker_yf": ticker_yf},
+                headers={"X-API-Key": bridge_key},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                d = resp.json()
+                base.update({
+                    "beta_source":          "market",
+                    "beta_1y":              d.get("beta_1y"),
+                    "beta_3y":              d.get("beta_3y"),
+                    "volatility_30d":       d.get("volatility_30d"),
+                    "benchmark_ticker":     d.get("benchmark_ticker"),
+                    "benchmark_is_fallback":d.get("benchmark_is_fallback"),
+                    "data_quality":         d.get("data_quality"),
+                    "_calculated_at":       _ts(d.get("calculated_at")),
+                })
+            else:
+                base["_error"] = f"Bridge HTTP {resp.status_code} — ticker_yf evtl. nicht gesetzt"
+        else:
+            # Damodaran Beta
+            resp = httpx.get(
+                f"{bridge_url}/beta/damodaran",
+                params={"category": category},
+                headers={"X-API-Key": bridge_key},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                d = resp.json()
+                base.update({
+                    "beta_source":      "damodaran",
+                    "damodaran_beta":   d.get("beta"),
+                    "damodaran_sector": d.get("sector"),
+                })
+            else:
+                base["_error"] = f"Damodaran Bridge HTTP {resp.status_code}"
+    except httpx.TimeoutException:
+        base["_error"] = "Bridge Timeout (>8s) — Dyno schläft?"
+    except Exception as e:
+        base["_error"] = f"Bridge Fehler: {e}"
+
+    return base
+
+
 @router.get("/company/{name}/debug")
 def get_company_debug(name: str) -> dict:
     """
@@ -219,4 +294,7 @@ def get_company_debug(name: str) -> dict:
             "patent_granted_ratio": _val(company.get("patent_granted_ratio")),
             "patent_ipc_codes":     _val(company.get("patent_ipc_codes")),
         },
+
+        # ── Block 12: Beta (BA-Bridge) ────────────────────────────────────────
+        "beta": _fetch_beta_debug(company),
     }

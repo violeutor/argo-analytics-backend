@@ -266,21 +266,30 @@ async def _fetch_wikipedia(company: str) -> dict:
                         # headquarters
                         if not out.get("headquarters"):
                             for pat in [
-                                r"\|\s*(?:headquarters|hq_location|location_city)\s*=\s*([^\|\n\]]{3,80})",
-                                r"\|\s*location\s*=\s*([^\|\n\]]{3,80})",
+                                r"\|\s*(?:headquarters|hq_location|location_city)\s*=\s*([^\|\n]{3,120})",
+                                r"\|\s*location\s*=\s*([^\|\n]{3,120})",
                             ]:
                                 m = re.search(pat, wikitext, re.I)
                                 if m:
                                     hq = m.group(1)
-                                    # Wikitext-Markup entfernen
-                                    hq = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", hq)
-                                    hq = re.sub(r"\{\{[^}]+\}\}", "", hq)
-                                    # <ref>...</ref> — geschlossen und nicht-geschlossen entfernen
+                                    # BUG-45: robuster Wikitext-Cleanup
+                                    # 1. {{X|[[Y]]}} → [[Y]] retten vor Template-Strip
+                                    hq = re.sub(r"\{\{\w[^|{}]*\|(\[\[[^\]]+\]\])\}\}", r"\1", hq)
+                                    # 2. Restliche Templates iterativ strippen (flagicon, nowrap etc.)
+                                    for _ in range(3):
+                                        hq = re.sub(r"\{\{[^{}]*\}\}", "", hq)
+                                    # 3. [[Link|Display]] → Display
+                                    hq = re.sub(r"\[\[[^\]|]+\|([^\]]+)\]\]", r"\1", hq)
+                                    # 4. [[Link]] → Link
+                                    hq = re.sub(r"\[\[([^\]]+)\]\]", r"\1", hq)
+                                    # 5. <ref>...</ref> — geschlossen und nicht-geschlossen
                                     hq = re.sub(r"<ref[^>]*>.*?</ref>", "", hq, flags=re.S)
                                     hq = re.sub(r"<ref[^>]*/?>.*", "", hq, flags=re.S)
                                     hq = re.sub(r"<[^>]+>", "", hq)
+                                    # 6. Rest-Klammern
+                                    hq = re.sub(r"[\[\]\{\}]", "", hq)
                                     hq = hq.strip(" ,\n")
-                                    if hq and len(hq) < 60:
+                                    if hq and len(hq) < 80:
                                         out["headquarters"] = hq
                                     break
 

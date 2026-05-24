@@ -105,9 +105,10 @@ class ScoreResult:
 _ETF_COVERED_CATEGORIES = {
     "solar", "wind", "battery", "ev", "hydrogen", "carbon-capture",
     "energy-storage", "smart-grid", "climate-tech", "cleantech",
-    "industrial-tech", "semiconductor", "biotech", "ai", "cloud",
+    "industrial-tech", "industrial", "semiconductor", "biotech", "ai", "cloud",
     "space", "aerospace", "nuclear", "geothermal", "agri-tech",
     "heat-pump", "electrolysis", "fuel-cell", "direct-air-capture",
+    "automation", "software", "saas", "infrastructure", "logistics",
 }
 
 # Sektoren wo Patent-Tiefe den tech_readiness-Score beeinflusst (SE-14).
@@ -732,7 +733,8 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
     inputs: dict = {}
     score = 0.0
 
-    is_listed = bool(company.get("ticker"))
+    # BUG-44: ipo_status verwenden, nicht bool(ticker) — ticker kann auch bei privaten gesetzt sein
+    is_listed = company.get("ipo_status") == "listed"
     category  = (company.get("category") or "").lower()
     industry  = (company.get("industry") or "").lower()
     tr        = float(company.get("tech_readiness") or 0.5)
@@ -905,13 +907,20 @@ def derive_rating(hero_score: float | None, composite_score: float | None) -> st
 
     Primär: hero_score (path-kontextuelles Urteil).
     Fallback: composite_score (wenn kein hero vorhanden).
+    Tiebreaker (BUG-44): wenn hero_score > 1.5 unter composite_score,
+    composite_score verwenden — verhindert dass ein schwacher Hero-Path
+    das Rating nach unten zieht (typisch: listed Companies ohne M&A-/IPO-Relevanz).
 
     A (No-Brainer)    ≥ 7.5
     B (Interessant)   ≥ 5.5
     C (Beobachten)    ≥ 3.5
     D (Uninteressant) < 3.5
     """
-    ref = hero_score if hero_score is not None else composite_score
+    if hero_score is not None and composite_score is not None:
+        # Tiebreaker: composite gewinnt wenn Hero deutlich schlechter
+        ref = composite_score if (composite_score - hero_score) > 1.5 else hero_score
+    else:
+        ref = hero_score if hero_score is not None else composite_score
     if ref is None:
         return None
     if ref >= 7.5: return "A"
