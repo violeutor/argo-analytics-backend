@@ -464,6 +464,25 @@ def compute_competition_score(
     if top_names:
         note += f" Erwähnte Player: {', '.join(top_names[:3])}."
 
+    # ── 1b. BUG-46: peers_context als Score-Korrektiv wenn DDG-Signale schwach ─
+    # peers_context kommt aus peers_resolved — echte, angereicherte Wettbewerber.
+    # Wenn DDG < 6 Signale aber ≥ 3 Peers bekannt → Score mindestens "medium".
+    # Wenn ≥ 5 Peers bekannt → Score mindestens "high".
+    if peers_context and result_count < 12:
+        peer_count = len(peers_context)
+        if peer_count >= 5 and score == "low":
+            score = "high"
+            note = (
+                f"Hohe Wettbewerbsintensität — {peer_count} bekannte Wettbewerber"
+                f" (DDG-Signale schwach: {result_count})."
+            )
+        elif peer_count >= 3 and score == "low":
+            score = "medium"
+            note = (
+                f"Moderate Wettbewerbsintensität — {peer_count} bekannte Wettbewerber"
+                f" (DDG-Signale schwach: {result_count})."
+            )
+
     # ── 2. R-22: Peer Positioning Notes als direkter Wettbewerbs-Kontext ─────
     if peers_context:
         peer_notes = [

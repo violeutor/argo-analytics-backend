@@ -1635,6 +1635,39 @@ async def run_signal_engine(
                 sum(1 for e in company_events if e.direction == "negative"),
                 sum(1 for e in company_events if e.direction == "neutral"),
             )
+
+            # SE-16: ipo_status_change → sofort companies.ipo_status aktualisieren
+            # Keine Verzögerung — Status-Update hat immer Prio vor Signal-Persist.
+            ipo_events = [
+                e for e in company_events
+                if e.event_type == "ipo_status_change" and e.direction == "positive"
+            ]
+            if ipo_events and cid:
+                # Neueste Event bestimmen
+                latest_ipo = max(ipo_events, key=lambda e: e.event_date)
+                raw_title  = (latest_ipo.raw_title or "").lower()
+                # Neuen Status aus Event ableiten
+                if any(k in raw_title for k in ("s-1", "files s-1", "ipo filing", "going public", "spac")):
+                    new_ipo_status = "pre_ipo"
+                elif any(k in raw_title for k in ("began trading", "started trading", "listed on", "debut", "ipo priced")):
+                    new_ipo_status = "listed"
+                else:
+                    new_ipo_status = "pre_ipo"   # konservativer Default bei unklarem Signal
+
+                # Nur updaten wenn Status sich ändert
+                current_status = (company.get("ipo_status") or "").lower()
+                if new_ipo_status != current_status:
+                    try:
+                        from src.integrations.supabase import upsert_company_enrichment
+                        upsert_company_enrichment(cid, {"ipo_status": new_ipo_status})
+                        logger.info(
+                            "SE-16: %s ipo_status %s → %s (source=%s, title=%s)",
+                            cname, current_status or "—", new_ipo_status,
+                            latest_ipo.source, latest_ipo.raw_title,
+                        )
+                    except Exception as e:
+                        logger.warning("SE-16: ipo_status update failed for %s: %s", cname, e)
+
             all_events.extend(company_events)
 
     return all_events, all_patents
