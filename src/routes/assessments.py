@@ -124,10 +124,15 @@ def _build_narrative_context(
     dimension_scores: dict,
 ) -> str:
     """Baut strukturierten Kontext für Claude-Narrativ-Prompt."""
+    # BUG-51: funding_stage für listed Companies normalisieren
+    is_listed = (company.get("ipo_status") == "listed") or bool(company.get("ticker"))
+    funding_stage = "public" if is_listed else (company.get("funding_stage") or "—")
+
     lines = [
         f"COMPANY: {company.get('name')}",
         f"Category: {company.get('category') or company.get('industry') or '—'}",
-        f"Stage: {company.get('funding_stage') or '—'}",
+        f"Stage: {funding_stage}",
+        f"Listed: {'Yes — publicly traded' if is_listed else 'No — private company'}",
         f"Funding total: {company.get('funding_total_usd_mn') or '—'} USD mn",
         f"HQ: {company.get('headquarters') or '—'}",
         f"IPO status: {company.get('ipo_status') or '—'}",
@@ -183,6 +188,8 @@ def _build_narrative_context(
 SYSTEM_PROMPT = """You are a factual M&A and investment analysis engine.
 You explain pre-computed algorithmic scores for professional investors (VC, PE, M&A, Corporate, Asset Manager).
 No marketing language. Only facts, evidence-based context, and concise notes.
+If the company is publicly listed (Stage: public / Listed: Yes), focus financials notes on revenue, margins,
+market cap context and earnings signals — NOT on funding rounds or stage risk.
 Respond ONLY with valid JSON. No preamble, no explanation, no markdown fences."""
 
 USER_PROMPT_TEMPLATE = """The following algorithmic scores have been computed for {company_name}.
@@ -190,10 +197,11 @@ Your task: write concise factual notes explaining WHY each score is what it is.
 Do NOT change the scores. Do NOT invent numbers. Only explain with available evidence.
 
 If confidence="low" for a dimension, explicitly state: "Insufficient data — score reflects sector baseline."
+If the company is publicly listed, adapt financials notes to public market context (margins, EV, earnings).
 
 Dimensions to annotate:
 1. market — market size, growth, competitive dynamics
-2. financials — funding health, stage risk, financial signals
+2. financials — for private: funding health, stage risk, financial signals / for listed: revenue, margins, earnings signals
 3. strategy — competitive positioning, peer landscape, strategic signals
 4. political — regulatory environment, policy signals
 5. technology — tech readiness, IP position, innovation signals

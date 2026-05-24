@@ -106,6 +106,7 @@ class EnrichmentResult:
     employee_count: str | None = None
     ticker: str | None = None      # EN-06: Börsen-Ticker aus Wikipedia-Infobox
     exchange: str | None = None    # EN-06: Börsenplatz aus Wikipedia-Infobox
+    ipo_status: str | None = None  # BUG-47: "listed" | "private" aus Wikipedia-Infobox
     category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     crunchbase: CrunchbaseData | None = None
@@ -323,8 +324,8 @@ async def _fetch_wikipedia(company: str) -> dict:
                                         out["website"] = "https://" + url
                                     break
 
-                        # ticker + exchange (EN-06) — nur für listed companies
-                        # Infobox-Felder: traded_as, stock_code, symbol, nasdaq, nyse, …
+                        # ticker + exchange (EN-06)
+                        # BUG-47: entkoppelt von is_listed — Ticker-Vorhandensein impliziert listed
                         if not out.get("ticker"):
                             # Muster 1: | traded_as = {{NASDAQ|FRVO}} oder {{NYSE|CRH}}
                             m = re.search(
@@ -362,6 +363,28 @@ async def _fetch_wikipedia(company: str) -> dict:
                                 raw_ex = re.sub(r"\[\[([^\|]+\|)?([^\]]+)\]\]", r"\2", raw_ex).strip()
                                 if raw_ex and len(raw_ex) < 30:
                                     out["exchange"] = raw_ex
+
+                        # BUG-47: ipo_status aus Infobox-Typ-Feld
+                        # | type = Public company / Private company / Subsidiary / Non-profit
+                        if not out.get("ipo_status"):
+                            m = re.search(
+                                r"\|\s*type\s*=\s*([^\|\n]{3,60})",
+                                wikitext, re.I,
+                            )
+                            if m:
+                                raw_type = m.group(1).lower()
+                                # Wikitext-Markup entfernen
+                                raw_type = re.sub(r"\[\[([^\]|]+\|)?([^\]]+)\]\]", r"\2", raw_type)
+                                raw_type = re.sub(r"\{\{[^}]+\}\}", "", raw_type).strip()
+                                if "public" in raw_type:
+                                    out["ipo_status"] = "listed"
+                                elif "private" in raw_type or "privately" in raw_type:
+                                    out["ipo_status"] = "private"
+                                elif "subsidiary" in raw_type:
+                                    out["ipo_status"] = "private"
+                            # Fallback: Ticker vorhanden → listed
+                            if not out.get("ipo_status") and out.get("ticker"):
+                                out["ipo_status"] = "listed"
             except Exception as e:
                 logger.debug("Wikipedia Wikitext fallback failed for '%s': %s", company, e)
 
@@ -938,7 +961,7 @@ JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
                     "anthropic-version": "2023-06-01",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "claude-haiku-4-5-20251001",   # COST-01: Haiku für Kategorie-Inferenz
                     "max_tokens": 80,
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -1142,10 +1165,16 @@ async def enrich_company(
         result.founded_year   = wiki.get("founded_year")
         result.headquarters   = wiki.get("headquarters")
         result.employee_count = wiki.get("employee_count")
-        # EN-06: Ticker + Exchange nur für börsennotierte Companies
-        if is_listed:
-            result.ticker   = wiki.get("ticker")
-            result.exchange = wiki.get("exchange")
+        # BUG-47: ipo_status aus Wikipedia-Infobox (type-Feld + traded_as)
+        # Ticker-Extraktion entkoppelt von is_listed — Ticker impliziert listed
+        result.ipo_status = wiki.get("ipo_status")
+        result.ticker     = wiki.get("ticker")
+        result.exchange   = wiki.get("exchange")
+        # is_listed aktualisieren wenn Wikipedia es klar sagt
+        if result.ipo_status == "listed" or result.ticker:
+            is_listed = True
+        elif result.ipo_status == "private":
+            is_listed = False
 
     if isinstance(cb, CrunchbaseData):
         result.crunchbase     = cb

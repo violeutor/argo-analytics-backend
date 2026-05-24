@@ -86,7 +86,7 @@ Rules:
                     "anthropic-version": "2023-06-01",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "claude-haiku-4-5-20251001",   # COST-01: Haiku für Market-Extraktion
                     "max_tokens": 600,
                     "messages": [{"role": "user", "content": prompt}],
                 },
