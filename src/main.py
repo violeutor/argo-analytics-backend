@@ -21,6 +21,63 @@ from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
+async def _cron_rolling_refresh():
+    """
+    ARCH-02: Rolling Background Refresh — strukturelle Daten monatlich rotierend.
+    Läuft stündlich, 55 Companies pro Run → ~1.333/Tag → alle 30 Tage vollständig.
+    Sortierung: enriched_at IS NULL zuerst, dann älteste zuerst.
+    Signal Engine bleibt für zeitkritische Events (Funding, News, Patents, IPO-Status).
+    """
+    try:
+        from src.integrations.supabase import (
+            fetch_companies_for_rolling_refresh,
+            upsert_company_enrichment,
+            set_enrichment_status,
+        )
+        from src.services.enrichment import enrich_company
+
+        companies = fetch_companies_for_rolling_refresh(batch_size=55)
+        if not companies:
+            logger.debug("Rolling Refresh: Queue leer — alle Companies frisch genug")
+            return
+
+        logger.info("Rolling Refresh gestartet — %d Companies", len(companies))
+        refreshed = 0
+
+        for company in companies:
+            cid  = company.get("id")
+            name = company.get("name", "")
+            if not cid or not name:
+                continue
+            try:
+                enrichment = await enrich_company(
+                    company_name=name,
+                    company_record=company,
+                )
+                payload = {
+                    "founding_year": enrichment.founded_year,
+                    "headquarters":  enrichment.headquarters or None,
+                    "headcount":     enrichment.employee_count or None,
+                    "description":   enrichment.description or None,
+                    "website":       enrichment.website or None,
+                }
+                upsert_company_enrichment(cid, payload)   # schreibt auch enriched_at wenn payload nicht leer
+                # ARCH-02: enriched_at immer schreiben — auch wenn Enrichment leer war
+                # verhindert stündliche Retry-Loops für Companies ohne Wikipedia-Artikel
+                from datetime import datetime, timezone as tz
+                get_supabase().table("companies").update(
+                    {"enriched_at": datetime.now(tz.utc).isoformat()}
+                ).eq("id", cid).execute()
+                refreshed += 1
+                await asyncio.sleep(1.0)   # sanftes Rate-Limiting — kein Wikipedia-Burst
+            except Exception as ce:
+                logger.warning("Rolling Refresh: '%s' failed — %s", name, ce)
+
+        logger.info("Rolling Refresh fertig — %d/%d Companies aktualisiert", refreshed, len(companies))
+    except Exception as e:
+        logger.exception("Rolling Refresh FEHLER: %s", e)
+
+
 async def _cron_signal_engine():
     """SE-01 + SE-14 — Signal-Engine Cron, täglich 04:00 UTC."""
     try:
@@ -236,9 +293,18 @@ async def lifespan(app):
             await asyncio.sleep(30 * 60)
             await _cron_scoring()                # 05:30 UTC — Scoring
 
-    cron_task = asyncio.create_task(_schedule_cron())
+    async def _schedule_rolling_refresh():
+        """ARCH-02: Stündlicher Rolling Refresh — unabhängig vom täglichen Cron."""
+        await asyncio.sleep(5 * 60)   # 5min nach Start warten — DB-Verbindung sicher offen
+        while True:
+            await _cron_rolling_refresh()
+            await asyncio.sleep(60 * 60)   # 1h warten bis zum nächsten Run
+
+    cron_task    = asyncio.create_task(_schedule_cron())
+    rolling_task = asyncio.create_task(_schedule_rolling_refresh())
     yield
     cron_task.cancel()
+    rolling_task.cancel()
 
 
 app = FastAPI(
