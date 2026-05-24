@@ -623,16 +623,56 @@ async def enrich_ownership(
     # Bereits vorhandene Namen — keine Duplikate
     existing_names = {e.get("name", "").lower() for e in existing_entries}
 
-    # EN-08: Listed Companies → Yahoo institutional_holders (Prio über EDGAR/BA)
-    # BUG-50: Keine Wikipedia-Founders für börsennotierte Companies
+    # Listed Companies — EN-07/EN-08
+    # BUG-50: Keine Wikipedia-Founders für börsennotierte Companies.
+    # Quellen-Hierarchie:
+    #   US listed  → EDGAR SC 13G/13D (EN-07, gov API, kein CAPTCHA) → Yahoo Fallback (EN-08)
+    #   DE listed  → BaFin Cron schreibt direkt in ownership_entries (EN-07)
+    #                → Yahoo Fallback ad-hoc beim ersten Aufruf vor dem Cron (EN-08)
+    #   other      → Yahoo (EN-08)
     is_listed = (company.get("ipo_status") or "").lower() == "listed"
 
     if is_listed:
         ticker_yf = company.get("ticker_yf") or company.get("ticker")
-        if ticker_yf:
+
+        # EN-07: EDGAR SC 13G/13D — primary für listed US (gov API, kein CAPTCHA-Risiko)
+        if region == "US":
             logger.info(
-                "Ownership enrichment via Yahoo institutional for %s (listed, ticker=%s)",
-                company_name, ticker_yf,
+                "Ownership enrichment via EDGAR SC 13G/13D for %s (listed US)",
+                company_name,
+            )
+            try:
+                edgar_entries = await asyncio.wait_for(
+                    _edgar_fulltext_investors(company_name), timeout=15.0
+                )
+                for e in edgar_entries:
+                    if e.get("name", "").lower() not in existing_names:
+                        new_entries.append(e)
+                        existing_names.add(e["name"].lower())
+                if new_entries:
+                    source_used = "edgar_sc13g"
+                    logger.info(
+                        "EDGAR SC 13G/13D: %d Investoren für %s (listed US)",
+                        len(new_entries), company_name,
+                    )
+            except asyncio.TimeoutError:
+                logger.debug("EDGAR SC 13G/13D timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("EDGAR SC 13G/13D failed for %s: %s", company_name, e)
+
+        # EN-07: DE listed → BaFin-Cron (bafin_ownership.py, 03:15 UTC) schreibt
+        # direkt in ownership_entries — kein ad-hoc BaFin-Call nötig.
+        # Beim ersten Aufruf vor dem Cron: Yahoo-Fallback unten greift.
+
+        # EN-08: Yahoo institutional_holders — Fallback für alle listed Companies
+        # US:    wenn EDGAR leer (kein SC 13G/13D Filing gefunden)
+        # DE:    immer als ad-hoc Erstbefüllung vor BaFin-Cron
+        # other: immer
+        if not new_entries and ticker_yf:
+            logger.info(
+                "Ownership fallback via Yahoo institutional for %s "
+                "(listed, ticker=%s, region=%s)",
+                company_name, ticker_yf, region,
             )
             try:
                 from src.config import settings as argo_settings
@@ -650,14 +690,14 @@ async def enrich_ownership(
                     if new_entries:
                         source_used = "yahoo_institutional"
                 else:
-                    logger.debug("BA-Bridge nicht konfiguriert — kein Yahoo-Ownership-Call")
+                    logger.debug("BA-Bridge nicht konfiguriert — kein Yahoo-Ownership-Fallback")
             except asyncio.TimeoutError:
                 logger.debug("Yahoo ownership timeout for %s", company_name)
             except Exception as e:
                 logger.debug("Yahoo ownership failed for %s: %s", company_name, e)
-        else:
+        elif not ticker_yf:
             logger.debug(
-                "Listed Company %s ohne ticker_yf/ticker — kein Yahoo-Ownership-Call",
+                "Listed Company %s ohne ticker_yf/ticker — kein Ownership-Fallback möglich",
                 company_name,
             )
 
