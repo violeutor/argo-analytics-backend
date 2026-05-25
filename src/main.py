@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -376,6 +376,13 @@ app.include_router(peers_router)
 app.include_router(kpi_router)
 app.include_router(assessments_router)
 app.include_router(debug_router)
+
+
+@app.post("/internal/edgar-kpi/trigger")
+async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
+    """Manueller Trigger für _cron_edgar_kpi (Testing/Debugging)."""
+    background_tasks.add_task(_cron_edgar_kpi)
+    return {"status": "triggered", "job": "_cron_edgar_kpi"}
 
 
 @app.get("/health")
