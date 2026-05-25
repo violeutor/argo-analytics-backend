@@ -347,17 +347,36 @@ def fetch_ownership_entries(company_id: str) -> list[dict]:
         return []
 
 
-def upsert_ownership_entries(company_id: str, entries: list[dict]) -> int:
+def upsert_ownership_entries(
+    company_id: str,
+    entries: list[dict],
+    company_name: str = "",
+) -> int:
     """
     EN-08: Schreibt Ownership-Einträge in ownership_entries.
     Deduplication obliegt dem Aufrufer (enrich_ownership filtert bereits via existing_names).
     Felder ohne DB-Spalte (notes) werden gefiltert — Schema: name, type, role,
     share_pct, source, as_of_date.
 
+    BUG-53: Self-reference-Filter — Einträge wo name == company_name (normalisiert,
+    Rechtsform-Suffixe gestripped) werden übersprungen. company_name optional.
+
     Gibt Anzahl erfolgreich geschriebener Rows zurück.
     """
     if not entries:
         return 0
+
+    # BUG-53: Normalisierung für Self-Reference-Vergleich
+    _LEGAL_SUFFIXES = {
+        "ag", "gmbh", "se", "kg", "ohg", "gbr", "plc", "llc", "llp",
+        "inc", "corp", "ltd", "sa", "sas", "bv", "nv", "ab", "oy",
+    }
+
+    def _normalize(s: str) -> str:
+        parts = s.lower().strip().split()
+        return " ".join(p for p in parts if p not in _LEGAL_SUFFIXES)
+
+    _co_norm = _normalize(company_name) if company_name else ""
 
     _ALLOWED_FIELDS = {"name", "type", "role", "share_pct", "source", "as_of_date"}
     db      = get_supabase()
@@ -366,6 +385,12 @@ def upsert_ownership_entries(company_id: str, entries: list[dict]) -> int:
     for entry in entries:
         name = (entry.get("name") or "").strip()
         if not name:
+            continue
+        # BUG-53: Self-Reference überspringen
+        if _co_norm and _normalize(name) == _co_norm:
+            logger.debug(
+                "upsert_ownership_entries skip self-ref '%s' für %s", name, company_id
+            )
             continue
         payload = {k: v for k, v in entry.items() if k in _ALLOWED_FIELDS and v is not None}
         payload["company_id"] = company_id
