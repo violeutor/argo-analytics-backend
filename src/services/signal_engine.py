@@ -74,6 +74,8 @@ class SignalEvent:
         "direction", "signal_category",
         # Session 10: Qualität + Deduplizierung + B-05
         "source_domain", "relevance_score", "funding_amount_usd_mn",
+        # SE-17: Multi-Source Aggregation
+        "source_count", "source_names",
     )
 
     def __init__(
@@ -92,6 +94,8 @@ class SignalEvent:
         source_domain: str | None = None,
         relevance_score: float | None = None,
         funding_amount_usd_mn: float | None = None,
+        source_count: int = 1,
+        source_names: list[str] | None = None,
     ):
         self.company_id            = company_id
         self.company_name          = company_name
@@ -107,6 +111,8 @@ class SignalEvent:
         self.source_domain         = source_domain or _extract_domain(source_url)
         self.relevance_score       = relevance_score
         self.funding_amount_usd_mn = funding_amount_usd_mn
+        self.source_count          = source_count
+        self.source_names          = source_names or [source]
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +129,8 @@ class SignalEvent:
             "source_domain":         self.source_domain,
             "relevance_score":       self.relevance_score,
             "funding_amount_usd_mn": self.funding_amount_usd_mn,
+            "source_count":          self.source_count,
+            "source_names":          self.source_names,
         }
 
 
@@ -226,6 +234,62 @@ def _parse_rss_date(pub_date: str | None) -> date:
             continue
     logger.debug("_parse_rss_date: konnte '%s' nicht parsen — verwende today()", pub_date)
     return date.today()
+
+
+def _aggregate_events(events: list[SignalEvent]) -> list[SignalEvent]:
+    """
+    SE-17: Multi-Source Signal Aggregation.
+    Gruppiert Events nach (company_id, event_type, 3-Tage-Bucket) und
+    merged Duplikate aus verschiedenen Quellen zu einem aggregierten Signal.
+
+    Trigger: Siemens-Italtech-Akquisition kam via EDGAR + Google News + TechCrunch
+    dreifach rein — jetzt ein Event mit source_count=3 + gewichtetem relevance_score.
+
+    Formel: relevance_score = base × min(2.0, 1.0 + source_count × 0.33)
+      source_count=1 → ×1.33  |  source_count=2 → ×1.66
+      source_count=3 → ×1.99  |  source_count=4+ → ×2.0 (Cap)
+    """
+    from collections import defaultdict
+
+    def _bucket(d: date) -> int:
+        """3-Tage-Bucket — Events innerhalb von ±3 Tagen landen im gleichen Bucket."""
+        return (d - date(2020, 1, 1)).days // 3
+
+    groups: dict[tuple, list[SignalEvent]] = defaultdict(list)
+    for ev in events:
+        key = (ev.company_id, ev.event_type, _bucket(ev.event_date))
+        groups[key].append(ev)
+
+    merged: list[SignalEvent] = []
+    for group in groups.values():
+        if len(group) == 1:
+            ev = group[0]
+            if ev.relevance_score is not None:
+                ev.relevance_score = round(ev.relevance_score * 1.33, 3)
+            merged.append(ev)
+            continue
+
+        # Bestes Event als Basis (höchster relevance_score)
+        base = max(group, key=lambda e: e.relevance_score or 0.0)
+        source_count  = len(group)
+        base_score    = base.relevance_score or 0.6
+        base.relevance_score = round(
+            base_score * min(2.0, 1.0 + source_count * 0.33), 3
+        )
+        base.source_count = source_count
+        base.source_names = list(dict.fromkeys(
+            s for ev in group for s in (ev.source_names or [ev.source])
+        ))
+        if source_count > 1 and base.summary:
+            base.summary = f"[{source_count} Quellen] {base.summary}"
+        merged.append(base)
+
+    logger.info(
+        "SE-17 Aggregation: %d events → %d aggregiert (%.0f%% Reduktion)",
+        len(events), len(merged),
+        (1 - len(merged) / len(events)) * 100 if events else 0,
+    )
+    return merged
 
 
 # ── SE-09/SE-11/SE-12: Keyword-basierte Direction + Category (Fallback) ──────
@@ -1696,6 +1760,9 @@ async def run_signal_engine(
                         logger.warning("SE-16: ipo_status update failed for %s: %s", cname, e)
 
             all_events.extend(company_events)
+
+    # SE-17: Multi-Source Aggregation — vor dem Return deduplizieren
+    all_events = _aggregate_events(all_events)
 
     return all_events, all_patents
 

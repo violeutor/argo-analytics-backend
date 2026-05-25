@@ -607,6 +607,8 @@ def upsert_signals(events: list[dict]) -> int:
                 "source_domain":         event.get("source_domain"),
                 "relevance_score":       event.get("relevance_score"),
                 "funding_amount_usd_mn": event.get("funding_amount_usd_mn"),
+                "source_count":          event.get("source_count", 1),
+                "source_names":          event.get("source_names") or [],
             }
             db.table("signals").upsert(
                 payload,
