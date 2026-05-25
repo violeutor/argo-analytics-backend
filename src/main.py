@@ -33,6 +33,7 @@ async def _cron_rolling_refresh():
             fetch_companies_for_rolling_refresh,
             upsert_company_enrichment,
             set_enrichment_status,
+            get_supabase,
         )
         from src.services.enrichment import enrich_company
 

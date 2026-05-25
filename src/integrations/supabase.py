@@ -416,13 +416,31 @@ def fetch_value_drivers(company_id: str) -> dict | None:
     """
     Gibt Value Drivers aus value_drivers-Tabelle zurück.
     Erwartet eine Row mit JSONB-Feldern: enablers, contributors, etfs, enriched_at.
+
+    BUG-56: upsert_value_drivers schreibt via json.dumps() — Supabase/postgrest gibt
+    JSONB-Felder je nach Konfiguration als String zurück. Felder werden hier
+    zurückgeparst damit compute_dimension_risks() Dicts statt Strings bekommt.
     """
+    import json as _json
     db = get_supabase()
     try:
         result = db.table("value_drivers").select(
             "enablers, contributors, etfs, enriched_at"
         ).eq("company_id", company_id).limit(1).execute()
-        return result.data[0] if result.data else None
+        if not result.data:
+            return None
+        row = result.data[0]
+        # JSON-Strings zurück zu Python-Listen parsen (BUG-56)
+        for field in ("enablers", "contributors", "etfs"):
+            val = row.get(field)
+            if isinstance(val, str):
+                try:
+                    row[field] = _json.loads(val)
+                except (_json.JSONDecodeError, TypeError):
+                    row[field] = []
+            elif val is None:
+                row[field] = []
+        return row
     except Exception as e:
         logger.warning("fetch_value_drivers failed for %s: %s", company_id, e)
         return None

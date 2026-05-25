@@ -201,6 +201,33 @@ def _name_in_text(company_name: str, text: str) -> bool:
     return False
 
 
+def _parse_rss_date(pub_date: str | None) -> date:
+    """
+    Parst RSS pubDate-Strings zu einem date-Objekt.
+    Unterstützt RFC-2822 ("Mon, 25 May 2026 04:00:00 +0000") und ISO-8601.
+    Gibt date.today() zurück wenn pub_date None oder nicht parsebar ist.
+
+    BUG-55: Funktion war versehentlich aus signal_engine.py entfernt worden.
+    Wird intern (Google News, TechCrunch) und von funding_enrichment.py genutzt.
+    """
+    if not pub_date:
+        return date.today()
+    _RFC_FORMATS = (
+        "%a, %d %b %Y %H:%M:%S %z",   # RFC-2822 mit Timezone
+        "%a, %d %b %Y %H:%M:%S",       # RFC-2822 ohne Timezone
+        "%Y-%m-%dT%H:%M:%S%z",         # ISO-8601 mit Timezone
+        "%Y-%m-%dT%H:%M:%S",           # ISO-8601 ohne Timezone
+        "%Y-%m-%d",                     # Einfaches Datum
+    )
+    for fmt in _RFC_FORMATS:
+        try:
+            return datetime.strptime(pub_date.strip(), fmt).date()
+        except ValueError:
+            continue
+    logger.debug("_parse_rss_date: konnte '%s' nicht parsen — verwende today()", pub_date)
+    return date.today()
+
+
 # ── SE-09/SE-11/SE-12: Keyword-basierte Direction + Category (Fallback) ──────
 
 # Potenzial-Signale: direction=positive
