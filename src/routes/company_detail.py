@@ -606,51 +606,109 @@ async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
     return {}
 
 
-async def _fetch_bridge_fundamentals(symbol: str) -> dict:
+async def _fetch_yf_fundamentals(symbol: str) -> dict:
     """
-    YH-08 · Fundamentals via BA-Bridge /yahoo/fundamentals/{ticker}.
-    Bridge nutzt yfinance — kostenlos, kein Plan-Upgrade nötig.
-    Suffix-Fallback: .DE → .F für Frankfurt-Listings (yfinance Abdeckung variiert).
-    Gibt leeres dict zurück bei Fehler — kein Hard-Fail.
-    """
-    if not settings.ba_bridge_url:
-        logger.debug("BA-Bridge nicht konfiguriert — kein Fundamentals-Call")
-        return {}
+    YH-08 · Direkter yfinance-Aufruf im Argo Backend — kein Bridge-Hop.
 
-    # Suffix-Fallback: wenn .DE kein Ergebnis → .F versuchen (und umgekehrt)
+    Architektur-Entscheidung: Bridge nur für beta_cache (Kursverlauf-Buffering).
+    Fundamentals brauchen kein Caching — on-demand, 1 Call pro Lookup.
+
+    Strategie:
+      fast_info → Preis, Marktcap, 52W (zuverlässig, ~0.3s)
+      .info     → Revenue, EBITDA, Margen, Multiples (~2–6s, kann {} sein)
+    Suffix-Fallback: .DE → .F für Frankfurt-Listings (yfinance Abdeckung variiert).
+    Timeout 8s — asyncio.to_thread (yfinance ist synchron).
+    """
+    import yfinance as yf
+
     candidates = [symbol]
     if symbol.endswith(".DE"):
         candidates.append(symbol[:-3] + ".F")
     elif symbol.endswith(".F"):
         candidates.append(symbol[:-2] + ".DE")
 
-    try:
-        timeout = httpx.Timeout(10.0, connect=3.0)
-        headers = {"X-API-Key": settings.ba_bridge_api_key}
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            for sym in candidates:
-                resp = await client.get(f"{settings.ba_bridge_url}/yahoo/fundamentals/{sym}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    logger.info(
-                        "BRIDGE_FUNDAMENTALS OK: %s rev=%.1fBn margin=%.1f%%",
-                        sym,
-                        data.get("revenue_bn") or 0,
-                        data.get("gross_margin_pct") or 0,
-                    )
-                    return data
-                logger.warning("BRIDGE_FUNDAMENTALS HTTP %s for %s", resp.status_code, sym)
-    except Exception as e:
-        logger.warning("BRIDGE_FUNDAMENTALS failed for %s: %s", symbol, e)
+    def _pct(v) -> float | None:
+        return round(v * 100, 2) if v is not None else None
+
+    def _bn(v) -> float | None:
+        return round(v / 1e9, 3) if v else None
+
+    def _sync_fetch(sym: str) -> dict:
+        try:
+            t    = yf.Ticker(sym)
+            fi   = t.fast_info          # zuverlässig, schnell
+            info = t.info or {}         # langsamer, kann {} sein
+
+            # fast_info: Preis-Check — wenn kein Preis → Ticker unbekannt
+            price      = getattr(fi, "last_price",   None)
+            market_cap = getattr(fi, "market_cap",   None)
+            currency   = getattr(fi, "currency",     None)
+            w52_high   = getattr(fi, "year_high",    None)
+            w52_low    = getattr(fi, "year_low",     None)
+
+            if not price and not info.get("regularMarketPrice"):
+                return {}
+
+            out: dict = {
+                "ticker":               sym,
+                "price":                price or info.get("regularMarketPrice"),
+                "market_cap_bn":        _bn(market_cap or info.get("marketCap")),
+                "currency":             currency or info.get("currency"),
+                "week_52_high":         w52_high or info.get("fiftyTwoWeekHigh"),
+                "week_52_low":          w52_low  or info.get("fiftyTwoWeekLow"),
+                "pe_ratio":             info.get("trailingPE"),
+                "revenue_bn":           _bn(info.get("totalRevenue")),
+                "ebitda_bn":            _bn(info.get("ebitda")),
+                "gross_margin_pct":     _pct(info.get("grossMargins")),
+                "operating_margin_pct": _pct(info.get("operatingMargins")),
+                "profit_margin_pct":    _pct(info.get("profitMargins")),
+                "revenue_growth_pct":   _pct(info.get("revenueGrowth")),
+                "earnings_growth_pct":  _pct(info.get("earningsGrowth")),
+                "free_cashflow_bn":     _bn(info.get("freeCashflow")),
+                "operating_cashflow_bn":_bn(info.get("operatingCashflow")),
+            }
+
+            ev    = info.get("enterpriseValue")
+            rev   = info.get("totalRevenue")
+            ebitda= info.get("ebitda")
+            debt  = info.get("totalDebt")
+            out["enterprise_value_bn"] = _bn(ev)
+            if ev and rev:           out["ev_revenue"]  = round(ev / rev, 1)
+            if ev and ebitda:        out["ev_ebitda"]   = round(ev / ebitda, 1)
+            if debt and ebitda:      out["debt_ebitda"] = round((debt / 1e9) / (ebitda / 1e9), 2)
+
+            return out
+        except Exception as e:
+            logger.debug("_fetch_yf_fundamentals sync failed for %s: %s", sym, e)
+            return {}
+
+    for sym in candidates:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_sync_fetch, sym),
+                timeout=8.0,
+            )
+            if result.get("price") or result.get("revenue_bn"):
+                logger.info(
+                    "YF_FUNDAMENTALS OK: %s rev=%.1fBn price=%s",
+                    sym, result.get("revenue_bn") or 0, result.get("price"),
+                )
+                return result
+        except asyncio.TimeoutError:
+            logger.warning("_fetch_yf_fundamentals timeout for %s", sym)
+        except Exception as e:
+            logger.warning("_fetch_yf_fundamentals failed for %s: %s", sym, e)
+
     return {}
 
 
 async def _fetch_yahoo(ticker: str | None) -> dict:
     """
     YH-08 Hybrid-Architektur:
-      1. Twelve Data /quote        → Preis + MarktCap + 52W  (Free Tier)
-      2. BA-Bridge /fundamentals/  → Revenue, EBITDA, Margen, EV (yfinance, kostenlos)
-      3. Yahoo Chart /v8/chart/    → Preis-Fallback wenn Twelve Data leer
+      1. Twelve Data /quote   → Preis + MarktCap + 52W  (Free Tier, Prio)
+      2. yfinance direkt      → Revenue, EBITDA, Margen, EV + Preis via fast_info
+      3. Yahoo Chart /v8/     → Preis-Fallback wenn weder TD noch yfinance Preis liefert
+    Bridge nur noch für beta_cache — kein Bridge-Hop für Fundamentals.
     """
     if not ticker:
         return {}
@@ -663,23 +721,24 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
         if suffix:
             symbol = symbol + suffix
 
-    # Parallel: Twelve Data Quote + Bridge Fundamentals
-    td_out, bridge_out = await asyncio.gather(
+    # Parallel: Twelve Data Quote + direkte yfinance Fundamentals
+    td_out, yf_out = await asyncio.gather(
         _fetch_twelve_data(symbol, exchange_key),
-        _fetch_bridge_fundamentals(symbol),
+        _fetch_yf_fundamentals(symbol),
         return_exceptions=True,
     )
     if isinstance(td_out, Exception):
         td_out = {}
-    if isinstance(bridge_out, Exception):
-        bridge_out = {}
+    if isinstance(yf_out, Exception):
+        yf_out = {}
 
-    # Merge: Twelve Data Preis + Bridge Fundamentals
-    out: dict = {**bridge_out, **td_out}  # td_out hat Prio bei Überschneidung (Preis/Exchange)
+    # Merge: Twelve Data Preis (Prio) + yfinance Fundamentals
+    # td_out überschreibt bei Preis/Exchange/52W — yf_out liefert Revenue/EBITDA/Margen
+    out: dict = {**yf_out, **td_out}
 
-    # Preis-Fallback: Yahoo Chart wenn Twelve Data keinen Preis lieferte
+    # Preis-Fallback: Yahoo Chart wenn weder Twelve Data noch yfinance fast_info Preis lieferte
     if not out.get("price"):
-        logger.info("Twelve Data kein Preis für %s — Yahoo Chart Fallback", symbol)
+        logger.info("Kein Preis via Twelve Data / yfinance für %s — Yahoo Chart Fallback", symbol)
         fallback = await _fetch_yahoo_price_fallback(symbol)
         for k in ("price", "market_cap_bn", "currency", "exchange"):
             if fallback.get(k) and not out.get(k):
