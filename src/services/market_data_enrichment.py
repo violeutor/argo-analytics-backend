@@ -519,16 +519,40 @@ def compute_market_cycle(
     category: str,
     all_funding_rounds: list[dict],
     all_companies: list[dict],
+    is_listed: bool = False,
 ) -> dict:
     """
     MD-B06: Marktzyklus aus Funding-Trend YoY in dieser Kategorie.
     early → growth → mature → consolidation
+
+    is_listed beeinflusst NUR den No-Data-Fallback, nie das algorithmische Ergebnis.
+    - Emerging Tech (EGS, CO₂-to-X, H₂, Solid-State) → Algorithmus entscheidet,
+      kein Override — Fervo/LanzaTech/Enapter können algorithmisch "early" behalten.
+    - Traditionelle Industrie + listed + kein Peer-Data → "mature" (Siemens-Fall).
+    - Alle anderen listed ohne Daten → "growth" (besser als "early" für börsennotierte).
     """
     from collections import defaultdict
+
+    _MATURE_CATEGORIES: set[str] = {
+        "industrial automation", "automation", "irrigation", "solar irrigation",
+        "traditional chemicals", "industrial gases", "waste-to-energy",
+        "agritech", "agritech saas", "erp", "enterprise software",
+    }
+    _cat_lower = (category or "").lower()
 
     # Companies in dieser Kategorie
     peer_ids = {c["id"] for c in all_companies if c.get("category") == category and c.get("id")}
     if not peer_ids:
+        if is_listed and _cat_lower in _MATURE_CATEGORIES:
+            return {
+                "market_cycle": "mature",
+                "market_cycle_note": "Börsennotiert in etabliertem Sektor — reifer Markt als Default.",
+            }
+        if is_listed:
+            return {
+                "market_cycle": "growth",
+                "market_cycle_note": "Börsennotiert ohne Peer-Funding-Daten — Wachstumsphase als Default.",
+            }
         return {
             "market_cycle": "early",
             "market_cycle_note": "Keine historischen Funding-Daten — Markt vermutlich früh.",
@@ -547,7 +571,21 @@ def compute_market_cycle(
             continue
 
     if not yearly:
-        return {"market_cycle": _default_cycle, "market_cycle_note": _default_note}
+        # Peers vorhanden aber keine Funding-Runden — typisch für listed Incumbents
+        if is_listed and _cat_lower in _MATURE_CATEGORIES:
+            return {
+                "market_cycle": "mature",
+                "market_cycle_note": "Börsennotiert in etabliertem Sektor, keine VC-Runden — reifer Markt.",
+            }
+        if is_listed:
+            return {
+                "market_cycle": "growth",
+                "market_cycle_note": "Börsennotiert ohne Funding-Runden in Peer-Gruppe — Wachstumsphase als Default.",
+            }
+        return {
+            "market_cycle": "early",
+            "market_cycle_note": "Peer-Gruppe ohne Funding-Daten — Markt vermutlich früh.",
+        }
 
     years = sorted(yearly.keys())
     recent_years = years[-3:] if len(years) >= 3 else years
