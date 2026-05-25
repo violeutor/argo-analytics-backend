@@ -1154,11 +1154,28 @@ async def enrich_company(
     )
 
     if isinstance(wiki, dict):
-        # BUG-02: Kanonischen Namen aus Wikipedia-Titel übernehmen
+        # BUG-02 / BUG-34: Kanonischen Namen aus Wikipedia-Titel übernehmen
         # "spacex" → "SpaceX", "lanzatech" → "LanzaTech"
+        #
+        # Drei Schutzbedingungen gegen falsche Umbenennungen:
+        #  1. Listed companies (Ticker in DB) niemals umbenennen — Börsenname ist kanonisch
+        #  2. Wortüberlappung: mindestens 1 Token aus company_name muss in canonical enthalten sein
+        #     → verhindert "LanzaTech" → "Aviation biofuel" (kein gemeinsamer Token)
+        #  3. Länge 2–120 (bestehende Bedingung)
         wiki_canonical = wiki.get("canonical_name", "")
-        if wiki_canonical and 2 <= len(wiki_canonical) <= 120:
-            result.name = wiki_canonical
+        _has_ticker_in_db = bool(company_record.get("ticker"))
+        if wiki_canonical and 2 <= len(wiki_canonical) <= 120 and not _has_ticker_in_db:
+            # Token-Overlap: min. 1 signifikantes Wort (>2 Zeichen) muss übereinstimmen
+            _orig_tokens = {t.lower() for t in company_name.split() if len(t) > 2}
+            _wiki_tokens = {t.lower() for t in wiki_canonical.split() if len(t) > 2}
+            if _orig_tokens & _wiki_tokens:
+                result.name = wiki_canonical
+            else:
+                logger.warning(
+                    "BUG-34 Guard: canonical_name '%s' für '%s' abgelehnt — "
+                    "kein Token-Overlap (falsche Wikipedia-Weiterleitung?)",
+                    wiki_canonical, company_name,
+                )
         result.description    = wiki.get("description")
         result.wikipedia_url  = wiki.get("wikipedia_url")
         result.website        = wiki.get("website")
@@ -1167,7 +1184,10 @@ async def enrich_company(
         result.employee_count = wiki.get("employee_count")
         # BUG-47: ipo_status aus Wikipedia-Infobox (type-Feld + traded_as)
         # Ticker-Extraktion entkoppelt von is_listed — Ticker impliziert listed
-        result.ipo_status = wiki.get("ipo_status")
+        # Guard: listed-Status (Ticker in DB) niemals durch Wikipedia überschreiben
+        _db_ipo_status = company_record.get("ipo_status")
+        if _db_ipo_status != "listed":
+            result.ipo_status = wiki.get("ipo_status")
         result.ticker     = wiki.get("ticker")
         result.exchange   = wiki.get("exchange")
         # is_listed aktualisieren wenn Wikipedia es klar sagt
