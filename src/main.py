@@ -269,6 +269,24 @@ async def _cron_funding_enrichment():
         logger.exception("Funding-Enrichment Cron FEHLER: %s", e)
 
 
+async def _cron_edgar_kpi():
+    """KPI-03 — EDGAR XBRL KPI Pipeline, täglich 05:15 UTC (zwischen ticker_yf + Buyer)."""
+    try:
+        from src.integrations.supabase import fetch_companies
+        from src.services.edgar_kpi import run_edgar_kpi_pipeline
+
+        companies = fetch_companies(limit=500)
+        logger.info("EDGAR KPI Cron gestartet — %d Companies", len(companies))
+        stats = await run_edgar_kpi_pipeline(companies)
+        logger.info(
+            "EDGAR KPI Cron fertig — %d Companies, %d rows written, %d skipped, %d errors",
+            stats["companies_processed"], stats["rows_written"],
+            stats["rows_skipped"], stats["errors"],
+        )
+    except Exception as e:
+        logger.exception("EDGAR KPI Cron FEHLER: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI Lifespan — Cron-Jobs starten."""
@@ -289,10 +307,12 @@ async def lifespan(app):
             await _cron_funding_enrichment()     # 04:30 UTC — Funding
             await asyncio.sleep(15 * 60)
             await _cron_ticker_yf()              # 04:45 UTC — ticker_yf (BUG-42)
-            await asyncio.sleep(15 * 60)
-            await _cron_buyer_enrichment()       # 05:00 UTC — Buyer
             await asyncio.sleep(30 * 60)
-            await _cron_scoring()                # 05:30 UTC — Scoring
+            await _cron_edgar_kpi()              # 05:15 UTC — EDGAR XBRL KPIs (KPI-03)
+            await asyncio.sleep(15 * 60)
+            await _cron_buyer_enrichment()       # 05:30 UTC — Buyer
+            await asyncio.sleep(30 * 60)
+            await _cron_scoring()                # 06:00 UTC — Scoring
 
     async def _schedule_rolling_refresh():
         """ARCH-02: Stündlicher Rolling Refresh — unabhängig vom täglichen Cron."""
