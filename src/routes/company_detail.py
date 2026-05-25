@@ -1380,6 +1380,46 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 db_ownership_entries[0].get("source") if db_ownership_entries else "?",
             )
 
+    # BaFin On-Demand — listed DE Companies ohne bafin_stimmrechte-Einträge.
+    # Unabhängig von db_ownership_entries: BaFin-Daten können fehlen auch wenn
+    # andere Sources (EDGAR, Yahoo) bereits Einträge geliefert haben.
+    _bafin_in_db = any(
+        e.get("source") == "bafin_stimmrechte"
+        for e in db_ownership_entries
+    )
+    _is_de_listed = is_listed and (
+        any(
+            x in (company.get("exchange") or "").lower()
+            for x in ("xetra", "frankfurt", "fse", "xfra", "m:access")
+        ) or any(
+            x in (company.get("headquarters") or "").lower()
+            for x in ("germany", "deutschland", "berlin", "munich", "münchen",
+                      "hamburg", "frankfurt", "cologne", "köln", "düsseldorf",
+                      "stuttgart", "hannover", "dortmund", "essen", "leipzig",
+                      "bremen", "dresden", "nuremberg", "nürnberg")
+        )
+    )
+    if company_id and _is_de_listed and not _bafin_in_db:
+        async def _bafin_enrich_bg():
+            try:
+                import os
+                from src.services.bafin_ownership import run_bafin_on_demand
+                stats = await asyncio.to_thread(
+                    run_bafin_on_demand,
+                    company_name,
+                    os.getenv("SUPABASE_URL", ""),
+                    os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY", ""),
+                )
+                logger.info(
+                    "BaFin on-demand '%s' fertig — %d Einträge geschrieben",
+                    company_name, stats.get("entries_written", 0),
+                )
+            except Exception:
+                logger.exception("BaFin on-demand FAILED für %s", company_name)
+
+        background_tasks.add_task(_bafin_enrich_bg)
+        logger.info("BaFin on-demand queued für %s", company_name)
+
     # Ownership Enrichment Background Task — feuert nur wenn DB leer (kein Re-Trigger).
     # Refresh via Rolling Refresh Cron (ARCH-02) in einer späteren Session.
     if company_id and not db_ownership_entries:

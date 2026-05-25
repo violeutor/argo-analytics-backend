@@ -19,6 +19,10 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 async def _cron_rolling_refresh():
@@ -287,6 +291,56 @@ async def _cron_edgar_kpi():
         logger.exception("EDGAR KPI Cron FEHLER: %s", e)
 
 
+async def _cron_bafin_ownership(company_name: str | None = None) -> dict:
+    """
+    BaFin Stimmrechtsmitteilungen — direkt im Argo Backend (kein Bridge-Hop nötig).
+
+    Zwei Modi:
+      company_name=None  → alle listed DE Companies (30d Rolling Cron)
+      company_name=str   → eine Company on-demand (One-Click-Trigger aus company_detail.py)
+
+    BaFin = öffentlicher GET-Endpoint, kein CAPTCHA, kein Session-Management
+    → kein BA-Bridge nötig. Rate-Limit (65s) nur im Cron-Modus relevant.
+    """
+    import os
+    from src.services.bafin_ownership import (
+        run_bafin_ownership_cron,
+        run_bafin_on_demand,
+    )
+
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY", "")
+
+    if not supabase_url or not supabase_key:
+        logger.error("BaFin Cron: SUPABASE_URL/KEY fehlt — übersprungen")
+        return {"error": "missing_credentials"}
+
+    try:
+        if company_name:
+            logger.info("BaFin on-demand: '%s'", company_name)
+            # Sync-Funktion im Thread-Pool — blockiert nicht den Event-Loop
+            stats = await asyncio.to_thread(
+                run_bafin_on_demand, company_name, supabase_url, supabase_key
+            )
+            logger.info("BaFin on-demand '%s' fertig — %s", company_name, stats)
+        else:
+            logger.info("BaFin Ownership Cron gestartet (30d Rolling)")
+            stats = await asyncio.to_thread(
+                run_bafin_ownership_cron, supabase_url, supabase_key
+            )
+            logger.info(
+                "BaFin Cron fertig — processed=%d with_data=%d written=%d errors=%d",
+                stats.get("companies_processed", 0),
+                stats.get("companies_with_data", 0),
+                stats.get("entries_written", 0),
+                stats.get("errors", 0),
+            )
+        return stats
+    except Exception as e:
+        logger.exception("BaFin Cron FEHLER: %s", e)
+        return {"error": str(e)}
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI Lifespan — Cron-Jobs starten."""
@@ -321,11 +375,20 @@ async def lifespan(app):
             await _cron_rolling_refresh()
             await asyncio.sleep(60 * 60)   # 1h warten bis zum nächsten Run
 
+    async def _schedule_bafin_refresh():
+        """BaFin 30d Rolling Refresh — unabhängig vom täglichen Cron."""
+        await asyncio.sleep(10 * 60)   # 10min nach Start — hinter Rolling Refresh
+        while True:
+            await _cron_bafin_ownership()
+            await asyncio.sleep(30 * 24 * 60 * 60)   # 30 Tage
+
     cron_task    = asyncio.create_task(_schedule_cron())
     rolling_task = asyncio.create_task(_schedule_rolling_refresh())
+    bafin_task   = asyncio.create_task(_schedule_bafin_refresh())
     yield
     cron_task.cancel()
     rolling_task.cancel()
+    bafin_task.cancel()
 
 
 app = FastAPI(
@@ -378,7 +441,21 @@ app.include_router(assessments_router)
 app.include_router(debug_router)
 
 
-@app.post("/internal/edgar-kpi/trigger")
+@app.post("/internal/bafin/trigger")
+async def trigger_bafin_cron(background_tasks: BackgroundTasks):
+    """Manueller Trigger für BaFin 30d Cron — alle listed DE Companies."""
+    background_tasks.add_task(_cron_bafin_ownership)
+    return {"status": "triggered", "job": "_cron_bafin_ownership"}
+
+
+@app.post("/internal/bafin/enrich/{company_name}")
+async def trigger_bafin_ondemand(company_name: str, background_tasks: BackgroundTasks):
+    """On-Demand BaFin-Fetch für eine einzelne Company (One-Click-Trigger)."""
+    background_tasks.add_task(_cron_bafin_ownership, company_name)
+    return {"status": "triggered", "company": company_name}
+
+
+
 async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
     """Manueller Trigger für _cron_edgar_kpi (Testing/Debugging)."""
     background_tasks.add_task(_cron_edgar_kpi)
