@@ -1749,3 +1749,87 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         warnings=warnings,
         scores=scores_result,
     )
+
+
+# ── UX-01: Enrichment Status Endpoint ────────────────────────────────────────
+
+@router.get("/company/{name}/status")
+async def get_enrichment_status(name: str):
+    """
+    UX-01: Gibt pro Tab zurück ob Daten vorhanden sind (ready) oder noch ausstehen (pending).
+    Wird vom Frontend alle 3s gepolllt bis alle relevanten Tabs ready sind.
+    Kein Heavy-Fetch — nur DB-Checks auf Existenz, keine Berechnungen.
+    """
+    sb = get_supabase()
+
+    # Company laden
+    rows = sb.table("companies").select(
+        "id, name, enrichment_status, description, industry, category, "
+        "founding_year, headquarters, headcount, tags"
+    ).ilike("name", name).limit(1).execute()
+
+    if not rows.data:
+        raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
+
+    company = rows.data[0]
+    company_id = company["id"]
+
+    # Parallel-Checks — alle nur Existenz/Count, kein Heavy-Fetch
+    def _has(table: str, col: str = "id", **filters) -> bool:
+        try:
+            q = sb.table(table).select(col, count="exact").eq("company_id", company_id)
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            r = q.limit(1).execute()
+            return (r.count or 0) > 0
+        except Exception:
+            return False
+
+    def _count(table: str, **filters) -> int:
+        try:
+            q = sb.table(table).select("id", count="exact").eq("company_id", company_id)
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            r = q.limit(1).execute()
+            return r.count or 0
+        except Exception:
+            return 0
+
+    # Tab-Status berechnen
+    has_description  = bool(company.get("description"))
+    has_tam          = _has("tam_cache", "tam_2035_usd_bn")
+    has_market       = _has("market_data", "sam_usd_bn")
+    has_ownership    = _count("ownership_entries") > 0
+    has_funding      = _count("funding_rounds") > 0
+    has_scores       = _has("company_scores", "composite_score")
+    has_assessments  = _has("company_assessments", "dimensions")
+    has_peers        = bool(company.get("tags"))  # peers kommen mit company
+    has_value_drivers = _has("value_drivers", "enablers")
+    has_signals      = _count("signals") > 0
+    has_kpi          = _count("kpi_timeseries") > 0
+
+    def _status(ready: bool) -> str:
+        return "ready" if ready else "pending"
+
+    tabs = {
+        "overview":     _status(has_description and has_tam),
+        "market":       _status(has_market),
+        "ownership":    _status(has_ownership or has_funding),
+        "fundamentals": _status(has_kpi or has_funding),
+        "assessments":  _status(has_assessments and has_scores),
+        "peers":        _status(has_peers),
+        "value_drivers":_status(has_value_drivers),
+        "scoring":      _status(has_scores),
+        "paths":        _status(has_scores),
+        "signals":      _status(has_signals),
+    }
+
+    all_ready = all(v == "ready" for v in tabs.values())
+
+    return {
+        "company":     name,
+        "company_id":  company_id,
+        "enrichment_status": company.get("enrichment_status") or "pending",
+        "all_ready":   all_ready,
+        "tabs":        tabs,
+    }
