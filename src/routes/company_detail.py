@@ -802,7 +802,7 @@ async def _fetch_beta_from_bridge(
                     _sfx  = _EXCHANGE_SUFFIX.get(_exch, "")
                     if _sfx:
                         symbol = symbol + _sfx
-                resp = await client.get(f"{settings.ba_bridge_url}/yahoo/ticker/{symbol}")
+                resp = await client.get(f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/{symbol}")
                 if resp.status_code == 200:
                     data = resp.json()
                     return {
@@ -819,7 +819,7 @@ async def _fetch_beta_from_bridge(
 
             elif not is_listed and category:
                 resp = await client.get(
-                    f"{settings.ba_bridge_url}/yahoo/ticker/_/damodaran",
+                    f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/_/damodaran",
                     params={"category": category},
                 )
                 if resp.status_code == 200:
@@ -1415,7 +1415,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # Für listed Companies: Yahoo institutional_holders (yfinance, via BA-Bridge).
     # Für private Companies: EDGAR Form D / BA-Bridge (enrich_ownership).
     # Einträge werden deduped gegen bereits vorhandene (curated overrides + enrichment + funding).
-    db_ownership_entries = fetch_ownership_entries(company_id) if company_id else []
+    _db_ownership_raw = fetch_ownership_entries(company_id) if company_id else []
+    # _enrichment_attempted: Loop-Guard — verhindert Re-Trigger wenn Enrichment 0 Ergebnisse hatte
+    _enrichment_attempted = any(e.get("source") == "enrichment_attempted" for e in _db_ownership_raw)
+    # Sentinel-Rows herausfiltern — werden nur als Loop-Guard geschrieben, nie angezeigt
+    db_ownership_entries = [e for e in _db_ownership_raw if e.get("source") != "enrichment_attempted"]
     if db_ownership_entries:
         _existing_names_db = {o.name.lower() for o in ownership}
         _added_from_db = 0
@@ -1481,7 +1485,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
     # Ownership Enrichment Background Task — feuert nur wenn DB leer (kein Re-Trigger).
     # Refresh via Rolling Refresh Cron (ARCH-02) in einer späteren Session.
-    if company_id and not db_ownership_entries:
+    if company_id and not db_ownership_entries and not _enrichment_attempted:
         _existing_for_bg = [
             {"name": o.name, "type": o.type, "role": o.role}
             for o in ownership
@@ -1509,8 +1513,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                         result.get("source_used"), result.get("region"), written,
                     )
                 else:
-                    logger.debug(
-                        "EN-08: keine neuen Ownership-Einträge für %s (source=%s)",
+                    # Loop-Guard: Sentinel-Row schreiben damit nächster Request
+                    # nicht erneut triggert (db_ownership_entries wäre sonst wieder leer).
+                    # source='enrichment_attempted' — filterbar im Frontend.
+                    upsert_ownership_entries(company_id, [{
+                        "name":   "_no_data",
+                        "type":   "sentinel",
+                        "source": "enrichment_attempted",
+                        "role":   None,
+                    }])
+                    logger.info(
+                        "EN-08: 0 Ownership-Einträge für %s (source=%s) — Sentinel geschrieben",
                         company_name, result.get("source_used"),
                     )
             except Exception:
