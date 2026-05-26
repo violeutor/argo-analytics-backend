@@ -146,7 +146,12 @@ async def get_company_ownership(name: str, background_tasks: BackgroundTasks) ->
     enrichment_status = company.get("enrichment_status", "pending")
 
     # 2. Bestehende Einträge aus DB
-    existing = _fetch_ownership_entries(company_id) if company_id else []
+    _existing_raw  = _fetch_ownership_entries(company_id) if company_id else []
+    # Loop-Guard: Sentinel-Row (source='enrichment_attempted') aus company_detail.py
+    # verhindert Re-Trigger wenn Enrichment 0 Ergebnisse hatte.
+    _enrichment_attempted = any(e.get("source") == "enrichment_attempted" for e in _existing_raw)
+    # Sentinel herausfiltern — nie anzeigen, nicht für _ownership_enriched zählen
+    existing       = [e for e in _existing_raw if e.get("source") != "enrichment_attempted"]
     funding_rounds = fetch_funding_rounds(company_id) if company_id else []
 
     # 3. Cap Table Score immer berechnen (auch aus vorhandenen Daten)
@@ -187,7 +192,8 @@ async def get_company_ownership(name: str, background_tasks: BackgroundTasks) ->
 
     # 6. Keine Einträge → Background-Enrichment anstoßen
     # Aber: wenn enrichment_status="running" bereits → 202-ähnlich, kein neuer Task
-    if company_id and enrichment_status not in ("running",):
+    # Loop-Guard: nicht nochmals triggern wenn Sentinel gesetzt (0 Ergebnisse bekannt)
+    if company_id and enrichment_status not in ("running",) and not _enrichment_attempted:
         _queue_enrichment(background_tasks, company_id, company_name, company, existing, funding_rounds)
         logger.info("Ownership enrichment queued for %s", company_name)
 
@@ -224,6 +230,14 @@ def _queue_enrichment(
             )
             if result.get("entries"):
                 _upsert_ownership_entries(company_id, result["entries"])
+            else:
+                # Sentinel-Row schreiben — Loop-Guard analog company_detail.py
+                _upsert_ownership_entries(company_id, [{
+                    "name":   "_no_data",
+                    "type":   "sentinel",
+                    "source": "enrichment_attempted",
+                    "role":   None,
+                }])
             set_enrichment_status(company_id, "done")
             logger.info(
                 "Ownership enrichment done for %s — %s new entries via %s",
