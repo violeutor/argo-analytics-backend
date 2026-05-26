@@ -1218,6 +1218,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             ),
             "description":   enrichment.description or None,
             "website":       enrichment.website or None,
+            "tags":          enrichment.tags if enrichment.tags else None,   # Technologie-Chips Tab 0 — persistieren, [] nicht schreiben
         }
         # BUG-47: ipo_status aus EnrichmentResult in DB schreiben
         # Nur wenn Enrichment einen Wert liefert UND DB noch keinen hat
