@@ -29,7 +29,10 @@ EDGAR_COMPANY_FACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 EDGAR_TICKERS_JSON  = "https://www.sec.gov/files/company_tickers.json"
 EDGAR_SEARCH_URL    = "https://efts.sec.gov/LATEST/search-index"
 
-HEADERS = {"User-Agent": "ArgoAnalytics research@argo-analytics.com Accept-Encoding: gzip"}
+HEADERS = {
+    "User-Agent":      "ArgoAnalytics research@argo-analytics.com",
+    "Accept-Encoding": "gzip",
+}
 
 # XBRL us-gaap Tag → currency-neutraler Metric-Key (analog BA-Bridge METRIC_MAP)
 _XBRL_MAP: dict[str, str] = {
@@ -69,22 +72,34 @@ _HELPER_METRICS: frozenset[str] = frozenset({"operating_income_mn", "depreciatio
 
 # ── CIK Lookup ────────────────────────────────────────────────────────────────
 
-async def _lookup_cik_by_ticker(ticker: str, client: httpx.AsyncClient) -> str | None:
+async def _fetch_tickers_map(client: httpx.AsyncClient) -> dict[str, str]:
     """
-    Schneller CIK-Lookup via company_tickers.json (EDGAR, kein Rate-Limit).
-    Stripped Exchange-Suffix (SIE.DE → SIE) vor dem Match.
+    Lädt company_tickers.json einmalig pro Pipeline-Run.
+    Gibt ticker.upper() -> cik_str (10-stellig) zurück.
+    Wird von run_edgar_kpi_pipeline gecacht und weitergereicht.
     """
     try:
-        ticker_clean = ticker.upper().split(".")[0]
-        resp = await client.get(EDGAR_TICKERS_JSON, timeout=10)
+        resp = await client.get(EDGAR_TICKERS_JSON, timeout=15)
         if resp.status_code != 200:
-            return None
-        for entry in resp.json().values():
-            if (entry.get("ticker") or "").upper() == ticker_clean:
-                return str(entry["cik_str"]).zfill(10)
+            logger.warning("EDGAR tickers.json HTTP %s", resp.status_code)
+            return {}
+        return {
+            (entry.get("ticker") or "").upper(): str(entry["cik_str"]).zfill(10)
+            for entry in resp.json().values()
+            if entry.get("ticker") and entry.get("cik_str")
+        }
     except Exception as e:
-        logger.debug("CIK ticker lookup failed for %s: %s", ticker, e)
-    return None
+        logger.warning("EDGAR tickers.json fetch failed: %s", e)
+        return {}
+
+
+def _lookup_cik_by_ticker(ticker: str, tickers_map: dict[str, str]) -> str | None:
+    """
+    CIK-Lookup aus gecachtem tickers_map.
+    Stripped Exchange-Suffix (SIE.DE -> SIE, H2O.DE -> H2O) vor dem Match.
+    """
+    ticker_clean = ticker.upper().split(".")[0]
+    return tickers_map.get(ticker_clean)
 
 
 async def _lookup_cik_by_name(company_name: str, client: httpx.AsyncClient) -> str | None:
@@ -188,20 +203,22 @@ def _derive_ebitda(rows: list[dict]) -> list[dict]:
 async def fetch_edgar_kpis(
     company_name: str,
     ticker: str | None = None,
+    tickers_map: dict[str, str] | None = None,
 ) -> list[dict]:
     """
     Holt KPI-Rows für eine Company aus der EDGAR Company Facts API.
     Gibt Liste von KPIRow-kompatiblen Dicts zurück (leer wenn kein EDGAR-Treffer).
 
-    CIK-Lookup: ticker_yf/ticker → Fallback company name search.
+    CIK-Lookup: tickers_map (gecacht) → Fallback company name search.
+    tickers_map wird von run_edgar_kpi_pipeline einmalig pro Run geladen.
     """
     cutoff_year = datetime.now(timezone.utc).year - 5
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=12) as client:
-        # CIK Lookup
+        # CIK Lookup — gecachter Map bevorzugt (kein extra HTTP-Call pro Company)
         cik = None
-        if ticker:
-            cik = await _lookup_cik_by_ticker(ticker, client)
+        if ticker and tickers_map is not None:
+            cik = _lookup_cik_by_ticker(ticker, tickers_map)
         if not cik:
             cik = await _lookup_cik_by_name(company_name, client)
         if not cik:
@@ -253,6 +270,11 @@ async def run_edgar_kpi_pipeline(companies: list[dict]) -> dict:
     stats = {"companies_processed": 0, "rows_written": 0, "rows_skipped": 0, "errors": 0}
     db = get_supabase()
 
+    # tickers_map einmalig laden — verhindert 50x Download von company_tickers.json (~7MB)
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15) as _client:
+        tickers_map = await _fetch_tickers_map(_client)
+    logger.info("EDGAR KPI: tickers_map geladen — %d Einträge", len(tickers_map))
+
     for company in companies[:50]:
         name   = company.get("name", "")
         ticker = company.get("ticker_yf") or company.get("ticker") or None
@@ -260,7 +282,7 @@ async def run_edgar_kpi_pipeline(companies: list[dict]) -> dict:
             continue
 
         try:
-            kpi_rows = await fetch_edgar_kpis(name, ticker)
+            kpi_rows = await fetch_edgar_kpis(name, ticker, tickers_map=tickers_map)
             if not kpi_rows:
                 await asyncio.sleep(0.15)
                 continue
