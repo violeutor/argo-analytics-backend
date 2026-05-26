@@ -860,64 +860,80 @@ def _infer_tags(text: str) -> list[str]:
 
 
 # ── Tag → category / industry Mapping ────────────────────────────────────────
+# Alle Werte sind kanonische Taxonomy-Strings aus src/taxonomy.py.
+# Neue Tags hier eintragen → Werte aus TAXONOMY übernehmen.
+
+from src.taxonomy import normalize_sector, normalize_category
 
 _TAG_TO_CATEGORY: dict[str, str] = {
-    "carbon-capture":        "Carbon Removal (DAC)",
-    "direct-air-capture":    "Carbon Removal (DAC)",
-    "ocean-cdr":             "Ocean CDR",
-    "low-carbon-cement":     "Low-Carbon Cement",
-    "sustainable-materials": "Sustainable Materials",
-    "battery":               "Battery / Energy Storage",
-    "long-duration-storage": "Long-Duration Storage",
-    "solid-state-battery":   "Solid-State Battery",
-    "grid":                  "Grid Software / Infrastructure",
-    "ai-grid-software":      "AI × Grid Software",
-    "solar":                 "Solar Energy",
-    "hydrogen":              "Hydrogen",
-    "geothermal":            "Geothermal / EGS",
-    "waste-to-energy":       "Waste-to-Energy",
-    "agritech":              "Agritech",
-    "bioengineering":        "Bioengineering",
-    "soil-carbon":           "Soil Carbon",
-    "co2-to-fuels":          "CO₂-to-Fuels / SAF",
-    "bio-based-chemicals":   "Bio-based Chemicals",
-    "datacenter-cooling":    "Datacenter Cooling / HVAC",
-    "climate-risk-saas":     "Climate-Risk SaaS",
-    "carbon-credits":        "Carbon Credits",
-    "irrigation":            "Irrigation",
-    "water-tech":            "AI × Water / Cooling",
-}
-
-_TAG_TO_INDUSTRY: dict[str, str] = {
-    "carbon-capture":        "Carbon Removal",
-    "direct-air-capture":    "Carbon Removal",
-    "ocean-cdr":             "Carbon Removal",
-    "low-carbon-cement":     "Industrial Decarbonization",
-    "sustainable-materials": "Industrial Decarbonization",
-    "bio-based-chemicals":   "Industrial Decarbonization",
-    "waste-to-energy":       "Industrial Decarbonization",
+    # Carbon & Climate
+    "carbon-capture":        "Carbon Capture & Storage",
+    "direct-air-capture":    "Direct Air Capture",
+    "ocean-cdr":             "Nature-Based Solutions",
+    "co2-to-fuels":          "CO₂ Utilization",
+    "carbon-credits":        "Carbon Markets & Credits",
+    "climate-risk-saas":     "Climate Analytics & ESG",
+    # Energy & Power
     "battery":               "Energy Storage",
     "long-duration-storage": "Energy Storage",
     "solid-state-battery":   "Energy Storage",
-    "grid":                  "Grid & Infrastructure",
-    "ai-grid-software":      "Grid & Infrastructure",
-    "solar":                 "Renewable Energy",
-    "hydrogen":              "Renewable Energy",
-    "geothermal":            "Renewable Energy",
+    "grid":                  "Grid & Smart Energy",
+    "ai-grid-software":      "Grid & Smart Energy",
+    "solar":                 "Solar PV",
+    "hydrogen":              "Hydrogen & Fuel Cells",
+    "geothermal":            "Geothermal",
+    "waste-to-energy":       "Waste-to-Energy",
+    # Materials & Chemicals
+    "low-carbon-cement":     "Advanced Materials",
+    "sustainable-materials": "Advanced Materials",
+    "bio-based-chemicals":   "Green Chemicals",
+    # Agriculture & Food
+    "agritech":              "Precision Farming",
+    "bioengineering":        "Alternative Proteins",
+    "soil-carbon":           "Precision Farming",
+    # Built Environment
+    "datacenter-cooling":    "Smart Buildings",
+    # Water
+    "irrigation":            "Water Infrastructure",
+    "water-tech":            "Water Technology",
+}
+
+_TAG_TO_INDUSTRY: dict[str, str] = {
+    # Carbon & Climate
+    "carbon-capture":        "Carbon & Climate",
+    "direct-air-capture":    "Carbon & Climate",
+    "ocean-cdr":             "Carbon & Climate",
+    "co2-to-fuels":          "Carbon & Climate",
+    "carbon-credits":        "Carbon & Climate",
+    "climate-risk-saas":     "Carbon & Climate",
+    # Energy & Power
+    "battery":               "Energy & Power",
+    "long-duration-storage": "Energy & Power",
+    "solid-state-battery":   "Energy & Power",
+    "grid":                  "Energy & Power",
+    "ai-grid-software":      "Energy & Power",
+    "solar":                 "Energy & Power",
+    "hydrogen":              "Energy & Power",
+    "geothermal":            "Energy & Power",
+    "waste-to-energy":       "Industrial & Manufacturing",
+    # Materials & Chemicals
+    "low-carbon-cement":     "Materials & Chemicals",
+    "sustainable-materials": "Materials & Chemicals",
+    "bio-based-chemicals":   "Materials & Chemicals",
+    # Agriculture & Food
     "agritech":              "Agriculture & Food",
     "bioengineering":        "Agriculture & Food",
     "soil-carbon":           "Agriculture & Food",
-    "co2-to-fuels":          "Fuels & Chemicals",
-    "datacenter-cooling":    "Digital Infrastructure",
-    "climate-risk-saas":     "Climate Intelligence",
-    "carbon-credits":        "Carbon Markets",
-    "irrigation":            "Water & Irrigation",
-    "water-tech":            "Water & Irrigation",
+    # Built Environment
+    "datacenter-cooling":    "Built Environment",
+    # Water
+    "irrigation":            "Water & Circular Economy",
+    "water-tech":            "Water & Circular Economy",
 }
 
 
 def infer_category_industry(tags: list[str]) -> tuple[str | None, str | None]:
-    """Leitet category/industry aus Tags ab. Gibt (None, None) wenn kein Treffer."""
+    """Leitet category/industry aus Tags ab — gibt Taxonomy-konforme Strings zurück."""
     for tag in tags:
         cat = _TAG_TO_CATEGORY.get(tag)
         ind = _TAG_TO_INDUSTRY.get(tag)
@@ -929,30 +945,27 @@ def infer_category_industry(tags: list[str]) -> tuple[str | None, str | None]:
 async def _claude_infer_category(company: str, description: str) -> tuple[str | None, str | None]:
     """
     Claude-Fallback wenn TAG_KEYWORDS keinen Treffer liefert.
-    Klassifiziert die Company in category + industry anhand der Description.
-    Wird nur aufgerufen wenn tags leer — daher kein Timeout-Problem im Hauptpfad.
+    Klassifiziert die Company in Sektor + Kategorie anhand der Description.
+    Werte werden gegen src/taxonomy.py normalisiert — kein Freitext in die DB.
+    Wird nur aufgerufen wenn tags leer — kein Timeout-Problem im Hauptpfad.
     """
     if not description:
         return None, None
 
-    industries = [
-        "Carbon Removal", "Industrial Decarbonization", "Energy Storage",
-        "Grid & Infrastructure", "Renewable Energy", "Agriculture & Food",
-        "Fuels & Chemicals", "Digital Infrastructure", "Climate Intelligence",
-        "Carbon Markets", "Water & Irrigation", "Diversified Industrial",
-    ]
-    prompt = f"""Classify this company for an investment database. Return ONLY valid JSON, no preamble.
+    from src.taxonomy import ENRICHMENT_TAXONOMY_BLOCK, normalize_sector, normalize_category
+
+    prompt = f"""Classify this company for an M&A investment database. Return ONLY valid JSON, no preamble, no markdown.
 
 Company: {company}
-Description: {description[:400]}
+Description: {description[:500]}
 
-Pick the best fit from these industries: {", ".join(industries)}
-Also provide a short category (5-40 chars, e.g. "Grid Software / Infrastructure", "Industrial Automation", "Hydrogen Electrolysis").
+{ENRICHMENT_TAXONOMY_BLOCK}
 
-JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
+Return JSON with exactly these two keys:
+{{"sector": "<exact sector name from list>", "category": "<exact category name from list>"}}"""
 
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -962,7 +975,7 @@ JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
                 },
                 json={
                     "model": "claude-haiku-4-5-20251001",   # COST-01: Haiku für Kategorie-Inferenz
-                    "max_tokens": 80,
+                    "max_tokens": 120,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
@@ -970,10 +983,24 @@ JSON: {{"category": "<short category>", "industry": "<industry from list>"}}"""
             logger.warning("_claude_infer_category HTTP %s for %s: %s", resp.status_code, company, resp.text[:200])
             return None, None
         raw = resp.json()["content"][0]["text"].strip()
-        logger.warning("_claude_infer_category RAW for %s: %r", company, raw[:200])
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
         parsed = json.loads(raw)
-        return parsed.get("category"), parsed.get("industry")
+        raw_sector   = parsed.get("sector")
+        raw_category = parsed.get("category")
+        # Normalisierung gegen Taxonomy — verhindert Freitext in der DB
+        sector   = normalize_sector(raw_sector)
+        category = normalize_category(raw_category, sector)
+        if not sector or not category:
+            logger.warning(
+                "_claude_infer_category NO_MATCH for %s: sector=%r category=%r",
+                company, raw_sector, raw_category,
+            )
+        else:
+            logger.info(
+                "_claude_infer_category OK for %s: sector=%r category=%r",
+                company, sector, category,
+            )
+        return category, sector
     except Exception as e:
         logger.warning("_claude_infer_category EXCEPTION for %s: %s — %s", company, type(e).__name__, e)
         return None, None
@@ -1285,5 +1312,12 @@ async def enrich_company(
         inferred_cat, inferred_ind = infer_category_industry(result.tags)
         result.category = inferred_cat if not company_record.get("category") else None
         result.industry = inferred_ind if not company_record.get("industry") else None
+
+    # Taxonomy-Normalisierung als Write-Guard — kein Freitext in die DB
+    # Verhindert Inkonsistenzen auch wenn company_record bereits Werte enthält
+    if result.industry:
+        result.industry = normalize_sector(result.industry) or result.industry
+    if result.category:
+        result.category = normalize_category(result.category, result.industry) or result.category
 
     return result

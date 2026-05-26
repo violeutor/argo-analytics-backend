@@ -101,27 +101,13 @@ class ScoreResult:
 
 # ── Lookup-Tabellen ────────────────────────────────────────────────────────────
 
-# Kategorien mit guter ETF-Abdeckung (ICLN, QCLN, CTEC, BATT, LIT, ARKX usw.)
-_ETF_COVERED_CATEGORIES = {
-    "solar", "wind", "battery", "ev", "hydrogen", "carbon-capture",
-    "energy-storage", "smart-grid", "climate-tech", "cleantech",
-    "industrial-tech", "industrial", "semiconductor", "biotech", "ai", "cloud",
-    "space", "aerospace", "nuclear", "geothermal", "agri-tech",
-    "heat-pump", "electrolysis", "fuel-cell", "direct-air-capture",
-    "automation", "software", "saas", "infrastructure", "logistics",
-}
-
-# Sektoren wo Patent-Tiefe den tech_readiness-Score beeinflusst (SE-14).
-# Kanonische Definition in services/signal_engine.py (PATENT_SCORING_SECTORS).
-# Datensammlung via EPO OPS läuft universell — Scoring-Einfluss nur hier.
-_PATENT_SCORING_SECTORS: frozenset[str] = frozenset({
-    "battery", "energy storage", "hydrogen", "fuel cell", "electrochemical",
-    "carbon removal", "dac", "direct air capture", "cdr", "mineralization",
-    "materials", "chemistry", "chemical", "pharma", "biotech", "medtech",
-    "semiconductor", "hardware", "geothermal", "electrolysis",
-    "cement", "concrete", "industrial", "circular", "biomass",
-    "solid-state", "long-duration storage", "co₂", "co2",
-})
+# ETF_COVERED_CATEGORIES + PATENT_SCORING_SECTORS → SSOT: src/taxonomy.py
+from src.taxonomy import (
+    ETF_COVERED_CATEGORIES  as _ETF_COVERED_CATEGORIES,
+    PATENT_SCORING_SECTORS  as _PATENT_SCORING_SECTORS,
+    is_etf_covered          as _is_etf_covered,
+    is_patent_relevant      as _is_patent_relevant,
+)
 
 # IPO-Attraktivität je Funding Stage (raw base)
 _STAGE_IPO_SCORE: dict[str, float] = {
@@ -760,7 +746,7 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
         score += 2.0
 
     # Kategorie in ETF-Universe
-    cat_match = any(c in category or c in industry for c in _ETF_COVERED_CATEGORIES)
+    cat_match = _is_etf_covered(category, industry)
     if cat_match:
         score += 3.0
         inputs["etf_category_match"] = True
@@ -1078,7 +1064,7 @@ def compute_dimension_risks(
     tech_sources = ["auto_tech_readiness(stage_proxy)", "signals[patent,tech_milestone]"]
     patent_bonus = 0.0
     category_raw = (company.get("category") or company.get("industry") or "").lower()
-    in_patent_sector = any(s in category_raw for s in _PATENT_SCORING_SECTORS)
+    in_patent_sector = _is_patent_relevant(category_raw)
     patent_count   = int(company.get("patent_count") or 0)
     granted_ratio  = float(company.get("patent_granted_ratio") or 0.0)
 

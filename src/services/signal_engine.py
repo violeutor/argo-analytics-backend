@@ -452,30 +452,15 @@ _NS_EPO = "http://www.epo.org/exchange"
 # Kind-Codes gültig erteilter Patente (B1/B2 = EP erteilt, C = korrigiert, W = PCT granted)
 _GRANTED_KINDS: frozenset[str] = frozenset({"B1", "B2", "B3", "C", "C1", "C2"})
 
-# Sektoren in denen Patent-Tiefe den tech_readiness-Score beeinflusst.
-# Datensammlung läuft universell — Scoring-Einfluss nur wo IP ein echter Moat ist.
+# PATENT_SCORING_SECTORS + TRENDS_RELEVANT_SECTORS → SSOT: src/taxonomy.py
 # Importierbar von score_calculator.py + assessments.py:
-#   from services.signal_engine import PATENT_SCORING_SECTORS
-PATENT_SCORING_SECTORS: frozenset[str] = frozenset({
-    "battery", "energy storage", "hydrogen", "fuel cell", "electrochemical",
-    "carbon removal", "dac", "direct air capture", "cdr", "mineralization",
-    "materials", "chemistry", "chemical", "pharma", "biotech", "medtech",
-    "semiconductor", "hardware", "geothermal", "electrolysis",
-    "cement", "concrete", "industrial", "circular", "biomass",
-    "solid-state", "long-duration storage", "co₂", "co2",
-})
-
-# SE-15: Sektoren wo Google Trends ein sinnvolles Markt-Signal liefert.
-# Primär: Software/SaaS/AI-Companies wo User-Suchvolumen Nachfrage reflektiert.
-# Explizit NICHT: Deep Tech / Industrial / B2B-only (niemand googelt "Elektrolyse-Stack").
-TRENDS_RELEVANT_SECTORS: frozenset[str] = frozenset({
-    "software", "saas", "ai", "artificial intelligence", "machine learning",
-    "cloud", "platform", "marketplace", "api", "developer tools",
-    "fintech", "insurtech", "proptech", "legaltech", "edtech",
-    "healthtech", "consumer", "climate risk", "climate analytics",
-    "esg platform", "carbon credits", "agritech saas", "food tech",
-    "digital infrastructure", "climate intelligence",
-})
+#   from src.taxonomy import PATENT_SCORING_SECTORS
+from src.taxonomy import (
+    PATENT_SCORING_SECTORS,
+    TRENDS_RELEVANT_SECTORS,
+    is_patent_relevant as _is_patent_relevant_fn,
+    is_trends_relevant as _is_trends_relevant_fn,
+)
 
 _NER_SYSTEM = """\
 Du bist ein präziser Signal-Klassifikator für M&A- und Investment-Screening.
@@ -731,7 +716,7 @@ async def parse_epo(
 
     Datensammlung universal (Chemie, Pharma, Deep Tech, alle Sektoren).
     Scoring-Einfluss auf tech_readiness nur für PATENT_SCORING_SECTORS —
-    gesteuert in score_calculator.py via `from services.signal_engine import PATENT_SCORING_SECTORS`.
+    gesteuert in score_calculator.py via `from src.taxonomy import PATENT_SCORING_SECTORS`.
 
     Rate-Limit Free Tier: 4 req/s, 10k req/Woche.
     Bei 43 Companies à 1 Call ≈ 43 req/Tag — unkritisch.
@@ -902,8 +887,7 @@ _TRENDS_WIDGET_URL = "https://trends.google.com/trends/api/widgetdata/multiline"
 
 def _is_trends_relevant(category: str, industry: str) -> bool:
     """Prüft ob Google Trends für diese Company ein sinnvolles Signal liefert."""
-    text = f"{category} {industry}".lower()
-    return any(s in text for s in TRENDS_RELEVANT_SECTORS)
+    return _is_trends_relevant_fn(category, industry)
 
 
 async def _fetch_pytrends(

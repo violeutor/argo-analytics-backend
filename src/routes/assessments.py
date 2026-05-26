@@ -332,102 +332,138 @@ async def get_assessments(name: str):
     R-18 v2.0: Company Assessments — 6 Dimensionen, algorithmische Scores + Claude Narrativ.
     Cache-first: DB → sofort wenn frisch. Cache miss → Scores berechnen + Claude Narrativ → DB → Response.
     """
-    # 1. Company laden
-    company = fetch_company_by_name(name)
-    if not company:
-        raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
+    from fastapi.responses import JSONResponse
 
-    company_id   = company["id"]
-    company_name = company["name"]
+    try:
+        # 1. Company laden
+        company = fetch_company_by_name(name)
+        if not company:
+            raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
 
-    # 2. Cache prüfen (nur algorithmische Scores akzeptieren)
-    cached = fetch_assessments(company_id)
-    if cached and _is_cache_fresh(cached):
-        logger.info("assessments cache hit (algorithmic): %s", name)
+        company_id   = company["id"]
+        company_name = company["name"]
+
+        # 2. Cache prüfen (nur algorithmische Scores akzeptieren)
+        try:
+            cached = fetch_assessments(company_id)
+            if cached and _is_cache_fresh(cached):
+                logger.info("assessments cache hit (algorithmic): %s", name)
+                return {
+                    "company":               name,
+                    "source":                "cache",
+                    "generated_at":          cached.get("generated_at"),
+                    "model":                 cached.get("model"),
+                    "description":           cached.get("description"),
+                    "dimensions":            cached.get("dimensions") or [],
+                    "composite_opportunity": cached.get("composite_opportunity"),
+                    "composite_risk":        cached.get("composite_risk"),
+                }
+        except Exception as e:
+            logger.warning("assessments cache read failed for %s: %s — continuing", name, e)
+
+        # 3. Daten für algorithmische Scores laden
+        try:
+            market      = fetch_market_data(company_id)
+            tam         = fetch_tam_cache(company_id)
+            pos_signals = fetch_directional_signals(company_id, "positive", limit=15)
+            neg_signals = fetch_directional_signals(company_id, "negative", limit=15)
+            vd_raw      = fetch_value_drivers(company_id)
+        except Exception as e:
+            logger.error("assessments data fetch failed for %s: %s", name, e)
+            market = tam = vd_raw = None
+            pos_signals = neg_signals = []
+
+        # Value Drivers als flache Liste für compute_dimension_risks
+        vd_flat: list[dict] = []
+        if vd_raw:
+            for key in ("enablers", "contributors"):
+                vd_flat.extend(vd_raw.get(key) or [])
+
+        all_signals = (pos_signals or []) + (neg_signals or [])
+
+        # 4. Algorithmische Scores berechnen
+        try:
+            dimension_scores = compute_dimension_risks(
+                company=company,
+                market_data=market,
+                signals=all_signals,
+                value_drivers=vd_flat,
+            )
+        except Exception as e:
+            logger.error("compute_dimension_risks failed for %s: %s", name, e)
+            # Neutrale Fallback-Scores — kein 500
+            dimension_scores = {
+                dim: {"opportunity_score": 5.0, "risk_score": 5.0, "data_confidence": "low",
+                      "opportunity_sources": [], "risk_sources": []}
+                for dim in ("market", "financials", "strategy", "political", "technology", "operations")
+            }
+
+        # 5. Composite berechnen
+        comp_opp, comp_risk = _compute_composites(dimension_scores)
+
+        # 6. Claude-Call — nur Narrativ, keine Scores
+        narrative_dims: list[dict] = []
+        description = ""
+        try:
+            context = _build_narrative_context(
+                company=company,
+                market=market,
+                tam=tam,
+                pos_signals=pos_signals or [],
+                neg_signals=neg_signals or [],
+                dimension_scores=dimension_scores,
+            )
+            result = await _call_claude_narrative(company_name, context)
+            narrative_dims = result.get("dimensions") or []
+            description    = result.get("description") or ""
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 529:
+                logger.warning("Claude 529 overloaded for %s — using scores only", name)
+            else:
+                logger.error("Claude narrative call failed for %s: %s", name, e)
+        except Exception as e:
+            logger.warning("Claude narrative call failed for %s: %s — scores still returned", name, e)
+
+        # 7. Scores + Narrativ mergen
+        try:
+            merged_dims = _merge_dimensions(dimension_scores, narrative_dims)
+        except Exception as e:
+            logger.error("_merge_dimensions failed for %s: %s", name, e)
+            merged_dims = []
+
+        # 8. In DB cachen (non-blocking — Fehler darf Response nicht blockieren)
+        try:
+            payload: dict[str, Any] = {
+                "dimensions":            merged_dims,
+                "composite_opportunity": comp_opp,
+                "composite_risk":        comp_risk,
+                "description":           description or company.get("description") or "",
+                "generated_at":          datetime.datetime.utcnow().isoformat(),
+                "model":                 MODEL,
+            }
+            upsert_assessments(company_id, payload)
+            if description:
+                upsert_company_description(company_id, description)
+        except Exception as e:
+            logger.error("assessments upsert failed for %s: %s", name, e)
+
         return {
-            "company":              name,
-            "source":               "cache",
-            "generated_at":         cached.get("generated_at"),
-            "model":                cached.get("model"),
-            "description":          cached.get("description"),
-            "dimensions":           cached.get("dimensions") or [],
-            "composite_opportunity": cached.get("composite_opportunity"),
-            "composite_risk":        cached.get("composite_risk"),
+            "company":               company_name,
+            "source":                "generated",
+            "generated_at":          datetime.datetime.utcnow().isoformat(),
+            "model":                 MODEL,
+            "description":           description,
+            "dimensions":            merged_dims,
+            "composite_opportunity": comp_opp,
+            "composite_risk":        comp_risk,
         }
 
-    # 3. Daten für algorithmische Scores laden
-    market      = fetch_market_data(company_id)
-    tam         = fetch_tam_cache(company_id)
-    pos_signals = fetch_directional_signals(company_id, "positive", limit=15)
-    neg_signals = fetch_directional_signals(company_id, "negative", limit=15)
-    vd_raw      = fetch_value_drivers(company_id)
-
-    # Value Drivers als flache Liste für compute_dimension_risks
-    vd_flat: list[dict] = []
-    if vd_raw:
-        for key in ("enablers", "contributors"):
-            vd_flat.extend(vd_raw.get(key) or [])
-
-    all_signals = pos_signals + neg_signals
-
-    # 4. Algorithmische Scores berechnen
-    dimension_scores = compute_dimension_risks(
-        company=company,
-        market_data=market,
-        signals=all_signals,
-        value_drivers=vd_flat,
-    )
-
-    # 5. Composite berechnen
-    comp_opp, comp_risk = _compute_composites(dimension_scores)
-
-    # 6. Claude-Call — nur Narrativ, keine Scores
-    narrative_dims: list[dict] = []
-    description = ""
-    try:
-        context = _build_narrative_context(
-            company=company,
-            market=market,
-            tam=tam,
-            pos_signals=pos_signals,
-            neg_signals=neg_signals,
-            dimension_scores=dimension_scores,
-        )
-        result = await _call_claude_narrative(company_name, context)
-        narrative_dims = result.get("dimensions") or []
-        description    = result.get("description") or ""
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 529:
-            logger.warning("Claude 529 overloaded for %s — using scores only", name)
-        else:
-            logger.error("Claude narrative call failed for %s: %s", name, e)
+    except HTTPException:
+        raise  # 404 etc. direkt weiterreichen
     except Exception as e:
-        logger.warning("Claude narrative call failed for %s: %s — scores still returned", name, e)
-
-    # 7. Scores + Narrativ mergen
-    merged_dims = _merge_dimensions(dimension_scores, narrative_dims)
-
-    # 8. In DB cachen
-    payload: dict[str, Any] = {
-        "dimensions":            merged_dims,
-        "composite_opportunity": comp_opp,
-        "composite_risk":        comp_risk,
-        "description":           description or company.get("description") or "",
-        "generated_at":          datetime.datetime.utcnow().isoformat(),
-        "model":                 MODEL,
-    }
-    upsert_assessments(company_id, payload)
-
-    if description:
-        upsert_company_description(company_id, description)
-
-    return {
-        "company":               company_name,
-        "source":                "generated",
-        "generated_at":          payload["generated_at"],
-        "model":                 MODEL,
-        "description":           description,
-        "dimensions":            merged_dims,
-        "composite_opportunity": comp_opp,
-        "composite_risk":        comp_risk,
-    }
+        # Globaler Guard — verhindert HTML-500-Response an den Client
+        logger.error("get_assessments UNHANDLED for %s: %s", name, e, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Assessment generation failed for '{name}'", "error": str(e)},
+        )

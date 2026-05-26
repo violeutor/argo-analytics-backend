@@ -532,18 +532,12 @@ def compute_market_cycle(
     - Alle anderen listed ohne Daten → "growth" (besser als "early" für börsennotierte).
     """
     from collections import defaultdict
-
-    _MATURE_CATEGORIES: set[str] = {
-        "industrial automation", "automation", "irrigation", "solar irrigation",
-        "traditional chemicals", "industrial gases", "waste-to-energy",
-        "agritech", "agritech saas", "erp", "enterprise software",
-    }
-    _cat_lower = (category or "").lower()
+    from src.taxonomy import is_mature_market as _is_mature_market
 
     # Companies in dieser Kategorie
     peer_ids = {c["id"] for c in all_companies if c.get("category") == category and c.get("id")}
     if not peer_ids:
-        if is_listed and _cat_lower in _MATURE_CATEGORIES:
+        if is_listed and _is_mature_market(category):
             return {
                 "market_cycle": "mature",
                 "market_cycle_note": "Börsennotiert in etabliertem Sektor — reifer Markt als Default.",
@@ -572,7 +566,7 @@ def compute_market_cycle(
 
     if not yearly:
         # Peers vorhanden aber keine Funding-Runden — typisch für listed Incumbents
-        if is_listed and _cat_lower in _MATURE_CATEGORIES:
+        if is_listed and _is_mature_market(category):
             return {
                 "market_cycle": "mature",
                 "market_cycle_note": "Börsennotiert in etabliertem Sektor, keine VC-Runden — reifer Markt.",
