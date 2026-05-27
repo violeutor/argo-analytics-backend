@@ -512,22 +512,10 @@ def compute_competition_score(
         if peer_notes:
             note += " Bekannte Wettbewerber — " + " | ".join(peer_notes) + "."
 
-    # ── 3. DB-Funding-Konzentration als Kontextnote (nicht Score) ────────────
-    db_peers = [c for c in all_companies if c.get("category") == category]
-    if len(db_peers) >= 2:
-        peer_fundings = {
-            c["id"]: c.get("funding_total_usd_mn") or 0
-            for c in db_peers if c.get("id")
-        }
-        total_funding = sum(peer_fundings.values()) or 1
-        max_funding = max(peer_fundings.values()) if peer_fundings else 0
-        concentration = max_funding / total_funding
-        top_db = max(db_peers, key=lambda c: c.get("funding_total_usd_mn") or 0, default=None)
-        if top_db:
-            note += (
-                f" In Argo-DB: {len(db_peers)} erfasste Player,"
-                f" Funding-Führung {top_db['name']} ({concentration:.0%} Anteil)."
-            )
+    # Block 3 (DB-Funding-Konzentration) entfernt:
+    # Argo-DB bildet den Markt nicht vollständig ab — DB-Zähler ist kein valides
+    # Wettbewerbssignal und führt zu irreführenden Notes ("Nur 1 bekannter Player in DB").
+    # Primärquelle bleibt DDG (result_count_proxy) + peers_context.
 
     return {"competition_score": score, "competition_note": note}
 
@@ -539,36 +527,62 @@ def compute_market_cycle(
     all_funding_rounds: list[dict],
     all_companies: list[dict],
     is_listed: bool = False,
+    company_id: str | None = None,
+    cagr_pct: float | None = None,
 ) -> dict:
     """
     MD-B06: Marktzyklus aus Funding-Trend YoY in dieser Kategorie.
     early → growth → mature → consolidation
 
-    is_listed beeinflusst NUR den No-Data-Fallback, nie das algorithmische Ergebnis.
-    - Emerging Tech (EGS, CO₂-to-X, H₂, Solid-State) → Algorithmus entscheidet,
-      kein Override — Fervo/LanzaTech/Enapter können algorithmisch "early" behalten.
-    - Traditionelle Industrie + listed + kein Peer-Data → "mature" (Siemens-Fall).
-    - Alle anderen listed ohne Daten → "growth" (besser als "early" für börsennotierte).
+    Reihenfolge der Signale (Priorität absteigend):
+      1. Algorithmisch aus Peer-Funding-Daten (≥2 externe Peers, ≥4 Runden)
+      2. CAGR-Signal wenn verfügbar (>20% → growth, <5% → mature/consolidation)
+      3. is_listed + is_mature_market als letzter Fallback (nur bei echtem Datenmangel)
+
+    is_listed überschreibt NIE ein algorithmisches Ergebnis.
+    Selbst-Referenz (company_id) wird aus peer_ids excludiert — verhindert dass
+    ein börsennotiertes Unternehmen sich selbst als "reifer Markt" einstuft.
     """
     from collections import defaultdict
     from src.taxonomy import is_mature_market as _is_mature_market
 
-    # Companies in dieser Kategorie
-    peer_ids = {c["id"] for c in all_companies if c.get("category") == category and c.get("id")}
-    if not peer_ids:
+    # Companies in dieser Kategorie — Selbst-Referenz excludieren
+    peer_ids = {
+        c["id"] for c in all_companies
+        if c.get("category") == category
+        and c.get("id")
+        and c.get("id") != company_id      # nie sich selbst zählen
+    }
+
+    _no_peer_data = not peer_ids
+
+    if _no_peer_data:
+        # CAGR als primäres Signal wenn Peer-Daten fehlen
+        if cagr_pct is not None:
+            if cagr_pct >= 20:
+                return {
+                    "market_cycle": "growth",
+                    "market_cycle_note": f"CAGR {cagr_pct:.0f}%/Jahr — starkes Wachstum, keine Peer-Funding-Daten.",
+                }
+            elif cagr_pct >= 8:
+                return {
+                    "market_cycle": "early",
+                    "market_cycle_note": f"CAGR {cagr_pct:.0f}%/Jahr — früher bis wachsender Markt, keine Peer-Funding-Daten.",
+                }
+        # is_listed + Taxonomie nur als letzter Fallback bei echtem Datenmangel
         if is_listed and _is_mature_market(category):
             return {
                 "market_cycle": "mature",
-                "market_cycle_note": "Börsennotiert in etabliertem Sektor — reifer Markt als Default.",
+                "market_cycle_note": "Börsennotiert in etabliertem Sektor — reifer Markt (Fallback).",
             }
         if is_listed:
             return {
                 "market_cycle": "growth",
-                "market_cycle_note": "Börsennotiert ohne Peer-Funding-Daten — Wachstumsphase als Default.",
+                "market_cycle_note": "Börsennotiert ohne externe Peer-Daten — Wachstumsphase (Fallback).",
             }
         return {
             "market_cycle": "early",
-            "market_cycle_note": "Keine historischen Funding-Daten — Markt vermutlich früh.",
+            "market_cycle_note": "Keine Peer-Funding-Daten verfügbar — Markt vermutlich früh.",
         }
 
     # Funding nach Jahr aggregieren
@@ -778,8 +792,16 @@ def enrich_market_data_sync_wrapper(
         })
 
     # MD-B06 — Market Cycle
+    # company_id: Selbst-Referenz excludieren
+    # cagr_pct: aus async_result (MD-B01) oder tam_cache — primäres Signal bei Datenmangel
+    _cagr = (async_result or {}).get("cagr_pct")
     try:
-        cycle = compute_market_cycle(category, safe_rounds, safe_companies, is_listed=is_listed)
+        cycle = compute_market_cycle(
+            category, safe_rounds, safe_companies,
+            is_listed=is_listed,
+            company_id=company_id,
+            cagr_pct=_cagr,
+        )
         result.update(cycle)
     except Exception as e:
         logger.warning("Market cycle failed for %s: %s", company_name, e)
