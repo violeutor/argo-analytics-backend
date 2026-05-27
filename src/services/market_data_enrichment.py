@@ -707,16 +707,20 @@ async def enrich_market_data(
     )
 
     # CAGR-Hochrechnung — Fallback wenn MD-B01 keinen CAGR geliefert hat
+    # Nur cagr_pct schreiben — cagr_source/cagr_confidence nicht im market_data Schema.
     if not result.get("cagr_pct"):
         from src.services.tam import compute_cagr
-        cagr_data = compute_cagr(sector, tam_usd_bn)
-        result["cagr_pct"]        = cagr_data["cagr_pct"]
-        result["cagr_source"]     = cagr_data["cagr_source"]
-        result["cagr_confidence"] = cagr_data["cagr_confidence"]
-        logger.debug(
-            "CAGR fallback for %s: %.1f%% (%s, %s)",
-            company_name, cagr_data["cagr_pct"],
-            cagr_data["cagr_source"], cagr_data["cagr_confidence"],
+        # Unicode-Normalisierung: ₂ → 2 (CO₂ Utilization → co2-utilization)
+        _sector_normalized = sector.translate(str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789"))
+        cagr_data = compute_cagr(_sector_normalized, tam_usd_bn)
+        if cagr_data.get("cagr_pct"):
+            result["cagr_pct"] = cagr_data["cagr_pct"]
+        logger.info(
+            "CAGR fallback für %s (sector=%s): %.1f%% (%s, conf=%s)",
+            company_name, _sector_normalized,
+            cagr_data.get("cagr_pct", 0),
+            cagr_data.get("cagr_source", "—"),
+            cagr_data.get("cagr_confidence", "—"),
         )
 
     geo_scope = market_details.get("geo_scope", "global")

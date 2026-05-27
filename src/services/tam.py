@@ -136,20 +136,53 @@ def compute_cagr(
 
     if sector_tag:
         tag = sector_tag.lower().strip()
-        # Normalisierung: Sonderzeichen → Bindestriche, Stopwörter entfernen
-        tag = re.sub(r"[/\\|&+]", "-", tag)   # Slash/Pipe/etc → Bindestrich
-        tag = re.sub(r"\s+", "-", tag)          # Leerzeichen → Bindestrich
-        tag = re.sub(r"-+", "-", tag)           # Doppelte Bindestriche
+        # Unicode-Normalisierung: Subscript-Ziffern → ASCII (₂→2, ₃→3 etc.)
+        _UNICODE_SUB = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+        tag = tag.translate(_UNICODE_SUB)
+        # Sonderzeichen → Bindestriche
+        tag = re.sub(r"[/\\|&+]", "-", tag)
+        tag = re.sub(r"\s+", "-", tag)
+        tag = re.sub(r"-+", "-", tag)
         tag = tag.strip("-")
-        # Alias-Map: häufige Kurzschreibweisen → kanonischer Key
+        # Alias-Map: Kurzschreibweisen + Category-Namen → kanonischer Tag-Key
         _ALIASES = {
-            "co2-fuels":       "co2-to-fuels",
-            "co2-chemicals":   "co2-to-chemicals",
-            "dac":             "direct-air-capture",
-            "ccus":            "carbon-capture",
-            "bess":            "long-duration-storage",
-            "ev-battery":      "battery",
-            "ldes":            "long-duration-storage",
+            # Kurzformen
+            "co2-fuels":            "co2-to-fuels",
+            "co2-chemicals":        "co2-to-chemicals",
+            "dac":                  "direct-air-capture",
+            "ccus":                 "carbon-capture",
+            "bess":                 "long-duration-storage",
+            "ev-battery":           "battery",
+            "ldes":                 "long-duration-storage",
+            # Category-Namen → Tag (für den Fall dass category statt tag übergeben wird)
+            "co2-utilization":      "co2-to-fuels",
+            "co2-to-chemicals":     "co2-to-fuels",
+            "carbon-removal":       "carbon-capture",
+            "mineralization":       "carbon-capture",
+            "biomass-cdr":          "carbon-capture",
+            "electrochemical-capture": "carbon-capture",
+            "modular-capture":      "carbon-capture",
+            "mobile-capture":       "carbon-capture",
+            "industrial-capture":   "carbon-capture",
+            "ocean-cdr":            "ocean-cdr",
+            "electrified-cement":   "low-carbon-cement",
+            "distributed-battery":  "battery",
+            "circular-battery":     "battery",
+            "second-life-bess":     "battery",
+            "solid-state-battery":  "solid-state-battery",
+            "distributed-power":    "grid",
+            "ai-grid":              "ai-grid-software",
+            "geothermal-egs":       "geothermal",
+            "egs":                  "geothermal",
+            "agritech-saas":        "agritech",
+            "precision-agriculture":"agritech",
+            "vertical-farming":     "agritech",
+            "solar-irrigation":     "agritech",
+            "climate-risk":         "climate-risk-saas",
+            "climate-adaptation":   "climate-risk-saas",
+            "datacenter-cooling-hvac": "datacenter-cooling",
+            "bio-based-chemicals":  "bio-based-chemicals",
+            "sustainable-materials":"sustainable-materials",
         }
         tag = _ALIASES.get(tag, tag)
 
