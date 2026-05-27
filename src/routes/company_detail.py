@@ -1144,12 +1144,26 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     _tr_ref: list[float | None] = [None]
 
     market_data_cached = fetch_market_data(company_id) if company_id else None
-    # Leere Row (nur company_id, alle Felder NULL) gilt nicht als befüllt
-    _market_data_valid = bool(
-        market_data_cached
-        and market_data_cached.get("enriched_at")
-        and market_data_cached.get("sam_usd_bn")  # SAM wird immer berechnet — zuverlässigstes Vollständigkeits-Signal
-    )
+    # Leere Row (nur company_id, alle Felder NULL) gilt nicht als befüllt.
+    # Staleness-Guard: enriched_at vor 2026 = Sentinel/Pre-Session-27-Datum → re-enrich.
+    # Auch Daten älter als 30 Tage werden neu angereichert (MD-B01/05/06-Fixes greifen dann).
+    def _market_data_fresh(cached: dict | None) -> bool:
+        if not cached:
+            return False
+        if not cached.get("enriched_at") or not cached.get("sam_usd_bn"):
+            return False
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(cached["enriched_at"].replace("Z", "+00:00"))
+            if dt.year < 2026:          # Sentinel-Datum (z.B. 2020-01-01) → stale
+                return False
+            if (datetime.now(timezone.utc) - dt).days > 30:  # Älter als 30 Tage → re-enrich
+                return False
+            return True
+        except Exception:
+            return False
+
+    _market_data_valid = _market_data_fresh(market_data_cached)
     if company_id and not _market_data_valid:
         async def _market_enrichment_bg():
             try:
