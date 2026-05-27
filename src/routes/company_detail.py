@@ -1323,6 +1323,33 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
         upsert_company_enrichment(company_id, upsert_payload)
 
+        # 4c. Yahoo-Fundamentals → companies table (Background Task)
+        # Schließt Architektur-Lücke: revenue_usd_mn / is_profitable / growth_rate_pct
+        # wurden bisher nur von Wikipedia/Enrichment befüllt — fehlen für listed Companies.
+        # Auswirkung: Debug-Report korrekt, SC-01 Financial Score verbessert sich ab nächstem Load.
+        if is_listed and yahoo:
+            _yf_persist: dict = {}
+            if yahoo.get("revenue_bn") is not None:
+                _yf_persist["revenue_usd_mn"] = round(yahoo["revenue_bn"] * 1000, 1)
+            if yahoo.get("profit_margin_pct") is not None:
+                _yf_persist["is_profitable"] = yahoo["profit_margin_pct"] > 0
+            if yahoo.get("revenue_growth_pct") is not None:
+                _yf_persist["growth_rate_pct"] = yahoo["revenue_growth_pct"]
+            if _yf_persist:
+                async def _persist_yf_bg(_p: dict = _yf_persist) -> None:
+                    try:
+                        upsert_company_enrichment(company_id, _p)
+                        logger.info(
+                            "Yahoo fundamentals persisted für %s: %s",
+                            company_name, list(_p.keys()),
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            "Yahoo fundamentals persist failed für %s: %s",
+                            company_name, _e,
+                        )
+                background_tasks.add_task(_persist_yf_bg)
+
     # TAM-Re-Lookup: wenn erster TAM-Call Fallback war und jetzt category bekannt
     if tam.get("method") == "fallback" and company.get("category"):
         logger.info("TAM re-lookup with inferred category '%s' for %s", company["category"], company_name)
