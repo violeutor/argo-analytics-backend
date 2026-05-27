@@ -1323,32 +1323,79 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
 
         upsert_company_enrichment(company_id, upsert_payload)
 
-        # 4c. Yahoo-Fundamentals → companies table (Background Task)
+        # 4c. Fundamentals → companies table (Background Task)
         # Schließt Architektur-Lücke: revenue_usd_mn / is_profitable / growth_rate_pct
-        # wurden bisher nur von Wikipedia/Enrichment befüllt — fehlen für listed Companies.
-        # Auswirkung: Debug-Report korrekt, SC-01 Financial Score verbessert sich ab nächstem Load.
-        if is_listed and yahoo:
-            _yf_persist: dict = {}
+        # Strategie: Yahoo primär (wenn yfinance .info nicht timeout) →
+        #            kpi_timeseries Fallback (eigene DB, bereits gecacht, zuverlässig).
+        # Für kleine Nasdaq-Caps (LNZA etc.) läuft yfinance .info oft in den 8s-Timeout
+        # → yahoo hat keine Fundamentals → kpi_timeseries ist der robustere Pfad.
+        if is_listed and company_id:
+            # Yahoo-Werte wenn vorhanden (yfinance hat nicht ge-timeout)
+            _yf_direct: dict = {}
             if yahoo.get("revenue_bn") is not None:
-                _yf_persist["revenue_usd_mn"] = round(yahoo["revenue_bn"] * 1000, 1)
+                _yf_direct["revenue_usd_mn"] = round(yahoo["revenue_bn"] * 1000, 1)
             if yahoo.get("profit_margin_pct") is not None:
-                _yf_persist["is_profitable"] = yahoo["profit_margin_pct"] > 0
+                _yf_direct["is_profitable"] = yahoo["profit_margin_pct"] > 0
             if yahoo.get("revenue_growth_pct") is not None:
-                _yf_persist["growth_rate_pct"] = yahoo["revenue_growth_pct"]
-            if _yf_persist:
-                async def _persist_yf_bg(_p: dict = _yf_persist) -> None:
-                    try:
-                        upsert_company_enrichment(company_id, _p)
+                _yf_direct["growth_rate_pct"] = yahoo["revenue_growth_pct"]
+
+            async def _persist_fundamentals_bg(_direct: dict = _yf_direct) -> None:
+                try:
+                    persist: dict = dict(_direct)  # Yahoo-Werte als Ausgangspunkt
+
+                    # Fallback: kpi_timeseries aus DB — zuverlässig auch wenn yfinance timeout
+                    # Füllt Lücken die Yahoo nicht geliefert hat
+                    _missing = {"revenue_usd_mn", "is_profitable", "growth_rate_pct"} - set(persist)
+                    if _missing:
+                        db = get_supabase()
+                        rows = (
+                            db.table("kpi_timeseries")
+                            .select("metric,fiscal_year,value")
+                            .eq("company_id", company_id)
+                            .execute()
+                            .data or []
+                        )
+                        # Neuesten Wert je Metrik
+                        by_metric: dict = {}
+                        for r in rows:
+                            m = r["metric"]
+                            if m not in by_metric or r["fiscal_year"] > by_metric[m]["fiscal_year"]:
+                                by_metric[m] = r
+
+                        if "revenue_usd_mn" in _missing and "revenue_mn" in by_metric:
+                            persist["revenue_usd_mn"] = round(by_metric["revenue_mn"]["value"], 1)
+
+                        if "is_profitable" in _missing and "net_income_mn" in by_metric:
+                            persist["is_profitable"] = by_metric["net_income_mn"]["value"] > 0
+
+                        if "growth_rate_pct" in _missing and "revenue_mn" in by_metric:
+                            # CAGR aus kpi_timeseries berechnen wenn ≥2 Datenpunkte
+                            rev_rows = sorted(
+                                [r for r in rows if r["metric"] == "revenue_mn"],
+                                key=lambda r: r["fiscal_year"],
+                            )
+                            if len(rev_rows) >= 2:
+                                first, last = rev_rows[0], rev_rows[-1]
+                                n = last["fiscal_year"] - first["fiscal_year"]
+                                if n > 0 and first["value"] and first["value"] > 0:
+                                    cagr = ((last["value"] / first["value"]) ** (1 / n) - 1) * 100
+                                    persist["growth_rate_pct"] = round(cagr, 1)
+
+                    if persist:
+                        upsert_company_enrichment(company_id, persist)
                         logger.info(
-                            "Yahoo fundamentals persisted für %s: %s",
-                            company_name, list(_p.keys()),
+                            "Fundamentals persisted für %s (yahoo=%d kpi=%d): %s",
+                            company_name,
+                            len(_direct),
+                            len(persist) - len(_direct),
+                            list(persist.keys()),
                         )
-                    except Exception as _e:
-                        logger.warning(
-                            "Yahoo fundamentals persist failed für %s: %s",
-                            company_name, _e,
-                        )
-                background_tasks.add_task(_persist_yf_bg)
+                    else:
+                        logger.debug("Keine Fundamentals zu persistieren für %s", company_name)
+                except Exception as _e:
+                    logger.warning("Fundamentals persist failed für %s: %s", company_name, _e)
+
+            background_tasks.add_task(_persist_fundamentals_bg)
 
     # TAM-Re-Lookup: wenn erster TAM-Call Fallback war und jetzt category bekannt
     if tam.get("method") == "fallback" and company.get("category"):
