@@ -678,14 +678,46 @@ async def _fetch_yf_fundamentals(symbol: str) -> dict:
                 "operating_cashflow_bn":_bn(info.get("operatingCashflow")),
             }
 
-            ev    = info.get("enterpriseValue")
-            rev   = info.get("totalRevenue")
-            ebitda= info.get("ebitda")
-            debt  = info.get("totalDebt")
+            # ── Derived metrics: berechne aus Komponenten wenn Direktwert fehlt ──────
+            # Prinzip: wenn Yahoo das Feld nicht direkt liefert, haben wir meist
+            # alle Komponenten um es selbst zu berechnen.
+
+            rev        = info.get("totalRevenue")
+            ebitda     = info.get("ebitda")
+            debt       = info.get("totalDebt")
+            cash       = info.get("totalCash") or info.get("cashAndCashEquivalents") or 0
+            net_income = info.get("netIncome")
+            gross_prof = info.get("grossProfits")
+            op_income  = info.get("operatingIncome")
+            dep_amort  = info.get("depreciationAmortization") or info.get("depreciation")
+
+            # EBITDA: direkt → operatingIncome + D&A
+            if not ebitda and op_income and dep_amort:
+                ebitda = op_income + dep_amort
+                out["ebitda_bn"] = _bn(ebitda)
+                logger.debug("EBITDA berechnet (op_income+D&A) für %s: %.1fM", sym, ebitda / 1e6)
+
+            # Enterprise Value: direkt → Mktcap + Debt - Cash
+            ev = info.get("enterpriseValue")
+            if not ev and _mktcap_raw and debt is not None:
+                ev = _mktcap_raw + (debt or 0) - cash
+                logger.debug("EV berechnet (mktcap+debt-cash) für %s: %.1fBn", sym, ev / 1e9)
+
             out["enterprise_value_bn"] = _bn(ev)
-            if ev and rev:           out["ev_revenue"]  = round(ev / rev, 1)
-            if ev and ebitda:        out["ev_ebitda"]   = round(ev / ebitda, 1)
-            if debt and ebitda:      out["debt_ebitda"] = round((debt / 1e9) / (ebitda / 1e9), 2)
+            if ev and rev:    out["ev_revenue"]  = round(ev / rev, 1)
+            if ev and ebitda: out["ev_ebitda"]   = round(ev / ebitda, 1)
+            if debt and ebitda:
+                out["debt_ebitda"] = round((debt / 1e9) / (ebitda / 1e9), 2)
+
+            # Margen: direkt → berechnet aus Komponenten / Revenue
+            if not out.get("gross_margin_pct") and gross_prof and rev:
+                out["gross_margin_pct"] = round(gross_prof / rev * 100, 1)
+            if not out.get("operating_margin_pct") and op_income and rev:
+                out["operating_margin_pct"] = round(op_income / rev * 100, 1)
+            if not out.get("profit_margin_pct") and net_income and rev:
+                out["profit_margin_pct"] = round(net_income / rev * 100, 1)
+            if ebitda and rev and not info.get("ebitdaMargins"):
+                out["ebitda_margin_pct"] = round(ebitda / rev * 100, 1)
 
             return out
         except Exception as e:
