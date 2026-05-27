@@ -14,6 +14,7 @@ from src.routes.peers import router as peers_router
 from src.routes.kpi_timeseries import router as kpi_router
 from src.routes.assessments import router as assessments_router
 from src.routes.debug import router as debug_router
+from src.routes.notifications import router as notifications_router
 import os
 import asyncio
 import logging
@@ -439,6 +440,7 @@ app.include_router(peers_router)
 app.include_router(kpi_router)
 app.include_router(assessments_router)
 app.include_router(debug_router)
+app.include_router(notifications_router)
 
 
 @app.post("/internal/bafin/trigger")
