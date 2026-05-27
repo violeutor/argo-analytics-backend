@@ -236,6 +236,49 @@ def _parse_rss_date(pub_date: str | None) -> date:
     return date.today()
 
 
+def _extract_date_from_text(text: str | None) -> date | None:
+    """
+    BUG-04: Extrahiert das Datum aus dem Artikel-Body/Titel wenn Feed-Datum
+    nicht zuverlässig ist (Re-Published alte Artikel).
+
+    Sucht nach ISO-Datumsangaben und deutschen/englischen Monatsnamen.
+    Gibt None zurück wenn kein plausibles Datum gefunden.
+    """
+    if not text:
+        return None
+    # ISO-Datum im Text (z.B. "2025-04-15" oder "15.04.2025")
+    iso_pattern = re.compile(r'\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b')
+    de_pattern  = re.compile(
+        r'\b(0?[1-9]|[12]\d|3[01])\s*\.?\s*'
+        r'(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember|'
+        r'Jan|Feb|Mär|Apr|Jun|Jul|Aug|Sep|Okt|Nov|Dez)'
+        r'\.?\s*(20\d{2})\b', re.IGNORECASE
+    )
+    _DE_MONTHS = {
+        "januar":1,"jan":1,"februar":2,"feb":2,"märz":3,"mär":3,
+        "april":4,"apr":4,"mai":5,"juni":6,"jun":6,"juli":7,"jul":7,
+        "august":8,"aug":8,"september":9,"sep":9,"oktober":10,"okt":10,
+        "november":11,"nov":11,"dezember":12,"dez":12,
+    }
+    # ISO zuerst
+    m = iso_pattern.search(text)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    # Deutsches Format
+    m = de_pattern.search(text)
+    if m:
+        try:
+            month = _DE_MONTHS.get(m.group(2).lower().rstrip("."))
+            if month:
+                return date(int(m.group(3)), month, int(m.group(1)))
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
 def _aggregate_events(events: list[SignalEvent]) -> list[SignalEvent]:
     """
     SE-17: Multi-Source Signal Aggregation.
@@ -1753,7 +1796,59 @@ async def run_signal_engine(
     # SE-17: Multi-Source Aggregation — vor dem Return deduplizieren
     all_events = _aggregate_events(all_events)
 
-    return all_events, all_patents
+    # ── BUG-05: Staleness-Filter — Events >180d nicht schreiben ──────────────
+    # Re-Published alte Artikel (Google News Aggregatoren) würden sonst als
+    # neue Events erscheinen. 180d = sicherer Puffer für alle Signal-Typen.
+    _today     = date.today()
+    _cutoff_write  = _today - timedelta(days=180)
+    _cutoff_decay  = _today - timedelta(days=90)
+
+    _before_filter = len(all_events)
+    filtered_events: list[SignalEvent] = []
+    for ev in all_events:
+        age_days = (_today - ev.event_date).days
+
+        # BUG-05: älter als 180d → komplett verwerfen
+        if ev.event_date < _cutoff_write:
+            logger.debug(
+                "Staleness-Filter: %s / %s (%s) — %dd alt, wird nicht geschrieben",
+                ev.company_name, ev.event_type, ev.event_date.isoformat(), age_days,
+            )
+            continue
+
+        # BUG-06: 90–180d → schreiben aber relevance_score = 0 (eingepreist)
+        # Quartalszahlen etc. sind nach 90d im Kurs eingepreist — kein Scoring-Einfluss.
+        if ev.event_date < _cutoff_decay:
+            if ev.relevance_score != 0:
+                logger.debug(
+                    "Relevanz-Decay: %s / %s (%s) — %dd alt, relevance_score → 0",
+                    ev.company_name, ev.event_type, ev.event_date.isoformat(), age_days,
+                )
+            ev.relevance_score = 0.0
+
+        # BUG-04: Datum-Plausibilitäts-Check — Feed-Datum vs. extrahiertes Artikel-Datum
+        # Wenn Feed-Datum = heute aber Artikel-Text enthält älteres Datum → Artikel-Datum nutzen
+        if ev.event_date == _today and ev.summary:
+            extracted = _extract_date_from_text(ev.summary)
+            if extracted and extracted < _today and (_today - extracted).days <= 180:
+                logger.info(
+                    "BUG-04 Datum-Korrektur: %s / %s — Feed=%s → Artikel=%s",
+                    ev.company_name, ev.event_type,
+                    ev.event_date.isoformat(), extracted.isoformat(),
+                )
+                ev.event_date = extracted
+                # Decay ggf. nachtragen nach Datum-Korrektur
+                if ev.event_date < _cutoff_decay:
+                    ev.relevance_score = 0.0
+
+        filtered_events.append(ev)
+
+    logger.info(
+        "Signal-Filter: %d events → %d (-%d Staleness-Drop, Decay-Events behalten)",
+        _before_filter, len(filtered_events), _before_filter - len(filtered_events),
+    )
+
+    return filtered_events, all_patents
 
 
 async def _filter_techcrunch_cached(
