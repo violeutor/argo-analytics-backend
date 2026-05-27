@@ -129,6 +129,12 @@ Regeln für Käufer:
 - Mische US + Europa wenn relevant
 - strategic_rationale: 1 präziser Satz — welche strategische Logik treibt diese Akquisition?
 
+KRITISCH für Ticker:
+- Nur verifizierte, echte Börsenticker verwenden — keine erfundenen Kürzel
+- US-Ticker: 1–5 Buchstaben (z.B. MSFT, GE, HON, CRM)
+- DE-Ticker: meist 3 Buchstaben ohne Suffix (z.B. ENR, SIE, BAS)
+- Wenn du den Ticker eines Unternehmens nicht sicher kennst, lasse ticker leer ("")
+
 Antworte NUR mit einem JSON-Array, kein Markdown:
 [
   {{
@@ -180,6 +186,15 @@ Antworte NUR mit einem JSON-Array, kein Markdown:
             seen.add(bname.lower())
             if conf not in ("high", "medium", "low"):
                 conf = "medium"
+
+            # Ticker-Validierung: Format-Check vor Yahoo-Fetch
+            if ticker:
+                if not re.match(r"^[A-Z0-9]{1,6}$", ticker):
+                    logger.warning(
+                        "Buyer-Gen: Ticker '%s' für '%s' hat ungültiges Format — wird geleert",
+                        ticker, bname,
+                    )
+                    ticker = None
 
             buyers.append(PotentialBuyer(
                 name=bname,
@@ -264,8 +279,16 @@ async def _fetch_market_cap(
                 if resp2.status_code == 200:
                     resp = resp2
                 else:
+                    logger.warning(
+                        "Yahoo: Ticker '%s' (auch '%s') nicht gefunden (HTTP %s/%s) fuer %s",
+                        yahoo_ticker, yahoo_ticker_f, resp.status_code, resp2.status_code, buyer.name,
+                    )
                     return None
             else:
+                logger.warning(
+                    "Yahoo: Ticker '%s' nicht gefunden (HTTP %s) fuer %s",
+                    yahoo_ticker, resp.status_code, buyer.name,
+                )
                 return None
 
         data = resp.json()

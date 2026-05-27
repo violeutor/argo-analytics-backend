@@ -717,7 +717,7 @@ def upsert_funding_round(company_id: str, data: dict) -> bool:
 
 def update_last_funding_enriched_at(company_id: str) -> None:
     """B-05: Setzt companies.last_funding_enriched_at auf jetzt."""
-    from datetime import timezone
+    from datetime import datetime, timezone
     db = get_supabase()
     try:
         db.table("companies").update({
@@ -753,7 +753,7 @@ def fetch_companies_for_funding_enrichment(days_since_last: int = 7) -> list[dic
     B-05: Gibt Companies zurück die seit >N Tagen kein Funding-Enrichment hatten.
     Steuerung via companies.last_funding_enriched_at.
     """
-    from datetime import timezone, timedelta
+    from datetime import datetime, timezone, timedelta
     db = get_supabase()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days_since_last)).isoformat()
     try:
