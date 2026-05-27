@@ -649,10 +649,20 @@ async def _fetch_yf_fundamentals(symbol: str) -> dict:
             if not price and not info.get("regularMarketPrice"):
                 return {}
 
+            # market_cap: fast_info primär → info.marketCap → price × sharesOutstanding
+            # Kleine Nasdaq-Caps (z.B. LNZA) haben oft None in fast_info.market_cap
+            _price_val  = price or info.get("regularMarketPrice")
+            _shares     = info.get("sharesOutstanding")
+            _mktcap_raw = (
+                market_cap
+                or info.get("marketCap")
+                or (_price_val * _shares if _price_val and _shares else None)
+            )
+
             out: dict = {
                 "ticker":               sym,
-                "price":                price or info.get("regularMarketPrice"),
-                "market_cap_bn":        _bn(market_cap or info.get("marketCap")),
+                "price":                _price_val,
+                "market_cap_bn":        _bn(_mktcap_raw),
                 "currency":             currency or info.get("currency"),
                 "week_52_high":         w52_high or info.get("fiftyTwoWeekHigh"),
                 "week_52_low":          w52_low  or info.get("fiftyTwoWeekLow"),
