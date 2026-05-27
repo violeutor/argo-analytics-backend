@@ -64,6 +64,11 @@ class PeerCompany(BaseModel):
     exchange: str | None = None
     # Benchmark-Felder (berechnet)
     stage_normalized: str | None = None
+    # Argo Scores (aus company_scores)
+    composite_score: float | None = None
+    rating: str | None = None          # A | B | C | D
+    financial_score: float | None = None
+    market_score: float | None = None
     # R-10: Positioning note (Claude-generiert, relativ zu Subject Company)
     positioning_note: str | None = None
 
@@ -146,11 +151,9 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
     company_name_lower = company_name.lower()
     resolved_ids: list[str] = []
     for peer_name in peer_names:
-        # Skip wenn Peer-Name die eigene Company matcht (exact oder substring beidseitig)
+        # Skip wenn Peer-Name die eigene Company exakt matcht (case-insensitive)
         pn_lower = peer_name.lower()
-        if (pn_lower == company_name_lower
-                or pn_lower in company_name_lower
-                or company_name_lower in pn_lower):
+        if pn_lower == company_name_lower:
             logger.info("Self-reference skipped: peer '%s' matches source '%s'", peer_name, company_name)
             continue
         peer_id, is_new = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
@@ -201,14 +204,28 @@ async def _claude_generate_peers(company: dict) -> tuple[list[str], dict[str, st
         return [], {}
 
     subject = company.get("name", "")
+
+    # Kontextfelder aufbereiten
+    funding_total = company.get("funding_total_usd_mn")
+    funding_str   = (f"${funding_total:.0f}M" if funding_total and funding_total < 1000
+                     else f"${funding_total/1000:.1f}B" if funding_total else "—")
+    tags          = company.get("tags") or []
+    tags_str      = ", ".join(tags) if tags else "—"
+    tam           = company.get("tam_2035_usd_bn") or company.get("tam_usd_bn")
+    tam_str       = f"${tam:.0f}B TAM 2035" if tam else "—"
+
     prompt = f"""Du bist ein M&A-Analyst. Identifiziere 4-5 direkte Wettbewerber dieser Company.
 
 Company: {subject}
 Kategorie: {company.get('category') or '—'}
 Industrie: {company.get('industry') or '—'}
 Region: {company.get('region') or '—'}
-Beschreibung: {company.get('description') or company.get('summary') or '—'}
+Gegründet: {company.get('founding_year') or '—'}
 Funding Stage: {company.get('funding_stage') or '—'}
+Funding Gesamt: {funding_str}
+Technologie-Tags: {tags_str}
+Markt (TAM): {tam_str}
+Beschreibung: {company.get('description') or company.get('summary') or '—'}
 Investment Path: {company.get('investment_path') or '—'}
 
 Regeln:
@@ -232,7 +249,7 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
                 },
                 json={
                     "model":      "claude-haiku-4-5-20251001",
-                    "max_tokens": 600,
+                    "max_tokens": 1000,
                     "messages":   [{"role": "user", "content": prompt}],
                 },
             )
@@ -476,7 +493,7 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
 # ── DB Helpers ────────────────────────────────────────────────────────────────
 
 def _fetch_peers_by_ids(db, ids: list[str]) -> list[dict]:
-    """Lädt Peer-Companies aus DB anhand ihrer UUIDs."""
+    """Lädt Peer-Companies aus DB anhand ihrer UUIDs — inkl. Argo Scores."""
     if not ids:
         return []
     try:
@@ -486,10 +503,34 @@ def _fetch_peers_by_ids(db, ids: list[str]) -> list[dict]:
             "ipo_status, ipo_potential, investment_path, revenue_usd_mn, "
             "description, website, ticker, exchange, summary"
         ).in_("id", ids).execute()
-        return result.data or []
+        rows = result.data or []
     except Exception as e:
-        logger.warning("_fetch_peers_by_ids failed: %s", e)
+        logger.warning("_fetch_peers_by_ids companies failed: %s", e)
         return []
+
+    # Argo Scores nachladen + in Peer-Row mergen
+    try:
+        scores_result = db.table("company_scores").select(
+            "company_id, composite_score, rating, financial_score, market_score"
+        ).in_("company_id", ids).execute()
+        scores_by_id = {
+            s["company_id"]: s for s in (scores_result.data or [])
+        }
+        for row in rows:
+            s = scores_by_id.get(row["id"], {})
+            row["composite_score"]  = s.get("composite_score")
+            row["rating"]           = s.get("rating")
+            row["financial_score"]  = s.get("financial_score")
+            row["market_score"]     = s.get("market_score")
+    except Exception as e:
+        logger.warning("_fetch_peers_by_ids scores failed (non-fatal): %s", e)
+        for row in rows:
+            row.setdefault("composite_score", None)
+            row.setdefault("rating", None)
+            row.setdefault("financial_score", None)
+            row.setdefault("market_score", None)
+
+    return rows
 
 
 _STAGE_LABEL: dict[str, str] = {
@@ -502,9 +543,24 @@ _STAGE_LABEL: dict[str, str] = {
 
 def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> PeerCompany:
     raw_stage = row.get("funding_stage") or ""
+    db_name   = row["name"]
+
+    # Positioning-Note Lookup: exakter Match → normalisiert → leer
+    # Normalisierung: lowercase + strip — verhindert stille Datenverluste wenn
+    # Claude-generierter Name marginal vom DB-Namen abweicht
+    note = None
+    if peers_context:
+        note = peers_context.get(db_name)
+        if note is None:
+            db_name_norm = db_name.lower().strip()
+            for ctx_name, ctx_note in peers_context.items():
+                if ctx_name.lower().strip() == db_name_norm:
+                    note = ctx_note
+                    break
+
     return PeerCompany(
         id=row["id"],
-        name=row["name"],
+        name=db_name,
         category=row.get("category"),
         industry=row.get("industry"),
         region=row.get("region"),
@@ -523,7 +579,11 @@ def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> Pe
         ticker=row.get("ticker"),
         exchange=row.get("exchange"),
         stage_normalized=_STAGE_LABEL.get(raw_stage, raw_stage) or None,
-        positioning_note=(peers_context or {}).get(row["name"]),
+        composite_score=row.get("composite_score"),
+        rating=row.get("rating"),
+        financial_score=row.get("financial_score"),
+        market_score=row.get("market_score"),
+        positioning_note=note,
     )
 
 
@@ -553,7 +613,39 @@ def _build_benchmark(company: dict, peers: list[dict]) -> list[PeerBenchmark]:
     def _fmt_k(v: int | None) -> str | None:
         return f"{v:,}" if v else None
 
-    # Funding Total
+    # ── Argo Scores (zuerst — wichtigster Vergleichspunkt für VC/PE/M&A) ────
+    # Rating-Verteilung Peers
+    peer_ratings = [p.get("rating") for p in peers if p.get("rating")]
+    if peer_ratings:
+        rating_counts: dict[str, int] = {}
+        for r in peer_ratings:
+            rating_counts[r] = rating_counts.get(r, 0) + 1
+        rating_str = " · ".join(
+            f"{r} ({n})" for r, n in sorted(rating_counts.items())
+        )
+        company_rating = company.get("rating") or "—"
+        # rating aus company_scores falls vorhanden
+        benchmarks.append(PeerBenchmark(
+            metric="Argo Rating",
+            company_value=company_rating,
+            peer_median=rating_str,
+            note="A=No-Brainer · B=Solide · C=Abwägen · D=Uninteressant",
+        ))
+
+    # Composite Score Median
+    peer_scores = [
+        float(p["composite_score"]) for p in peers
+        if p.get("composite_score") is not None
+    ]
+    if len(peer_scores) >= 2:
+        company_score = company.get("composite_score")
+        benchmarks.append(PeerBenchmark(
+            metric="Composite Score",
+            company_value=f"{company_score:.1f}" if company_score is not None else None,
+            peer_median=f"{_median(peer_scores):.1f}" if _median(peer_scores) is not None else None,
+            unit="0–10",
+            note="Argo Score Engine · SC-01–SC-13",
+        ))
     peer_fundings = [p["funding_total_usd_mn"] for p in peers if p.get("funding_total_usd_mn")]
     if len(peer_fundings) >= 2:
         benchmarks.append(PeerBenchmark(
