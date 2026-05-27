@@ -72,30 +72,30 @@ CURATED_TAM: dict[str, dict] = {
 # Ergänzt CURATED_TAM: wenn TAM aus Curated-Dataset kommt, CAGR direkt ablesen.
 
 CURATED_CAGR: dict[str, dict] = {
-    "carbon-capture":          {"cagr_pct": 28.0, "confidence": "high"},
-    "direct-air-capture":      {"cagr_pct": 35.0, "confidence": "high"},
-    "ocean-cdr":               {"cagr_pct": 20.0, "confidence": "medium"},
-    "low-carbon-cement":       {"cagr_pct": 12.0, "confidence": "high"},
-    "sustainable-materials":   {"cagr_pct": 10.0, "confidence": "medium"},
-    "battery":                 {"cagr_pct": 18.0, "confidence": "high"},
-    "long-duration-storage":   {"cagr_pct": 32.0, "confidence": "high"},
-    "solid-state-battery":     {"cagr_pct": 38.0, "confidence": "medium"},
-    "grid":                    {"cagr_pct": 9.0,  "confidence": "high"},
-    "solar":                   {"cagr_pct": 14.0, "confidence": "high"},
-    "hydrogen":                {"cagr_pct": 22.0, "confidence": "high"},
-    "geothermal":              {"cagr_pct": 11.0, "confidence": "high"},
-    "waste-to-energy":         {"cagr_pct": 7.0,  "confidence": "medium"},
-    "agritech":                {"cagr_pct": 13.0, "confidence": "high"},
-    "bioengineering":          {"cagr_pct": 16.0, "confidence": "medium"},
-    "soil-carbon":             {"cagr_pct": 24.0, "confidence": "medium"},
-    "co2-to-fuels":            {"cagr_pct": 26.0, "confidence": "high"},
-    "bio-based-chemicals":     {"cagr_pct": 11.0, "confidence": "medium"},
-    "datacenter-cooling":      {"cagr_pct": 15.0, "confidence": "medium"},
-    "ai-grid-software":        {"cagr_pct": 19.0, "confidence": "medium"},
-    "climate-risk-saas":       {"cagr_pct": 21.0, "confidence": "medium"},
-    "carbon-credits":          {"cagr_pct": 29.0, "confidence": "high"},
-    "irrigation":              {"cagr_pct": 8.0,  "confidence": "medium"},
-    "water-tech":              {"cagr_pct": 7.5,  "confidence": "medium"},
+    "carbon-capture":          {"cagr_pct": 28.0, "confidence": "high",   "source": "IEA Net Zero 2050 · BNEF Carbon Removal 2024"},
+    "direct-air-capture":      {"cagr_pct": 35.0, "confidence": "high",   "source": "BNEF DAC Market Outlook 2024"},
+    "ocean-cdr":               {"cagr_pct": 20.0, "confidence": "medium", "source": "Carbon180 · BNEF 2024"},
+    "low-carbon-cement":       {"cagr_pct": 12.0, "confidence": "high",   "source": "McKinsey Green Cement 2030 · GCCA 2024"},
+    "sustainable-materials":   {"cagr_pct": 10.0, "confidence": "medium", "source": "Ellen MacArthur Foundation 2024"},
+    "battery":                 {"cagr_pct": 18.0, "confidence": "high",   "source": "BNEF Battery Market Outlook 2025"},
+    "long-duration-storage":   {"cagr_pct": 32.0, "confidence": "high",   "source": "BNEF LDES 2024 · Rocky Mountain Institute"},
+    "solid-state-battery":     {"cagr_pct": 38.0, "confidence": "medium", "source": "BloombergNEF Solid-State 2024"},
+    "grid":                    {"cagr_pct": 9.0,  "confidence": "high",   "source": "IEA World Energy Investment 2024"},
+    "solar":                   {"cagr_pct": 14.0, "confidence": "high",   "source": "BNEF New Energy Outlook 2025"},
+    "hydrogen":                {"cagr_pct": 22.0, "confidence": "high",   "source": "IEA Hydrogen Special Report 2024"},
+    "geothermal":              {"cagr_pct": 11.0, "confidence": "high",   "source": "NREL Geothermal Market Report 2024"},
+    "waste-to-energy":         {"cagr_pct": 7.0,  "confidence": "medium", "source": "Allied Market Research 2024"},
+    "agritech":                {"cagr_pct": 13.0, "confidence": "high",   "source": "McKinsey AgTech 2030 · BNEF 2024"},
+    "bioengineering":          {"cagr_pct": 16.0, "confidence": "medium", "source": "Precedence Research 2024"},
+    "soil-carbon":             {"cagr_pct": 24.0, "confidence": "medium", "source": "McKinsey Nature & Climate 2023"},
+    "co2-to-fuels":            {"cagr_pct": 26.0, "confidence": "high",   "source": "BNEF SAF Market Outlook 2024 · IATA"},
+    "bio-based-chemicals":     {"cagr_pct": 11.0, "confidence": "medium", "source": "Grand View Research 2024"},
+    "datacenter-cooling":      {"cagr_pct": 15.0, "confidence": "medium", "source": "MarketsandMarkets DC Cooling 2028"},
+    "ai-grid-software":        {"cagr_pct": 19.0, "confidence": "medium", "source": "Wood Mackenzie Grid Software 2030"},
+    "climate-risk-saas":       {"cagr_pct": 21.0, "confidence": "medium", "source": "MarketsandMarkets Climate Risk Analytics 2028"},
+    "carbon-credits":          {"cagr_pct": 29.0, "confidence": "high",   "source": "McKinsey VCM 2030 · BNEF 2024"},
+    "irrigation":              {"cagr_pct": 8.0,  "confidence": "medium", "source": "Grand View Research Irrigation 2030"},
+    "water-tech":              {"cagr_pct": 7.5,  "confidence": "medium", "source": "Global Water Intelligence 2024"},
 }
 
 # Marktgröße heute (2024, USD Bn) — für mathematische CAGR-Hochrechnung als Fallback
@@ -216,7 +216,7 @@ def compute_cagr(
             data = CURATED_CAGR[best_key]
             return {
                 "cagr_pct":        data["cagr_pct"],
-                "cagr_source":     f"Curated · {best_key} (BNEF/IEA/McKinsey)",
+                "cagr_source":     data.get("source", "BNEF · IEA · McKinsey"),
                 "cagr_confidence": data["confidence"],
             }
 

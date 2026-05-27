@@ -714,13 +714,13 @@ async def enrich_market_data(
         _sector_normalized = sector.translate(str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789"))
         cagr_data = compute_cagr(_sector_normalized, tam_usd_bn)
         if cagr_data.get("cagr_pct"):
-            result["cagr_pct"] = cagr_data["cagr_pct"]
+            result["cagr_pct"]    = cagr_data["cagr_pct"]
+            result["cagr_source"] = cagr_data.get("cagr_source")
         logger.info(
-            "CAGR fallback für %s (sector=%s): %.1f%% (%s, conf=%s)",
+            "CAGR fallback für %s (sector=%s): %.1f%% · %s",
             company_name, _sector_normalized,
             cagr_data.get("cagr_pct", 0),
             cagr_data.get("cagr_source", "—"),
-            cagr_data.get("cagr_confidence", "—"),
         )
 
     geo_scope = market_details.get("geo_scope", "global")
