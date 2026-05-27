@@ -1542,6 +1542,75 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         beta=beta,
         fd_source=fd_source,
     )
+
+    # KPI-Supplement (FD-05): Lücken in fundamentals aus kpi_timeseries füllen.
+    # Tritt auf wenn yfinance .info timeout (8s) → yf_out = {} → alle Fundamentals null.
+    # Preis kommt von Twelve Data (kein Timeout-Problem), daher price/mktcap ≠ null.
+    # Diese Supplementierung läuft auf dem Response-Pfad (nicht nur BG Task 4c).
+    if fundamentals.is_listed and company_id and (
+        fundamentals.revenue_bn is None or fundamentals.ebitda_bn is None
+    ):
+        try:
+            _db = get_supabase()
+            _kpi_rows = (
+                _db.table("kpi_timeseries")
+                .select("metric,fiscal_year,value")
+                .eq("company_id", company_id)
+                .execute()
+                .data or []
+            )
+            # Neuester Wert je Metrik
+            _kpi_best: dict[str, dict] = {}
+            for _r in _kpi_rows:
+                _m = _r["metric"]
+                if _m not in _kpi_best or _r["fiscal_year"] > _kpi_best[_m]["fiscal_year"]:
+                    _kpi_best[_m] = _r
+            _kpi: dict[str, float] = {m: v["value"] for m, v in _kpi_best.items()}
+
+            _rev_mn   = _kpi.get("revenue_mn")
+            _ebit_mn  = _kpi.get("ebit_mn")
+            _ebitda_mn = _kpi.get("ebitda_mn")
+            _ni_mn    = _kpi.get("net_income_mn")
+
+            # revenue_bn: direkt aus kpi
+            if fundamentals.revenue_bn is None and _rev_mn:
+                fundamentals.revenue_bn = round(_rev_mn / 1000, 3)
+                logger.info("KPI-Supplement revenue_bn für %s: %.3fBn", company_name, fundamentals.revenue_bn)
+
+            # ebitda_bn: direkt aus kpi
+            if fundamentals.ebitda_bn is None and _ebitda_mn:
+                fundamentals.ebitda_bn = round(_ebitda_mn / 1000, 3)
+                logger.info("KPI-Supplement ebitda_bn für %s: %.3fBn", company_name, fundamentals.ebitda_bn)
+
+            # operating_margin_pct: ebit_mn / revenue_mn (analog zu operatingIncome/totalRevenue)
+            if fundamentals.operating_margin_pct is None and _ebit_mn and _rev_mn and _rev_mn > 0:
+                fundamentals.operating_margin_pct = round(_ebit_mn / _rev_mn * 100, 1)
+                logger.info("KPI-Supplement operating_margin_pct für %s: %.1f%%", company_name, fundamentals.operating_margin_pct)
+
+            # profit_margin_pct: net_income_mn / revenue_mn (analog zu netIncome/totalRevenue)
+            if fundamentals.profit_margin_pct is None and _ni_mn and _rev_mn and _rev_mn > 0:
+                fundamentals.profit_margin_pct = round(_ni_mn / _rev_mn * 100, 1)
+                logger.info("KPI-Supplement profit_margin_pct für %s: %.1f%%", company_name, fundamentals.profit_margin_pct)
+
+            # EV/Revenue + EV/EBITDA aus Mktcap berechnen wenn Direktwert fehlt
+            # Hinweis: ohne Debt/Cash ist EV ≈ Mktcap (konservative Näherung, kein Debt in kpi)
+            if fundamentals.enterprise_value_bn is None and fundamentals.market_cap_bn:
+                fundamentals.enterprise_value_bn = fundamentals.market_cap_bn
+            _mktcap_raw = (fundamentals.market_cap_bn or 0) * 1e9
+            if _mktcap_raw > 0:
+                if fundamentals.ev_revenue is None and fundamentals.revenue_bn:
+                    fundamentals.ev_revenue = round(_mktcap_raw / (fundamentals.revenue_bn * 1e9), 1)
+                if fundamentals.ev_ebitda is None and fundamentals.ebitda_bn and fundamentals.ebitda_bn > 0:
+                    fundamentals.ev_ebitda = round(_mktcap_raw / (fundamentals.ebitda_bn * 1e9), 1)
+
+            # P/E aus Mktcap + Net Income (EDGAR) wenn pe_ratio fehlt
+            if fundamentals.pe_ratio is None and _ni_mn and _ni_mn > 0 and fundamentals.market_cap_bn:
+                fundamentals.pe_ratio = round((fundamentals.market_cap_bn * 1000) / _ni_mn, 1)
+                logger.info("KPI-Supplement pe_ratio für %s: %.1f (Mktcap/NetIncome)", company_name, fundamentals.pe_ratio)
+
+        except Exception as _kpi_sup_err:
+            logger.debug("KPI-Supplement failed für %s: %s", company_name, _kpi_sup_err)
+
     # FD-02 — Lücken-Badge: keine öffentlichen Finanzdaten
     if fd_source["primary"] == "none":
         warnings.append("Keine Finanzdaten öffentlich verfügbar für diese Company.")
