@@ -1571,6 +1571,16 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             _ebit_mn  = _kpi.get("ebit_mn")
             _ebitda_mn = _kpi.get("ebitda_mn")
             _ni_mn    = _kpi.get("net_income_mn")
+            _shares   = _kpi.get("shares_outstanding")   # absolute Aktienanzahl aus EDGAR DEI
+
+            # market_cap_bn aus price × shares_outstanding (KPI-06)
+            # Greift wenn yfinance timeout → market_cap_bn null, aber Preis via Twelve Data da
+            if fundamentals.market_cap_bn is None and fundamentals.price and _shares and _shares > 0:
+                fundamentals.market_cap_bn = round((fundamentals.price * _shares) / 1e9, 3)
+                logger.info(
+                    "KPI-Supplement market_cap_bn für %s: %.3fBn (price=%.2f × shares=%,.0f)",
+                    company_name, fundamentals.market_cap_bn, fundamentals.price, _shares,
+                )
 
             # revenue_bn: direkt aus kpi
             if fundamentals.revenue_bn is None and _rev_mn:

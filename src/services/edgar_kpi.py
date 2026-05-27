@@ -57,7 +57,8 @@ _XBRL_MAP: dict[str, str] = {
 
 # DEI-Namespace (separate von us-gaap)
 _DEI_MAP: dict[str, str] = {
-    "EntityNumberOfEmployees": "headcount",
+    "EntityNumberOfEmployees":               "headcount",
+    "EntityCommonStockSharesOutstanding":    "shares_outstanding",   # KPI-06: für market_cap_bn Derivation
 }
 
 # Monetary-Metriken → durch 1_000_000 dividieren (XBRL liefert volle USD)
@@ -65,6 +66,9 @@ _MONETARY: frozenset[str] = frozenset({
     "revenue_mn", "net_income_mn", "operating_income_mn",
     "depreciation_mn", "equity_mn", "total_assets_mn",
 })
+
+# Shares-Metriken → XBRL unit key "shares", Wert als absolute Zahl (kein Divider)
+_SHARES_UNIT: frozenset[str] = frozenset({"shares_outstanding"})
 
 # Helper-Metriken die nur für EBITDA-Berechnung gebraucht werden
 _HELPER_METRICS: frozenset[str] = frozenset({"operating_income_mn", "depreciation_mn"})
@@ -147,7 +151,11 @@ def _extract_xbrl_values(
         if not tag_data:
             continue
 
-        unit_key = "USD" if metric_key in _MONETARY else "pure"
+        unit_key = (
+            "USD"    if metric_key in _MONETARY    else
+            "shares" if metric_key in _SHARES_UNIT else
+            "pure"
+        )
         for entry in tag_data.get("units", {}).get(unit_key, []):
             if entry.get("form") not in ("10-K", "10-K/A"):
                 continue
