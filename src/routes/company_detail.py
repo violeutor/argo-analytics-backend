@@ -1164,6 +1164,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             return False
 
     _market_data_valid = _market_data_fresh(market_data_cached)
+    logger.warning(
+        "MARKET_DEBUG %s — fresh=%s enriched_at=%s sam=%s cagr=%s",
+        company_name, _market_data_valid,
+        (market_data_cached or {}).get("enriched_at"),
+        (market_data_cached or {}).get("sam_usd_bn"),
+        (market_data_cached or {}).get("cagr_pct"),
+    )
+
     if company_id and not _market_data_valid:
         async def _market_enrichment_bg():
             try:
@@ -1205,35 +1213,62 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         background_tasks.add_task(_market_enrichment_bg)
         logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
 
-    elif company_id and company.get("peers_context"):
-        # R-22 follow-up: competition_note mit aktuellem peers_context refreshen.
-        # Läuft wenn market_data bereits gecacht ist — kein teurer async-Teil (kein DDG/Claude).
-        # Nur competition_score + competition_note + market_cycle werden upgesertet.
-        async def _competition_refresh_bg():
-            try:
-                all_companies = fetch_companies(limit=500)
-                all_rounds    = fetch_all_funding_rounds()
-                comp_result   = enrich_market_data_sync_wrapper(
-                    company_id=company_id,
-                    company_name=company_name,
-                    category=company.get("category"),
-                    sector_tag=None,
-                    tam_usd_bn=tam.get("tam_usd_bn"),
-                    all_companies=all_companies,
-                    all_funding_rounds=all_rounds,
-                    async_result=None,   # keine neuen DDG-Signale — Peers-Kontext genügt
-                    peers_context=company.get("peers_context"),
-                    is_listed=is_listed,  # BUG-51: mature statt early für listed
-                )
-                upsert_market_data(company_id, {
-                    k: v for k, v in comp_result.items()
-                    if k in ("competition_note",)  # Score bleibt aus originalem DDG-Enrichment
-                })
-                logger.debug("R-22 competition_note refreshed for %s", company_name)
-            except Exception as e:
-                logger.warning("R-22 competition refresh failed for %s: %s", company_name, e)
+    else:
+        # Daten sind frisch — gezielte Einzel-Patches für fehlende Felder
 
-        background_tasks.add_task(_competition_refresh_bg)
+        # R-22: competition_note mit aktuellem peers_context refreshen (nur wenn peers vorhanden)
+        if company_id and company.get("peers_context"):
+            async def _competition_refresh_bg():
+                try:
+                    all_companies = fetch_companies(limit=500)
+                    all_rounds    = fetch_all_funding_rounds()
+                    comp_result   = enrich_market_data_sync_wrapper(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        sector_tag=None,
+                        tam_usd_bn=tam.get("tam_usd_bn"),
+                        all_companies=all_companies,
+                        all_funding_rounds=all_rounds,
+                        async_result=None,
+                        peers_context=company.get("peers_context"),
+                        is_listed=is_listed,
+                    )
+                    upsert_market_data(company_id, {
+                        k: v for k, v in comp_result.items()
+                        if k in ("competition_note",)
+                    })
+                    logger.debug("R-22 competition_note refreshed for %s", company_name)
+                except Exception as e:
+                    logger.warning("R-22 competition refresh failed for %s: %s", company_name, e)
+            background_tasks.add_task(_competition_refresh_bg)
+
+        # CAGR-Patch: läuft unabhängig von R-22 wenn cagr_pct null ist
+        # Kein DDG — nur compute_cagr() Fallback (CURATED_CAGR, 24 Sektoren)
+        if company_id and market_data_cached and not market_data_cached.get("cagr_pct"):
+            async def _cagr_patch_bg():
+                try:
+                    from src.services.tam import compute_cagr
+                    _cat = company.get("category") or ""
+                    _sec = _cat.lower().replace(" ", "-")
+                    _sec_norm = _sec.translate(str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789"))
+                    cagr_data = compute_cagr(_sec_norm, tam.get("tam_usd_bn"))
+                    if cagr_data.get("cagr_pct"):
+                        upsert_market_data(company_id, {
+                            "cagr_pct":    cagr_data["cagr_pct"],
+                            "cagr_source": cagr_data.get("cagr_source"),
+                        })
+                        logger.info(
+                            "CAGR patch OK für %s: %.1f%% · %s (sector=%s)",
+                            company_name, cagr_data["cagr_pct"],
+                            cagr_data.get("cagr_source", "—"), _sec_norm,
+                        )
+                    else:
+                        logger.warning("CAGR patch: kein Match für %s (sector=%s)", company_name, _sec_norm)
+                except Exception as e:
+                    logger.warning("CAGR patch failed für %s: %s", company_name, e)
+            background_tasks.add_task(_cagr_patch_bg)
+            logger.info("CAGR patch queued für %s (cagr_pct null, market_data fresh)", company_name)
 
     # 5. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
