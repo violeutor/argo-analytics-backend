@@ -177,25 +177,44 @@ async def _fetch_market_snippets(company: str, sector: str, category: str = "") 
                     if resp.status_code != 200:
                         continue
 
-                    # Snippets als Fallback
-                    snippets = re.findall(
-                        r'class="result__snippet"[^>]*>([^<]{30,400})<',
-                        resp.text,
+                    # Snippets — HTML-Tags im Text entfernen (DDG boldet Keywords)
+                    # Zwei Patterns: mit und ohne verschachtelten HTML-Tags
+                    raw_snippets = re.findall(
+                        r'class="result__snippet"[^>]*>(.*?)</(?:a|div|span)>',
+                        resp.text, re.DOTALL,
                     )
-                    all_snippets.extend(s.strip() for s in snippets[:5])
+                    for s in raw_snippets[:6]:
+                        clean = re.sub(r'<[^>]+>', '', s).strip()
+                        if len(clean) >= 30:
+                            all_snippets.append(clean[:400])
 
-                    # URLs für Page-Fetch extrahieren (DuckDuckGo HTML: result__url Links)
+                    # URLs für Page-Fetch — reihenfolge-unabhängig (class kann vor href stehen)
+                    # Pattern 1: href vor class (alt)
                     raw_urls = re.findall(
                         r'href="(https?://(?!duckduckgo)[^"]{10,200})"[^>]*class="result__a"',
                         resp.text,
                     )
-                    # Fallback: alle externen hrefs
+                    # Pattern 2: class vor href (aktuelles DDG-HTML)
                     if not raw_urls:
                         raw_urls = re.findall(
-                            r'href="(https?://(?!duckduckgo)[^"]{10,150})"',
+                            r'class="result__a"[^>]*href="(https?://(?!duckduckgo)[^"]{10,200})"',
+                            resp.text,
+                        )
+                    # Pattern 3: data-href oder uddg redirect URLs
+                    if not raw_urls:
+                        uddg = re.findall(r'uddg=(https?[^&"]{10,200})', resp.text)
+                        raw_urls = [u.split("%3F")[0] for u in uddg[:4]]
+                    # Pattern 4: generischer Fallback alle externen hrefs
+                    if not raw_urls:
+                        raw_urls = re.findall(
+                            r'href="(https?://(?!(?:duckduckgo|duck\.co))[^"]{10,150})"',
                             resp.text,
                         )
                     all_urls.extend(raw_urls[:4])
+                    logger.debug(
+                        "DDG '%s': %d snippets, %d urls",
+                        q[:40], len(all_snippets), len(raw_urls),
+                    )
                     await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.debug("DDG query failed ('%s'): %s", q[:50], e)
@@ -662,6 +681,16 @@ async def enrich_market_data(
         result["growth_drivers"] = market_details["growth_drivers"]
     if market_details.get("cagr_pct"):
         result["cagr_pct"] = market_details["cagr_pct"]
+
+    # Diagnose-Log: zeigt ob MD-B01 Daten geliefert hat
+    logger.info(
+        "MD-B01 result für %s: segments=%s drivers=%s cagr=%s (snippets=%d)",
+        company_name,
+        bool(market_details.get("segments")),
+        bool(market_details.get("growth_drivers")),
+        market_details.get("cagr_pct"),
+        len(snippets) if snippets else 0,
+    )
 
     # CAGR-Hochrechnung — Fallback wenn MD-B01 keinen CAGR geliefert hat
     if not result.get("cagr_pct"):
