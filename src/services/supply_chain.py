@@ -220,6 +220,24 @@ SUPPLY_CHAIN_MAP: dict[str, dict] = {
         ],
     },
 
+    # ── CO₂-to-Fuels / SAF / E-Fuels ────────────────────────────────────────────
+    "co2-to-fuels": {
+        "upstream": [
+            {"ticker": "LIN",  "name": "Linde",              "exchange": "Nasdaq","role": "Industrial CO₂ supply & H₂ infrastructure", "relevance": 0.85},
+            {"ticker": "APD",  "name": "Air Products",       "exchange": "NYSE",  "role": "Green H₂ as feedstock for e-fuels",          "relevance": 0.8},
+            {"ticker": "BKR",  "name": "Baker Hughes",       "exchange": "Nasdaq","role": "Industrial compressors & CO₂ processing",    "relevance": 0.7},
+        ],
+        "downstream": [
+            {"ticker": "UAL",  "name": "United Airlines",    "exchange": "Nasdaq","role": "SAF offtake — decarbonisation mandate",       "relevance": 0.85},
+            {"ticker": "DAL",  "name": "Delta Air Lines",    "exchange": "NYSE",  "role": "SAF buyer — net-zero 2050 commitment",        "relevance": 0.8},
+            {"ticker": "HON",  "name": "Honeywell",          "exchange": "Nasdaq","role": "SAF process tech licensor & integrator",      "relevance": 0.75},
+        ],
+        "etfs": [
+            {"ticker": "ICLN", "name": "iShares Global Clean Energy ETF", "relevance": 0.6},
+            {"ticker": "CTEC", "name": "Global X CleanTech ETF",          "relevance": 0.65},
+        ],
+    },
+
     # ── Waste-to-Energy / Biogas ──────────────────────────────────────────────
     "waste-to-energy": {
         "upstream": [

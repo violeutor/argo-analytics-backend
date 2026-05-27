@@ -1731,10 +1731,27 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
     sc = get_supply_chain(sc_tags)
 
-    # 10b. Value Drivers — Background-Enrichment wenn noch nicht in DB
+    # 10b. Value Drivers — Background-Enrichment wenn nicht in DB oder >30d alt
+    # TTL 30d: verhindert Stale Data (z.B. Fervo 1442 Enablers aus alter Pipeline).
+    # Hard Cap im enrich_value_drivers selbst: max 15 Enabler + 15 Contributors.
     if company_id and sc_tags:
+        from datetime import timezone as _tz
         vd_cached = fetch_value_drivers(company_id)
-        if not vd_cached:
+        _vd_stale = True
+        if vd_cached:
+            try:
+                _enriched_at = vd_cached.get("enriched_at") or vd_cached.get("created_at")
+                if _enriched_at:
+                    _vd_age = datetime.now(_tz.utc) - datetime.fromisoformat(
+                        _enriched_at.replace("Z", "+00:00")
+                    )
+                    _vd_stale = _vd_age.days > 30
+                    if _vd_stale:
+                        logger.info("Value drivers stale (%dd) für %s — re-enriching", _vd_age.days, company_name)
+            except Exception:
+                _vd_stale = not vd_cached  # Fallback: stale wenn kein Cache
+
+        if _vd_stale:
             async def _value_drivers_bg():
                 try:
                     vd_result = await enrich_value_drivers(

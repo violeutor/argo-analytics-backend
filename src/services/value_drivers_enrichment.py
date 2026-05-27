@@ -377,6 +377,13 @@ async def enrich_value_drivers(
             "source":             "supply_chain_py+claude",
         })
 
+    # Hard Cap: max 15 Enabler + 15 Contributors — Sicherheitsnetz gegen historische
+    # Overgeneration (Fervo hatte 1442 Enablers aus altem freien Claude-Prompt).
+    # supply_chain.py liefert max ~8 je Sektor — Cap greift nur als Sicherheitsnetz.
+    _MAX_PER_TYPE = 15
+    enriched_enablers     = sorted(enriched_enablers,     key=lambda x: -x.get("relevance", 0))[:_MAX_PER_TYPE]
+    enriched_contributors = sorted(enriched_contributors, key=lambda x: -x.get("relevance", 0))[:_MAX_PER_TYPE]
+
     logger.info(
         "Value drivers enriched for %s: %d enablers, %d contributors, %d etfs",
         company_name, len(enriched_enablers), len(enriched_contributors), len(etfs),
