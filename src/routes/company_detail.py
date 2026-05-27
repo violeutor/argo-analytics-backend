@@ -736,9 +736,14 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
     # td_out überschreibt bei Preis/Exchange/52W — yf_out liefert Revenue/EBITDA/Margen
     out: dict = {**yf_out, **td_out}
 
-    # Preis-Fallback: Yahoo Chart wenn weder Twelve Data noch yfinance fast_info Preis lieferte
-    if not out.get("price"):
-        logger.info("Kein Preis via Twelve Data / yfinance für %s — Yahoo Chart Fallback", symbol)
+    # Fallback: Yahoo Chart wenn Preis oder Market Cap fehlt.
+    # market_cap_bn kann None sein obwohl Preis da — yfinance fast_info.market_cap
+    # ist für kleine Nasdaq-Caps (z.B. LNZA) oft None obwohl Preis zurückkommt.
+    if not out.get("price") or not out.get("market_cap_bn"):
+        logger.info(
+            "Preis oder Market Cap fehlt für %s (price=%s mktcap=%s) — Yahoo Chart Fallback",
+            symbol, out.get("price"), out.get("market_cap_bn"),
+        )
         fallback = await _fetch_yahoo_price_fallback(symbol)
         for k in ("price", "market_cap_bn", "currency", "exchange"):
             if fallback.get(k) and not out.get(k):
