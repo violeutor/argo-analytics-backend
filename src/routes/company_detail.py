@@ -719,6 +719,16 @@ async def _fetch_yf_fundamentals(symbol: str) -> dict:
             if ebitda and rev and not info.get("ebitdaMargins"):
                 out["ebitda_margin_pct"] = round(ebitda / rev * 100, 1)
 
+            # Beta direkt aus Yahoo Finance .info — Fallback wenn Bridge-Cache fehlt.
+            # Yahoos pre-calculated Beta (trailing 12M vs. S&P 500).
+            # Präzisere Berechnung (252-Tage-Returns) läuft über BA-Bridge beta_cache.
+            _yf_beta = info.get("beta")
+            if _yf_beta is not None:
+                try:
+                    out["yf_beta"] = round(float(_yf_beta), 3)
+                except (TypeError, ValueError):
+                    pass
+
             return out
         except Exception as e:
             logger.debug("_fetch_yf_fundamentals sync failed for %s: %s", sym, e)
@@ -1443,6 +1453,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         category=company.get("category") or getattr(enrichment, "category", None),
         is_listed=is_listed,
     )
+
+    # yfinance Beta-Fallback: wenn Bridge keinen Cache hat (404) und Company listed
+    # yahoo["yf_beta"] = Yahoos pre-calculated trailing-12M Beta vs. S&P 500
+    # Mittelfristig: Bridge seeded proaktiv Kurse für alle listed Argo-Companies
+    if not beta.get("beta_1y") and is_listed and yahoo and yahoo.get("yf_beta"):
+        beta = {
+            "beta_1y":                    yahoo["yf_beta"],
+            "beta_3y":                    None,
+            "volatility_30d":             None,
+            "beta_source":                "yahoo",
+            "beta_benchmark":             "Yahoo Finance · S&P 500 (trailing 12M)",
+            "beta_benchmark_is_fallback": False,
+            "beta_calculated_at":         None,
+            "beta_data_quality":          "partial",
+        }
+        logger.info("Beta Fallback yfinance für %s: β=%.2f", company_name, yahoo["yf_beta"])
 
     # DQ-04: Proxy Beta — Beta des Investment-Instruments (z.B. NEE, CRH) für Tab 1
     # Nur wenn die Company selbst NICHT listed ist (sonst ist Company = Instrument)
