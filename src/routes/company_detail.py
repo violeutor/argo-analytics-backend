@@ -1572,6 +1572,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             _ebitda_mn = _kpi.get("ebitda_mn")
             _ni_mn    = _kpi.get("net_income_mn")
             _shares   = _kpi.get("shares_outstanding")   # absolute Aktienanzahl aus EDGAR DEI
+            # KPI-06: neue Metriken
+            _gross_profit_mn      = _kpi.get("gross_profit_mn")
+            _total_debt_mn        = _kpi.get("total_debt_mn")
+            _cash_mn              = _kpi.get("cash_mn")
+            _operating_cashflow_mn= _kpi.get("operating_cashflow_mn")
+            _free_cashflow_mn     = _kpi.get("free_cashflow_mn")
 
             # market_cap_bn aus price × shares_outstanding (KPI-06)
             # Greift wenn yfinance timeout → market_cap_bn null, aber Preis via Twelve Data da
@@ -1592,6 +1598,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 fundamentals.ebitda_bn = round(_ebitda_mn / 1000, 3)
                 logger.info("KPI-Supplement ebitda_bn für %s: %.3fBn", company_name, fundamentals.ebitda_bn)
 
+            # gross_margin_pct: KPI-06 — GrossProfit / Revenue
+            if fundamentals.gross_margin_pct is None and _gross_profit_mn and _rev_mn and _rev_mn > 0:
+                fundamentals.gross_margin_pct = round(_gross_profit_mn / _rev_mn * 100, 1)
+                logger.info("KPI-Supplement gross_margin_pct für %s: %.1f%%", company_name, fundamentals.gross_margin_pct)
+
             # operating_margin_pct: ebit_mn / revenue_mn (analog zu operatingIncome/totalRevenue)
             if fundamentals.operating_margin_pct is None and _ebit_mn and _rev_mn and _rev_mn > 0:
                 fundamentals.operating_margin_pct = round(_ebit_mn / _rev_mn * 100, 1)
@@ -1602,16 +1613,45 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 fundamentals.profit_margin_pct = round(_ni_mn / _rev_mn * 100, 1)
                 logger.info("KPI-Supplement profit_margin_pct für %s: %.1f%%", company_name, fundamentals.profit_margin_pct)
 
-            # EV/Revenue + EV/EBITDA aus Mktcap berechnen wenn Direktwert fehlt
-            # Hinweis: ohne Debt/Cash ist EV ≈ Mktcap (konservative Näherung, kein Debt in kpi)
-            if fundamentals.enterprise_value_bn is None and fundamentals.market_cap_bn:
-                fundamentals.enterprise_value_bn = fundamentals.market_cap_bn
+            # Cashflow: KPI-06 — aus EDGAR wenn Yahoo gefehlt hat
+            if fundamentals.operating_cashflow_bn is None and _operating_cashflow_mn is not None:
+                fundamentals.operating_cashflow_bn = round(_operating_cashflow_mn / 1000, 3)
+                logger.info("KPI-Supplement operating_cashflow_bn für %s: %.3fBn", company_name, fundamentals.operating_cashflow_bn)
+
+            if fundamentals.free_cashflow_bn is None and _free_cashflow_mn is not None:
+                fundamentals.free_cashflow_bn = round(_free_cashflow_mn / 1000, 3)
+                logger.info("KPI-Supplement free_cashflow_bn für %s: %.3fBn", company_name, fundamentals.free_cashflow_bn)
+
+            # Enterprise Value: KPI-06 — reales EV = Mktcap + Debt - Cash
+            # Priorität: echtes EV aus Debt+Cash > Näherung Mktcap
             _mktcap_raw = (fundamentals.market_cap_bn or 0) * 1e9
-            if _mktcap_raw > 0:
-                if fundamentals.ev_revenue is None and fundamentals.revenue_bn:
-                    fundamentals.ev_revenue = round(_mktcap_raw / (fundamentals.revenue_bn * 1e9), 1)
+            if fundamentals.enterprise_value_bn is None and _mktcap_raw > 0:
+                if _total_debt_mn is not None and _cash_mn is not None:
+                    # Reales EV (KPI-06)
+                    _ev_real = _mktcap_raw + (_total_debt_mn * 1e6) - (_cash_mn * 1e6)
+                    fundamentals.enterprise_value_bn = round(_ev_real / 1e9, 3)
+                    logger.info(
+                        "KPI-Supplement EV (real) für %s: %.3fBn (mktcap=%.2f + debt=%.0fMn - cash=%.0fMn)",
+                        company_name, fundamentals.enterprise_value_bn,
+                        fundamentals.market_cap_bn, _total_debt_mn, _cash_mn,
+                    )
+                else:
+                    # Fallback: EV ≈ Mktcap (kein Debt/Cash in kpi_timeseries)
+                    fundamentals.enterprise_value_bn = fundamentals.market_cap_bn
+                    logger.info("KPI-Supplement EV (Näherung ≈ Mktcap) für %s: %.3fBn", company_name, fundamentals.enterprise_value_bn)
+
+            # Debt/EBITDA: KPI-06
+            if fundamentals.debt_ebitda is None and _total_debt_mn and _ebitda_mn and _ebitda_mn > 0:
+                fundamentals.debt_ebitda = round((_total_debt_mn / 1000) / (_ebitda_mn / 1000), 2)
+                logger.info("KPI-Supplement debt_ebitda für %s: %.2f×", company_name, fundamentals.debt_ebitda)
+
+            # EV/Revenue + EV/EBITDA
+            _ev_bn = fundamentals.enterprise_value_bn
+            if _ev_bn and _ev_bn > 0:
+                if fundamentals.ev_revenue is None and fundamentals.revenue_bn and fundamentals.revenue_bn > 0:
+                    fundamentals.ev_revenue = round(_ev_bn / fundamentals.revenue_bn, 1)
                 if fundamentals.ev_ebitda is None and fundamentals.ebitda_bn and fundamentals.ebitda_bn > 0:
-                    fundamentals.ev_ebitda = round(_mktcap_raw / (fundamentals.ebitda_bn * 1e9), 1)
+                    fundamentals.ev_ebitda = round(_ev_bn / fundamentals.ebitda_bn, 1)
 
             # P/E aus Mktcap + Net Income (EDGAR) wenn pe_ratio fehlt
             if fundamentals.pe_ratio is None and _ni_mn and _ni_mn > 0 and fundamentals.market_cap_bn:

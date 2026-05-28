@@ -53,6 +53,22 @@ _XBRL_MAP: dict[str, str] = {
     "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": "equity_mn",
     # Total Assets
     "Assets":                                                            "total_assets_mn",
+    # ── KPI-06: Neue Metriken ─────────────────────────────────────────────
+    # Gross Profit → gross_margin_pct
+    "GrossProfit":                                                       "gross_profit_mn",
+    # Debt (Long + Short) → reales EV = Mktcap + Debt - Cash
+    "LongTermDebt":                                                      "long_term_debt_mn",
+    "LongTermDebtNoncurrent":                                            "long_term_debt_mn",
+    "ShortTermBorrowings":                                               "short_term_debt_mn",
+    "DebtCurrent":                                                       "short_term_debt_mn",
+    # Cash → reales EV
+    "CashAndCashEquivalentsAtCarryingValue":                             "cash_mn",
+    "CashCashEquivalentsAndShortTermInvestments":                        "cash_mn",
+    # Operating Cashflow
+    "NetCashProvidedByUsedInOperatingActivities":                        "operating_cashflow_mn",
+    # CapEx → FCF = OpCF - CapEx
+    "PaymentsToAcquirePropertyPlantAndEquipment":                        "capex_mn",
+    "PaymentsForCapitalImprovements":                                    "capex_mn",
 }
 
 # DEI-Namespace (separate von us-gaap)
@@ -65,6 +81,9 @@ _DEI_MAP: dict[str, str] = {
 _MONETARY: frozenset[str] = frozenset({
     "revenue_mn", "net_income_mn", "operating_income_mn",
     "depreciation_mn", "equity_mn", "total_assets_mn",
+    # KPI-06
+    "gross_profit_mn", "long_term_debt_mn", "short_term_debt_mn",
+    "cash_mn", "operating_cashflow_mn", "capex_mn",
 })
 
 # Shares-Metriken → XBRL unit key "shares", Wert als absolute Zahl (kein Divider)
@@ -72,6 +91,9 @@ _SHARES_UNIT: frozenset[str] = frozenset({"shares_outstanding"})
 
 # Helper-Metriken die nur für EBITDA-Berechnung gebraucht werden
 _HELPER_METRICS: frozenset[str] = frozenset({"operating_income_mn", "depreciation_mn"})
+
+# Debt-Komponenten: werden zu total_debt_mn summiert, dann aus Output entfernt
+_DEBT_COMPONENTS: frozenset[str] = frozenset({"long_term_debt_mn", "short_term_debt_mn"})
 
 
 # ── CIK Lookup ────────────────────────────────────────────────────────────────
@@ -206,6 +228,53 @@ def _derive_ebitda(rows: list[dict]) -> list[dict]:
     return clean
 
 
+def _derive_debt_and_fcf(rows: list[dict]) -> list[dict]:
+    """
+    KPI-06:
+      total_debt_mn  = long_term_debt_mn + short_term_debt_mn  (pro FY summiert)
+      free_cashflow_mn = operating_cashflow_mn - capex_mn       (pro FY)
+    Entfernt Debt-Komponenten (long/short) aus Output — nur total_debt_mn bleibt.
+    CapEx bleibt als Einzelmetrik erhalten (nützlich für CapEx-Intensitäts-Score).
+    """
+    lt_by_fy  = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "long_term_debt_mn"}
+    st_by_fy  = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "short_term_debt_mn"}
+    ocf_by_fy = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "operating_cashflow_mn"}
+    cx_by_fy  = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "capex_mn"}
+
+    # Debt-Komponenten rausfiltern
+    clean = [r for r in rows if r["metric"] not in _DEBT_COMPONENTS]
+
+    # total_debt_mn: LT + ST (mind. LT muss vorhanden sein)
+    all_debt_fys = set(lt_by_fy) | set(st_by_fy)
+    for fy in sorted(all_debt_fys):
+        lt  = lt_by_fy.get(fy, 0.0)
+        st  = st_by_fy.get(fy, 0.0)
+        total = round(lt + st, 2)
+        if total >= 0:
+            clean.append({
+                "metric":      "total_debt_mn",
+                "fiscal_year": fy,
+                "value":       total,
+                "currency":    "USD",
+                "source":      "edgar_xbrl",
+                "confidence":  "high",
+            })
+
+    # free_cashflow_mn = OpCF - CapEx (wo beide vorhanden)
+    for fy in sorted(set(ocf_by_fy) & set(cx_by_fy)):
+        fcf = round(ocf_by_fy[fy] - cx_by_fy[fy], 2)
+        clean.append({
+            "metric":      "free_cashflow_mn",
+            "fiscal_year": fy,
+            "value":       fcf,
+            "currency":    "USD",
+            "source":      "edgar_xbrl",
+            "confidence":  "high",
+        })
+
+    return clean
+
+
 # ── Haupt-Fetch ───────────────────────────────────────────────────────────────
 
 async def fetch_edgar_kpis(
@@ -255,6 +324,8 @@ async def fetch_edgar_kpis(
 
     # EBITDA ableiten + Helper-Metriken entfernen
     rows = _derive_ebitda(rows)
+    # KPI-06: total_debt_mn + free_cashflow_mn ableiten + Debt-Komponenten entfernen
+    rows = _derive_debt_and_fcf(rows)
 
     logger.info(
         "EDGAR KPI: %d rows für '%s' (CIK %s, cutoff %d)",
