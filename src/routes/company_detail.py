@@ -210,6 +210,8 @@ class CompanyDetailResponse(BaseModel):
     warnings: list[str]
     # SC-01–SC-13: Scoring Engine
     scores: dict | None = None      # ScoreResult.to_dict() — hero_path, rating, alle Sub-/Path-Scores
+    # Potential Buyers — für Tab 8 Investitionspfade
+    potential_buyers: list[dict] = []
 
 
 def _parse_year(value: str | None) -> int | None:
@@ -1584,7 +1586,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             if fundamentals.market_cap_bn is None and fundamentals.price and _shares and _shares > 0:
                 fundamentals.market_cap_bn = round((fundamentals.price * _shares) / 1e9, 3)
                 logger.info(
-                    "KPI-Supplement market_cap_bn für %s: %.3fBn (price=%.2f × shares=%,.0f)",
+                    "KPI-Supplement market_cap_bn für %s: %.3fBn (price=%.2f × shares=%.0f)",
                     company_name, fundamentals.market_cap_bn, fundamentals.price, _shares,
                 )
 
@@ -2080,7 +2082,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         is_known=True,
         warnings=warnings,
         scores=scores_result,
-    )
+        potential_buyers=[
+            {
+                "name":             b.get("name"),
+                "ticker":           b.get("ticker"),
+                "sector":           b.get("sector"),
+                "market_cap_usd_bn": b.get("market_cap_usd_bn"),
+                "mfr_confidence":   b.get("mfr_confidence"),
+                "strategic_fit":    b.get("strategic_fit"),
+            }
+            for b in buyers
+        ],
 
 
 # ── UX-01: Enrichment Status Endpoint ────────────────────────────────────────
