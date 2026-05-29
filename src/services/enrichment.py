@@ -179,7 +179,23 @@ async def _fetch_wikipedia(company: str) -> dict:
             return out
 
         data = resp.json()
-        desc = data.get("extract", "")
+
+        # Fix B: Disambiguation-Guard — Wikipedia-Disambig-Seiten erkennen und überspringen
+        # Erkennungsmuster: type="disambiguation" oder extract enthält "may refer to"
+        page_type = data.get("type", "")
+        desc_raw  = data.get("extract", "")
+        is_disambig = (
+            page_type == "disambiguation"
+            or "may refer to" in desc_raw[:200].lower()
+            or "can refer to" in desc_raw[:200].lower()
+            or desc_raw.strip().endswith("may refer to:")
+        )
+        if is_disambig:
+            logger.info("Wikipedia disambiguation erkannt für '%s' — überspringe", company)
+            # Kein return — weiter mit Wikitext-Fallback (Step 2) und DDG-Fallback
+            desc_raw = ""
+
+        desc = desc_raw
         out["description"]    = desc[:500] if desc else None
         out["wikipedia_url"]  = data.get("content_urls", {}).get("desktop", {}).get("page")
         # BUG-02: Kanonischer Name aus Wikipedia-Titel (z.B. "spacex" → "SpaceX")
@@ -1150,6 +1166,47 @@ async def _fetch_company_website(website: str) -> dict:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
+async def _ddg_description_fallback(company_name: str) -> str | None:
+    """
+    Fix B: DuckDuckGo-Fallback für Company-Description.
+    Greift wenn Wikipedia Disambig-Seite liefert oder 404.
+    Sucht '{company_name} company' und extrahiert AbstractText aus DDG Instant Answer API.
+    Fallback auf ersten organischen Snippet wenn AbstractText leer.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=8, headers=HEADERS) as client:
+            # DDG Instant Answer API — kein Scraping, kein Rate-Limit
+            resp = await client.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q":      f"{company_name} company",
+                    "format": "json",
+                    "no_html": "1",
+                    "skip_disambig": "1",
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+
+            # AbstractText: direkte Zusammenfassung (Wikipedia-Extrakt via DDG)
+            abstract = data.get("AbstractText", "").strip()
+            if abstract and len(abstract) > 50:
+                logger.debug("DDG AbstractText für '%s': %s…", company_name, abstract[:80])
+                return abstract[:500]
+
+            # Fallback: RelatedTopics erster Eintrag
+            topics = data.get("RelatedTopics", [])
+            if topics and isinstance(topics[0], dict):
+                text = topics[0].get("Text", "").strip()
+                if text and len(text) > 50:
+                    return text[:500]
+
+    except Exception as e:
+        logger.debug("_ddg_description_fallback error für '%s': %s", company_name, e)
+    return None
+
+
 async def enrich_company(
     company_name: str,
     company_record: dict | None = None,
@@ -1232,6 +1289,21 @@ async def enrich_company(
         result.employee_count = cb.employee_count or result.employee_count
         result.investors      = list(cb.investors)
         result.funding_rounds = list(cb.funding_rounds)
+
+    # Fix B: DuckDuckGo-Fallback für description — greift wenn Wikipedia Disambig oder 404
+    if not result.description:
+        try:
+            ddg_desc = await asyncio.wait_for(
+                _ddg_description_fallback(company_name),
+                timeout=8.0,
+            )
+            if ddg_desc:
+                result.description = ddg_desc
+                logger.info("DDG description fallback OK für '%s'", company_name)
+        except asyncio.TimeoutError:
+            logger.warning("DDG description fallback timeout für '%s'", company_name)
+        except Exception as e:
+            logger.warning("DDG description fallback failed für '%s': %s", company_name, e)
 
     # Company-Website: Headcount-Fallback wenn Wikipedia + Crunchbase leer
     # Priorität: DB-URL → Wikipedia-Wikitext-URL → Heuristik aus Company-Name

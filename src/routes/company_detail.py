@@ -1269,6 +1269,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             background_tasks.add_task(_cagr_patch_bg)
             logger.info("CAGR patch queued für %s (cagr_pct null, market_data fresh)", company_name)
 
+        # Fix A: enrichment_status auf done setzen wenn Daten frisch aber Status noch pending
+        # Basis: category + industry reichen — description/founding_year sind optional
+        if company_id and company.get("enrichment_status") == "pending":
+            if company.get("category") and company.get("industry"):
+                set_enrichment_status(company_id, "done")
+                logger.info("enrichment_status → done (market_data frisch, category+industry befüllt): %s", company_name)
+
     # 5. Parallel: enrichment (with timeout) + yahoo + intro
     async def _safe_enrichment():
         try:
