@@ -975,30 +975,27 @@ def _get_fundamentals_source(
     is_listed: bool,
     exchange: str | None,
     region: str | None,
+    ba_found: bool = False,
 ) -> dict:
     """
     FD-01 — Routing-Logik: welche Quellen für Fundamentals nutzen.
 
-    Returns:
-        {
-            "primary":   str,   # Haupt-Quelle
-            "secondary": str | None,  # Ergänzung (z.B. BA-Bridge für listed DE)
-            "beta":      str,   # 'market' (listed) | 'damodaran' (private)
-            "quality_flag": str | None,  # None | 'partial' — für Frontend-Hinweis
-        }
-
-    Routing-Tabelle (aus REQUESTS v1.8 FD-Block):
-        Private DE          → BA-Bridge primär
-        Private US          → EDGAR primär (Phase 2), Wikipedia Fallback
-        Private EU non-DE   → none (Revenue oft nicht öffentlich)
-        Private non-EU/US   → none
-        Listed US           → Yahoo Finance
-        Listed EU DE        → Yahoo Finance + BA-Bridge (Ergänzung)
-        Listed EU non-DE    → Yahoo Finance (quality_flag='partial' — lückenhaft)
-        Listed non-EU/US    → Yahoo Finance (quality_flag='partial')
+    DE-REGION-01: ba_found=True überschreibt region/exchange-Erkennung für private Companies.
+    Frisch angelegte Companies haben oft kein region-Feld — BA-Treffer ist der verlässlichste
+    Indikator dass es sich um eine DE-Company handelt.
     """
     exchange_norm = (exchange or "").lower()
     region_norm   = (region or "").lower()
+
+    # DE-REGION-01: BA-Treffer ist stärker als region-Feld.
+    # Gilt nur für private Companies (nicht listed).
+    if ba_found and not is_listed:
+        return {
+            "primary":      FUNDAMENTALS_SOURCE_BA,
+            "secondary":    None,
+            "beta":         "damodaran",
+            "quality_flag": None,
+        }
 
     # ── Listed ──────────────────────────────────────────────────────────────
     if is_listed:
@@ -1492,6 +1489,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         is_listed=is_listed,
         exchange=company.get("exchange") or yahoo.get("exchange"),
         region=company.get("region"),
+        ba_found=bool(enrichment.bundesanzeiger and enrichment.bundesanzeiger.found),
     )
     # BUG-37: ticker mit Exchange zusammenbauen damit Suffix-Auflösung in _fetch_beta_from_bridge greift
     # "SIE" (kein Exchange) → "SIE · Frankfurt" → _fetch_beta_from_bridge löst zu "SIE.DE" auf
@@ -1544,6 +1542,20 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         beta=beta,
         fd_source=fd_source,
     )
+
+    # DE-REGION-01: region nachschreiben wenn BA-Treffer aber region noch leer.
+    # Verhindert dass beim nächsten Request ohne BA-Fetch falsch geroutet wird.
+    if (
+        company_id
+        and fundamentals.ba_found
+        and not company.get("region")
+        and not is_listed
+    ):
+        try:
+            get_supabase().table("companies").update({"region": "DE"}).eq("id", company_id).execute()
+            logger.info("DE-REGION-01: region='DE' für %s nachgeschrieben", company_name)
+        except Exception as _re:
+            logger.debug("DE-REGION-01: region-Write fehlgeschlagen für %s: %s", company_name, _re)
 
     # KPI-Supplement (FD-05): Lücken in fundamentals aus kpi_timeseries füllen.
     # Tritt auf wenn yfinance .info timeout (8s) → yf_out = {} → alle Fundamentals null.
