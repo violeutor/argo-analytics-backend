@@ -2,7 +2,8 @@
 Company Enrichment Pipeline — v2.0
 ====================================
 Sources:
-  - Crunchbase public HTML  → funding rounds + investor list
+  - DDG Instant Answer API  → employee_count, HQ (ersetzt Crunchbase BUG-04)
+  - Wikidata SPARQL          → founding_year, HQ als strukturierter Fallback
   - Bundesanzeiger          → financials + ownership for private DE companies
   - Wikipedia API           → founding year, description
 
@@ -65,19 +66,6 @@ class FundingRound:
 
 
 @dataclass
-class CrunchbaseData:
-    url: str
-    description: str | None = None
-    funding_total_mn: float | None = None
-    stage: str | None = None
-    investors: list[InvestorEntry] = field(default_factory=list)
-    funding_rounds: list[FundingRound] = field(default_factory=list)
-    founded_year: str | None = None
-    headquarters: str | None = None
-    employee_count: str | None = None
-
-
-@dataclass
 class BundesanzeigerData:
     company_name: str
     legal_form: str | None = None
@@ -109,7 +97,6 @@ class EnrichmentResult:
     ipo_status: str | None = None  # BUG-47: "listed" | "private" aus Wikipedia-Infobox
     category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
-    crunchbase: CrunchbaseData | None = None
     bundesanzeiger: BundesanzeigerData | None = None
     investors: list[InvestorEntry] = field(default_factory=list)
     funding_rounds: list[FundingRound] = field(default_factory=list)
@@ -409,106 +396,100 @@ async def _fetch_wikipedia(company: str) -> dict:
     return out
 
 
-# ─── Crunchbase ───────────────────────────────────────────────────────────────
+# ─── DDG + Wikidata Company Facts ────────────────────────────────────────────
+# Ersetzt Crunchbase (BUG-04: JS-Rendering, 403/429 Fehlermeldungen, keine SSR-Daten mehr)
+# DDG Instant Answer API: employee_count, HQ aus Knowledge Graph
+# Wikidata SPARQL: founding_year, HQ als strukturierte Fallback-Quelle
 
-async def _fetch_crunchbase(company: str) -> CrunchbaseData:
-    slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
-    url  = f"https://www.crunchbase.com/organization/{slug}"
-    result = CrunchbaseData(url=url)
+async def _fetch_ddg_company_facts(company: str) -> dict:
+    """
+    Holt Company-Fakten via DDG Instant Answer API + Wikidata SPARQL.
+    Liefert: founded_year, headquarters, employee_count.
+    Kein Scraping, kein Rate-Limit, keine 403/429.
 
+    Quellen (Reihenfolge):
+      1. DDG Instant Answer API (Knowledge Graph) → employee_count, HQ
+      2. Wikidata SPARQL → founding_year, HQ als Fallback
+    """
+    out: dict = {}
+
+    # ── 1. DDG Instant Answer API ────────────────────────────────────────────
     try:
-        async with httpx.AsyncClient(
-            timeout=12, headers=HEADERS, follow_redirects=True
-        ) as client:
-            resp = await client.get(url)
+        async with httpx.AsyncClient(timeout=8, headers=HEADERS) as client:
+            resp = await client.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q":            f"{company} company",
+                    "format":       "json",
+                    "no_html":      "1",
+                    "skip_disambig":"1",
+                },
+            )
+        if resp.status_code == 200:
+            data = resp.json()
 
-        if resp.status_code != 200:
-            return result
+            # Infobox-Felder aus DDG Knowledge Graph
+            for item in data.get("Infobox", {}).get("content", []):
+                label = (item.get("label") or "").lower()
+                value = (item.get("value") or "").strip()
+                if not value:
+                    continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+                if "employee" in label or "staff" in label:
+                    # Normalisieren: "1,200" → "1200", "~500" → "500"
+                    clean = re.sub(r"[^0-9]", "", value.split()[0])
+                    if clean.isdigit() and 1 <= int(clean) <= 500_000:
+                        out["employee_count"] = clean
 
-        # Meta description (SSR, always present)
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta:
-            desc = meta.get("content", "")
-            result.description = desc[:400]
-            # Funding total
-            m = re.search(r"\$([0-9,.]+)\s*(M|B|million|billion)", desc, re.I)
-            if m:
-                val  = float(m.group(1).replace(",", ""))
-                unit = m.group(2).upper()
-                result.funding_total_mn = val * 1000 if unit in ("B", "BILLION") else val
-            # Stage
-            for s in ["Series E", "Series D", "Series C", "Series B", "Series A", "Seed", "IPO"]:
-                if s.lower() in desc.lower():
-                    result.stage = s
-                    break
+                elif "headquarter" in label or "location" in label or "founded in" not in label and "city" in label:
+                    if len(value) < 100:
+                        out.setdefault("headquarters", value)
 
-        # JSON-LD structured data
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-                if isinstance(data, dict):
-                    if "foundingDate" in data:
-                        result.founded_year = str(data["foundingDate"])[:4]
-                    emp = data.get("numberOfEmployees")
-                    if emp:
-                        result.employee_count = str(
-                            emp.get("value", emp) if isinstance(emp, dict) else emp
-                        )
-                    addr = data.get("address")
-                    if isinstance(addr, dict):
-                        city    = addr.get("addressLocality", "")
-                        country = addr.get("addressCountry", "")
-                        result.headquarters = f"{city}, {country}".strip(", ")
-            except Exception:
-                pass
+                elif "founded" in label or "inception" in label:
+                    m = re.search(r"(\d{4})", value)
+                    if m:
+                        out.setdefault("founded_year", m.group(1))
 
-        # Investor mentions from page text
-        page_text = soup.get_text(" ", strip=True)
-        for pat in [
-            r"(?:Lead investors?|Notable investors?)[:\s]+([^.]{10,200})",
-            r"(?:backed by|funded by)[:\s]+([^.]{10,150})",
-        ]:
-            m = re.search(pat, page_text, re.I)
-            if m:
-                raw_text = m.group(1)
-                for raw in re.split(r",\s*|\band\b|\s+&\s+", raw_text):
-                    name = raw.strip().rstrip(".")
-                    if 3 < len(name) < 60:
-                        result.investors.append(InvestorEntry(
-                            name=name,
-                            type=_classify_investor(name),
-                            role=_classify_role(raw_text),
-                        ))
-                break
-
-        # Funding rounds from page text (heuristic)
-        round_re = re.compile(
-            r"(Seed|Series [A-F]|Growth|Venture)\s+[\·\-–]?\s*\$?([\d,.]+)\s*(M|B|million|billion)?",
-            re.I,
-        )
-        seen_rounds: set[str] = set()
-        for m in round_re.finditer(page_text[:6000]):
-            rname = m.group(1).strip().title()
-            if rname in seen_rounds:
-                continue
-            seen_rounds.add(rname)
-            try:
-                val  = float(m.group(2).replace(",", ""))
-                unit = (m.group(3) or "M").upper()
-                if unit in ("B", "BILLION"):
-                    val *= 1000
-                result.funding_rounds.append(FundingRound(
-                    round_name=rname, amount_mn=val, date=None,
-                ))
-            except ValueError:
-                pass
+            if out:
+                logger.debug("DDG facts OK für '%s': %s", company, out)
 
     except Exception as e:
-        logger.warning("Crunchbase scrape failed for '%s': %s", company, e)
+        logger.debug("DDG company facts failed für '%s': %s", company, e)
 
-    return result
+    # ── 2. Wikidata SPARQL — Fallback für founded_year + HQ ─────────────────
+    if not out.get("founded_year") or not out.get("headquarters"):
+        try:
+            sparql = f"""
+SELECT ?founded ?hqLabel WHERE {{
+  ?item wdt:P31 wd:Q4830453 ;
+        rdfs:label "{company}"@en .
+  OPTIONAL {{ ?item wdt:P571 ?founded. }}
+  OPTIONAL {{ ?item wdt:P159 ?hq. }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}}
+LIMIT 1
+"""
+            async with httpx.AsyncClient(timeout=8, headers={**HEADERS, "Accept": "application/json"}) as client:
+                wd_resp = await client.get(
+                    "https://query.wikidata.org/sparql",
+                    params={"query": sparql, "format": "json"},
+                )
+            if wd_resp.status_code == 200:
+                bindings = wd_resp.json().get("results", {}).get("bindings", [])
+                if bindings:
+                    row = bindings[0]
+                    if not out.get("founded_year") and "founded" in row:
+                        year_str = row["founded"]["value"][:4]
+                        if year_str.isdigit():
+                            out["founded_year"] = year_str
+                    if not out.get("headquarters") and "hqLabel" in row:
+                        out["headquarters"] = row["hqLabel"]["value"]
+                    if out:
+                        logger.debug("Wikidata facts OK für '%s': %s", company, out)
+        except Exception as e:
+            logger.debug("Wikidata SPARQL failed für '%s': %s", company, e)
+
+    return out
 
 
 # ─── Bundesanzeiger ──────────────────────────────────────────────────────────
@@ -1088,7 +1069,7 @@ async def _fetch_company_website(website: str) -> dict:
     """
     Scrapt die Company-Website nach Headcount-Angaben.
     Sucht in JSON-LD (numberOfEmployees) und im Seitentext.
-    Wird aufgerufen wenn Wikipedia + Crunchbase keinen Headcount liefern.
+    Wird aufgerufen wenn Wikipedia + DDG keinen Headcount liefern.
     """
     out: dict = {}
     if not website:
@@ -1213,7 +1194,7 @@ async def enrich_company(
     existing_tags: list[str] | None = None,
 ) -> EnrichmentResult:
     """
-    Full async enrichment. Runs Wikipedia + Crunchbase concurrently;
+    Full async enrichment. Runs Wikipedia + DDG/Wikidata concurrently;
     adds Bundesanzeiger if company is likely German-registered and private.
 
     Returns EnrichmentResult — caller persists to Supabase.
@@ -1226,14 +1207,13 @@ async def enrich_company(
 
     result = EnrichmentResult(name=company_name)
 
-    # Concurrent: Wikipedia (primär) + Crunchbase (opportunistisch)
-    # Crunchbase liefert keine strukturierten Daten mehr via SSR (JS-Rendering, BUG-04).
-    # JSON-LD gelegentlich noch brauchbar für foundingDate + numberOfEmployees.
-    # Wikipedia Wikitext-Infobox ist primäre Quelle für founded_year, headquarters, headcount.
-    # Crunchbase-Timeout: 12s — wird via return_exceptions abgefangen, blockiert nicht.
-    wiki, cb = await asyncio.gather(
+    # Concurrent: Wikipedia (primär) + DDG/Wikidata (Fakten-Fallback)
+    # Crunchbase entfernt: JS-Rendering seit ~2024, 403/429, keine SSR-Daten (BUG-04)
+    # DDG Instant Answer API + Wikidata SPARQL als saubere, kostenfreie Alternative
+    # Wikipedia Wikitext-Infobox bleibt primäre Quelle für founded_year, HQ, headcount
+    wiki, ddg = await asyncio.gather(
         _fetch_wikipedia(company_name),
-        _fetch_crunchbase(company_name),
+        _fetch_ddg_company_facts(company_name),
         return_exceptions=True,
     )
 
@@ -1280,15 +1260,11 @@ async def enrich_company(
         elif result.ipo_status == "private":
             is_listed = False
 
-    if isinstance(cb, CrunchbaseData):
-        result.crunchbase     = cb
-        result.description    = result.description or cb.description
-        result.founded_year   = result.founded_year or cb.founded_year
-        # Crunchbase-Werte überschreiben Wikipedia nur wenn vorhanden
-        result.headquarters   = cb.headquarters or result.headquarters
-        result.employee_count = cb.employee_count or result.employee_count
-        result.investors      = list(cb.investors)
-        result.funding_rounds = list(cb.funding_rounds)
+    # DDG/Wikidata-Fakten als Fallback — füllt nur was Wikipedia leer ließ
+    if isinstance(ddg, dict) and ddg:
+        result.founded_year   = result.founded_year   or ddg.get("founded_year")
+        result.headquarters   = result.headquarters   or ddg.get("headquarters")
+        result.employee_count = result.employee_count or ddg.get("employee_count")
 
     # Fix B: DuckDuckGo-Fallback für description — greift wenn Wikipedia Disambig oder 404
     if not result.description:
@@ -1305,7 +1281,7 @@ async def enrich_company(
         except Exception as e:
             logger.warning("DDG description fallback failed für '%s': %s", company_name, e)
 
-    # Company-Website: Headcount-Fallback wenn Wikipedia + Crunchbase leer
+    # Company-Website: Headcount-Fallback wenn Wikipedia + DDG leer
     # Priorität: DB-URL → Wikipedia-Wikitext-URL → Heuristik aus Company-Name
     _known_url = company_record.get("website") or result.website
     if not result.employee_count:
