@@ -587,18 +587,23 @@ def compute_value_driver_score(
     Inputs: value_drivers (dependency_score, market_position, type), tech_readiness.
 
     Gewichtung:
-      TechReadiness      0–3.0 Pkt  (Proxy für Innovations- und Skalierungspotenzial)
+      Dependency Score   0–4.0 Pkt  (Kernmetrik — tatsächliche Enabler-Qualität)
+      Market Position    0–2.0 Pkt  (Leader/Dominant Einträge)
       Driver Count       0–2.0 Pkt  (Anzahl identifizierter Value Drivers)
-      Dependency Score   0–3.0 Pkt  (Durchschnitt; hohe Abhängigkeit = starke Position)
-      Market Position    0–1.5 Pkt  (Leader/Dominant Einträge)
+      TechReadiness      0–1.5 Pkt  (Stage-Proxy — unterstützend, nicht dominant)
       Baseline           0.5  Pkt   (immer)
+
+    Rationale: TechReadiness ist ein Stage-Proxy, keine echte Enabler-Qualität.
+    Dependency Score und Market Position reflektieren die tatsächliche Supply-Chain-Stärke.
+    Eine Series-A Company mit kritischen Enablerabhängigkeiten schlägt eine
+    Series-C Company mit commodity Enablers — wie in der Realität.
     """
     inputs: dict = {}
     score = 0.5   # Baseline
 
     tr = float(company.get("tech_readiness") or 0.5)
     inputs["tech_readiness"] = tr
-    score += tr * 3.0
+    score += tr * 1.5   # Stage-Proxy: unterstützend, nicht dominant (war: 3.0)
 
     vds = value_drivers or []
     if not vds:
@@ -609,19 +614,19 @@ def compute_value_driver_score(
     score += min(2.0, len(vds) * 0.4)
     inputs["driver_count"] = len(vds)
 
-    # Dependency Score Durchschnitt (0–3)
+    # Dependency Score Durchschnitt (0–4) — Kernmetrik
     dep_vals = [float(d["dependency_score"]) for d in vds if d.get("dependency_score") is not None]
     if dep_vals:
         avg_dep = sum(dep_vals) / len(dep_vals)
-        score += avg_dep * 3.0
+        score += avg_dep * 4.0   # war: 3.0 — Dependency ist die echte Qualitätsmetrik
         inputs["avg_dependency_score"] = round(avg_dep, 2)
 
-    # Market Position Bonus (0–1.5)
+    # Market Position Bonus (0–2.0) — erhöht von 1.5 auf 2.0
     strong = sum(
         1 for d in vds
         if (d.get("market_position") or "").lower() in ("leader", "market leader", "dominant", "monopol", "quasi-monopol")
     )
-    score += min(1.5, strong * 0.75)
+    score += min(2.0, strong * 0.75)   # war: min(1.5, ...)
     inputs["strong_positions"] = strong
 
     return _safe_round(score), inputs
@@ -1006,13 +1011,31 @@ def compute_dimension_risks(
         "risk_sources":        ["companies.funding_stage", "signals[negative_earnings,high_burn]"],
     }
 
-    # ─── 3. STRATEGY (Wettbewerbsposition aus peers_context) ───────────────
+    # ─── 3. STRATEGY (Wettbewerbsposition) ────────────────────────────────
+    # Rationale: peer_count war ein inverser Proxy — mehr Peers = mehr Opportunität
+    # ist strukturell falsch (mehr Peers = mehr Wettbewerb). Fix: competition_score
+    # und market_cycle aus Market Data als primäre Basis, Peers als Risiko-Signal.
     peers_resolved = company.get("peers_resolved") or []
     peer_count     = len(peers_resolved)
 
-    strat_opp  = 5.0 + min(1.5, peer_count * 0.3)  # mehr Peers = Markt wird vermessen
-    strat_risk = 4.0 + min(3.0, peer_count * 0.5)  # mehr Peers = mehr Wettbewerb
-    strat_conf = "medium" if peer_count >= 2 else ("low" if peer_count == 1 else "low")
+    # Opportunität aus Market Cycle + Positive Signals (nicht aus Peer Count)
+    _CYCLE_STRAT_OPP = {"early": 7.0, "growth": 6.5, "mature": 5.0, "consolidation": 4.5}
+    market_cycle_strat = md.get("market_cycle") or ""
+    strat_opp = _CYCLE_STRAT_OPP.get(market_cycle_strat, 5.0)
+
+    # Risiko: Wettbewerbsdichte (competition_score) + Peer Count als Dichte-Proxy
+    _COMP_STRAT_RISK = {"low": 2.5, "medium": 4.5, "high": 7.5}
+    competition_strat = md.get("competition_score") or ""
+    if competition_strat:
+        strat_risk = _COMP_STRAT_RISK.get(competition_strat, 4.5)
+    else:
+        # Fallback: Peer Count als Wettbewerbsdichte-Proxy (Risiko, nicht Opportunität)
+        strat_risk = min(7.5, 3.5 + peer_count * 0.4)
+
+    strat_conf = "high" if (competition_strat and market_cycle_strat) else (
+        "medium" if (competition_strat or market_cycle_strat) else
+        ("medium" if peer_count >= 2 else "low")
+    )
 
     strat_neg = [s for s in sigs if s.get("signal_category") in ("leadership_change", "strategy_pivot")]
     strat_pos = [s for s in sigs if s.get("signal_category") in ("new_partnership", "expansion", "acquisition") and s.get("direction") == "positive"]
@@ -1023,8 +1046,8 @@ def compute_dimension_risks(
         "opportunity_score": _safe_round(strat_opp),
         "risk_score":        _safe_round(strat_risk),
         "data_confidence":   strat_conf,
-        "opportunity_sources": ["peers.resolved_count", "signals[new_partnership,expansion]"],
-        "risk_sources":        ["peers.competitive_density", "signals[leadership_change]"],
+        "opportunity_sources": ["market_data.market_cycle", "signals[new_partnership,expansion]"],
+        "risk_sources":        ["market_data.competition_score", "peers.competitive_density", "signals[leadership_change]"],
     }
 
     # ─── 4. POLITICAL ──────────────────────────────────────────────────────
