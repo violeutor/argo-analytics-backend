@@ -2070,7 +2070,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         intro=intro,
         description=description_disp,
         wikipedia_url=enrichment.wikipedia_url,
-        crunchbase_url=enrichment.crunchbase.url if enrichment.crunchbase else None,
+        crunchbase_url=None,  # Crunchbase entfernt (BUG-04) — Feld nicht mehr in EnrichmentResult
         headquarters=headquarters_disp,
         employee_count=headcount_disp,
         ipo_status=ipo_status,
