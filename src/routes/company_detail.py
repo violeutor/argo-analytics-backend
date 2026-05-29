@@ -2190,3 +2190,40 @@ async def get_enrichment_status(name: str):
         "all_ready":   all_ready,
         "tabs":        tabs,
     }
+
+
+@router.get("/company/{name}/scores")
+async def get_company_scores(name: str):
+    """
+    UX-PEER-01: Lightweight Score-Endpoint für Frontend-Polling.
+    Liest nur company_scores aus DB — kein Heavy-Fetch, kein Recalculate.
+    Liefert composite_score, financial_score, market_score, rating.
+    <50ms. Wird vom Peer-Score-Poller alle 5s gecallt.
+    """
+    sb = get_supabase()
+
+    rows = sb.table("companies").select("id").ilike("name", name).limit(1).execute()
+    if not rows.data:
+        raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
+
+    company_id = rows.data[0]["id"]
+    cached = fetch_company_scores(company_id)
+
+    if not cached:
+        return {
+            "company":         name,
+            "scores_ready":    False,
+            "composite_score": None,
+            "financial_score": None,
+            "market_score":    None,
+            "rating":          None,
+        }
+
+    return {
+        "company":         name,
+        "scores_ready":    cached.get("composite_score") is not None,
+        "composite_score": cached.get("composite_score"),
+        "financial_score": cached.get("financial_score"),
+        "market_score":    cached.get("market_score"),
+        "rating":          cached.get("rating"),
+    }
