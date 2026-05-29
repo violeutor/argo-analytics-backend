@@ -161,9 +161,24 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
             resolved_ids.append(peer_id)
             name_to_id[peer_name.lower()] = peer_id
             if is_new:
-                # Organic DB growth: Enrichment im Hintergrund anstoßen
+                # Neue Company: vollständiges Enrichment
                 background_tasks.add_task(_enrich_new_peer, peer_id, peer_name)
                 logger.info("Enrichment scheduled for new peer: %s", peer_name)
+            else:
+                # Bestehende Company ohne Score: Enrichment nachholen ohne
+                # auf manuelles Aufrufen zu warten (PEERS-01)
+                try:
+                    _score_check = db.table("company_scores").select("composite_score").eq(
+                        "company_id", peer_id
+                    ).limit(1).execute()
+                    _has_score = bool((_score_check.data or [{}])[0].get("composite_score"))
+                except Exception:
+                    _has_score = False
+                if not _has_score:
+                    background_tasks.add_task(_enrich_new_peer, peer_id, peer_name)
+                    logger.info(
+                        "Enrichment scheduled for existing peer without score: %s", peer_name
+                    )
 
     # 5. peers_resolved + peers_context + generated_at in companies schreiben
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -347,48 +362,104 @@ async def _resolve_or_create_peer(
 
 async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
     """
-    R-21: Vollständiges Enrichment für neu angelegte Peer-Companies.
-    Stufe 1: Wikipedia (founding_year, headquarters, headcount, website, description)
+    R-21: Vollständiges Enrichment für Peer-Companies (neu oder ohne Score).
+    Stufe 1: Wikipedia + Crunchbase → vollständige Persistenz via upsert_company_enrichment
+             (identischer Pfad wie company_detail.py — tags, category, industry, ipo_status,
+             ticker, exchange, region werden korrekt geschrieben)
     Stufe 2: TAM-Lookup + Market Data Enrichment (async, non-blocking)
+    Stufe 3: Scoring mit frischen Daten
     """
+    import re as _re
     try:
-        from src.services.enrichment import enrich_company
-        enriched = await enrich_company(peer_name)
+        from src.services.enrichment import enrich_company, infer_category_industry
+        from src.integrations.supabase import upsert_company_enrichment
+
+        # Peer-Row aus DB holen für Guards (ipo_status, ticker, category)
+        db = get_supabase()
+        peer_row_res = db.table("companies").select("*").eq("id", peer_id).limit(1).execute()
+        peer_record  = (peer_row_res.data or [{}])[0]
+
+        enriched = await enrich_company(peer_name, company_record=peer_record)
         if not enriched:
             logger.debug("_enrich_new_peer: kein Ergebnis für %s", peer_name)
             return
 
-        db = get_supabase()
-        payload: dict = {}
-
-        if enriched.headquarters:
-            payload["headquarters"] = str(enriched.headquarters)
-        if enriched.website:
-            payload["website"] = str(enriched.website)
-
-        if enriched.founded_year:
+        # Headcount normalisieren (gleiche Logik wie company_detail.py)
+        def _parse_headcount(value):
+            if not value:
+                return None
             try:
-                payload["founding_year"] = int(str(enriched.founded_year)[:4])
-            except (ValueError, TypeError):
-                pass
+                match = _re.search(r"(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)", str(value))
+                if match:
+                    lo = int(match.group(1).replace(",", ""))
+                    hi = int(match.group(2).replace(",", ""))
+                    n  = (lo + hi) // 2
+                else:
+                    match = _re.search(r"\d[\d,]*", str(value))
+                    if not match:
+                        return None
+                    n = int(match.group().replace(",", ""))
+                return n if 1 <= n <= 100_000 else None
+            except Exception:
+                return None
 
-        if enriched.employee_count:
+        def _parse_year(value):
+            if not value:
+                return None
             try:
-                cleaned = re.sub(r"[^\d]", "", str(enriched.employee_count).split()[0])
-                if cleaned:
-                    payload["headcount"] = int(cleaned)
-            except (ValueError, TypeError):
-                pass
+                match = _re.search(r"\b(19|20)\d{2}\b", str(value))
+                return int(match.group()) if match else None
+            except Exception:
+                return None
 
-        if enriched.description:
-            payload["description"] = str(enriched.description)[:1000]
+        # Vollständiger upsert_payload — identisch mit company_detail.py
+        upsert_payload: dict = {
+            "founding_year": _parse_year(enriched.founded_year),
+            "headquarters":  enriched.headquarters or None,
+            "headcount":     _parse_headcount(enriched.employee_count),
+            "description":   (enriched.description or None),
+            "website":       enriched.website or None,
+            "tags":          enriched.tags if enriched.tags else None,
+        }
 
-        if payload:
-            db.table("companies").update(payload).eq("id", peer_id).execute()
-            logger.info("Peer %s enriched (Wikipedia): %d Felder", peer_name, len(payload))
+        # ipo_status: nur schreiben wenn Enrichment Wert hat und DB noch keinen
+        if enriched.ipo_status and not peer_record.get("ipo_status"):
+            upsert_payload["ipo_status"] = enriched.ipo_status
+
+        # Ticker + Exchange: nur für börsennotierte Companies
+        _is_listed = (
+            peer_record.get("ipo_status") == "listed"
+            or enriched.ipo_status == "listed"
+            or bool(enriched.ticker)
+        )
+        if _is_listed:
+            if enriched.ticker and not peer_record.get("ticker"):
+                upsert_payload["ticker"] = enriched.ticker
+            if enriched.exchange and not peer_record.get("exchange"):
+                upsert_payload["exchange"] = enriched.exchange
+
+        # category / industry aus Tag-Inferenz
+        inferred_cat = enriched.category
+        inferred_ind = enriched.industry
+        if not inferred_cat and enriched.tags:
+            inferred_cat, inferred_ind = infer_category_industry(enriched.tags)
+        if inferred_cat and not peer_record.get("category"):
+            upsert_payload["category"] = inferred_cat
+        if inferred_ind and not peer_record.get("industry"):
+            upsert_payload["industry"] = inferred_ind
+
+        # None-Werte rausfiltern — kein versehentliches Überschreiben mit null
+        upsert_payload = {k: v for k, v in upsert_payload.items() if v is not None}
+
+        if upsert_payload:
+            upsert_company_enrichment(peer_id, upsert_payload)
+            logger.info(
+                "Peer %s enriched (vollständig): %d Felder — %s",
+                peer_name, len(upsert_payload), list(upsert_payload.keys()),
+            )
 
     except Exception as e:
-        logger.warning("_enrich_new_peer Wikipedia failed für %s: %s", peer_name, e)
+        logger.warning("_enrich_new_peer Enrichment failed für %s: %s", peer_name, e)
 
     # ── R-21 Stufe 2: TAM + Market Data ──────────────────────────────────────
     # Non-blocking — Fehler hier stoppen nicht die Peer-Generierung
