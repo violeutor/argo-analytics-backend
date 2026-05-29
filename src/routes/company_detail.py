@@ -2093,6 +2093,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             }
             for b in buyers
         ],
+    )
 
 
 # ── UX-01: Enrichment Status Endpoint ────────────────────────────────────────
