@@ -1115,6 +1115,29 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         exchange_raw = company.get("exchange", "")
         proxy = f"{ticker_raw} · {exchange_raw}".strip(" ·") if exchange_raw else ticker_raw
 
+    # EN-06 on-demand Write-back: proxy_ticker gesetzt aber ticker/exchange fehlen in DB.
+    # Tritt auf wenn Wikipedia-Infobox den Ticker noch nicht hat (frisch gelistete Companies).
+    # proxy_ticker "FRVO · Nasdaq" → ticker="FRVO", exchange="Nasdaq" → einmalig in DB schreiben.
+    _cid = company.get("id")
+    if is_listed and proxy and not company.get("ticker") and _cid:
+        _proxy_parts = [p.strip() for p in proxy.split("·")]
+        _proxy_sym   = _proxy_parts[0] if _proxy_parts else None
+        _proxy_exch  = _proxy_parts[1] if len(_proxy_parts) > 1 else None
+        if _proxy_sym and _proxy_sym != "—":
+            try:
+                upsert_company_enrichment(_cid, {
+                    "ticker":   _proxy_sym,
+                    "exchange": _proxy_exch,
+                })
+                logger.info(
+                    "EN-06 on-demand write-back: %s → ticker=%s exchange=%s (aus proxy_ticker)",
+                    company_name, _proxy_sym, _proxy_exch,
+                )
+                company["ticker"]   = _proxy_sym
+                company["exchange"] = _proxy_exch
+            except Exception as _e:
+                logger.warning("EN-06 on-demand write-back failed für %s: %s", company_name, _e)
+
     # 3. TAM — erst DB-Cache prüfen, dann scrapen, Ergebnis persistieren
     company_id = company.get("id")
     tam_cached = fetch_tam_cache(company_id) if company_id else None
