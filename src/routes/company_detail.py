@@ -164,7 +164,7 @@ class CompanyDetailResponse(BaseModel):
     core_technology: str | None
     website: str | None
     founded: str | None
-    intro: str
+    intro: str | None        # R18: async generiert, None bis BackgroundTask fertig
     description: str | None
     wikipedia_url: str | None
     crunchbase_url: str | None
@@ -1315,27 +1315,34 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             from src.services.enrichment import EnrichmentResult
             return EnrichmentResult(name=company_name)
 
-    async def _safe_intro():
+    # R18: Intro als BackgroundTask — blockiert Response nicht mehr.
+    # Generiertes Intro wird in companies.description geschrieben (wenn description leer).
+    # Response liefert intro=None beim Erstaufruf; Frontend fällt auf description zurück.
+    async def _intro_bg_task():
         try:
-            return await asyncio.wait_for(
+            generated = await asyncio.wait_for(
                 _generate_intro(company, tam),
                 timeout=10.0,
             )
-        except asyncio.TimeoutError:
-            logger.warning("Intro timeout for %s — using fallback", company_name)
-            return f"{company_name} — no description available."
+            if generated and company_id and not company.get("description"):
+                upsert_company_enrichment(company_id, {"description": generated})
+                logger.info("R18: Intro als description gecacht für %s", company_name)
         except Exception as e:
-            logger.warning("Intro failed for %s: %s", company_name, e)
-            return f"{company_name} — no description available."
+            logger.warning("R18: Intro BackgroundTask failed für %s: %s", company_name, e)
 
     # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
     # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
     _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
-    enrichment, yahoo, intro = await asyncio.gather(
+    enrichment, yahoo = await asyncio.gather(
         _safe_enrichment(),
         _fetch_yahoo(_yahoo_ticker),
-        _safe_intro(),
     )
+
+    # Intro: aus DB (description) wenn vorhanden, sonst BackgroundTask triggern
+    intro: str | None = company.get("description") or enrichment.description or None
+    if not intro:
+        background_tasks.add_task(_intro_bg_task)
+        logger.info("R18: Intro queued als BackgroundTask für %s", company_name)
 
     # 4b. Enrichment-Ergebnisse in DB persistieren (nur wenn Werte vorhanden)
     #     DB-Werte als Fallback wenn Enrichment leer (z.B. bei Timeout)
@@ -1344,17 +1351,35 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             getattr(enrichment.bundesanzeiger, "employees", None)
             if enrichment.bundesanzeiger else None
         )
-        upsert_payload = {
-            "founding_year": _parse_year(enrichment.founded_year),
-            "headquarters":  enrichment.headquarters or None,
-            "headcount":     (
-                _parse_headcount(enrichment.employee_count)
-                or (int(_ba_emp_for_upsert) if _ba_emp_for_upsert else None)
-            ),
-            "description":   enrichment.description or None,
-            "website":       enrichment.website or None,
-            "tags":          enrichment.tags if enrichment.tags else None,   # Technologie-Chips Tab 0 — persistieren, [] nicht schreiben
-        }
+        # Delta-Guard: nur Felder in den Payload aufnehmen die
+        #   (a) einen neuen Wert haben (nicht None/leer) UND
+        #   (b) in der DB noch leer sind — oder einen echten neuen Wert bringen.
+        # Verhindert dass ein leeres Enrichment-Ergebnis befüllte DB-Felder überschreibt.
+        _enriched_founding  = _parse_year(enrichment.founded_year)
+        _enriched_hq        = enrichment.headquarters or None
+        _enriched_headcount = (
+            _parse_headcount(enrichment.employee_count)
+            or (int(_ba_emp_for_upsert) if _ba_emp_for_upsert else None)
+        )
+        _enriched_desc      = enrichment.description or None
+        _enriched_website   = enrichment.website or None
+        _enriched_tags      = enrichment.tags if enrichment.tags else None
+
+        upsert_payload: dict = {}
+        # Schreibe nur wenn: neuer Wert vorhanden UND (DB leer ODER neuer Wert verschieden)
+        if _enriched_founding  and (_enriched_founding  != company.get("founding_year")):
+            upsert_payload["founding_year"] = _enriched_founding
+        if _enriched_hq        and (_enriched_hq        != company.get("headquarters")):
+            upsert_payload["headquarters"]  = _enriched_hq
+        if _enriched_headcount and (_enriched_headcount != company.get("headcount")):
+            upsert_payload["headcount"]     = _enriched_headcount
+        if _enriched_desc      and not company.get("description"):
+            # description: nur schreiben wenn DB leer — verhindert Überschreiben kuratierter Texte
+            upsert_payload["description"]   = _enriched_desc
+        if _enriched_website   and (_enriched_website   != company.get("website")):
+            upsert_payload["website"]       = _enriched_website
+        if _enriched_tags:
+            upsert_payload["tags"]          = _enriched_tags
         # BUG-47: ipo_status aus EnrichmentResult in DB schreiben
         # Nur wenn Enrichment einen Wert liefert UND DB noch keinen hat
         if enrichment.ipo_status and not company.get("ipo_status"):
@@ -1409,7 +1434,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             upsert_payload["industry"] = inferred_ind
             company["industry"] = inferred_ind
 
-        upsert_company_enrichment(company_id, upsert_payload)
+        if upsert_payload:
+            upsert_company_enrichment(company_id, upsert_payload)
+        else:
+            logger.debug("Delta-Guard: kein upsert für %s — keine neuen Felder", company_name)
 
         # 4c. Fundamentals → companies table (Background Task)
         # Schließt Architektur-Lücke: revenue_usd_mn / is_profitable / growth_rate_pct
@@ -1432,7 +1460,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     persist: dict = dict(_direct)  # Yahoo-Werte als Ausgangspunkt
 
                     # Fallback: kpi_timeseries aus DB — zuverlässig auch wenn yfinance timeout
-                    # Füllt Lücken die Yahoo nicht geliefert hat
+                    # Füllt nur Felder die weder Yahoo noch DB bereits hat
                     _missing = {"revenue_usd_mn", "is_profitable", "growth_rate_pct"} - set(persist)
                     if _missing:
                         db = get_supabase()
@@ -1469,17 +1497,42 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                                     cagr = ((last["value"] / first["value"]) ** (1 / n) - 1) * 100
                                     persist["growth_rate_pct"] = round(cagr, 1)
 
-                    if persist:
-                        upsert_company_enrichment(company_id, persist)
+                    # Delta-Guard: nur Felder schreiben die einen echten neuen Wert haben
+                    # und die DB nicht bereits befüllt haben.
+                    # Verhindert dass 0.0 oder None einen vorhandenen DB-Wert überschreibt.
+                    _db_revenue   = company.get("revenue_usd_mn")
+                    _db_profit    = company.get("is_profitable")
+                    _db_growth    = company.get("growth_rate_pct")
+                    # Delta-Regel: schreibe wenn neuer Wert vorhanden (nicht None/0.0-Artefakt)
+                    # und verschieden vom DB-Wert. Richtung egal — aktualisierte Zahlen
+                    # sollen geschrieben werden, auch wenn sie kleiner/negativer sind.
+                    # Nur echte Leer-Werte (None, 0.0 als Yahoo-Artefakt) blockieren.
+                    delta: dict = {}
+                    if "revenue_usd_mn" in persist:
+                        v = persist["revenue_usd_mn"]
+                        if v is not None and v != 0.0 and v != _db_revenue:
+                            delta["revenue_usd_mn"] = v
+                    if "is_profitable" in persist:
+                        v = persist["is_profitable"]
+                        if v is not None and v != _db_profit:
+                            delta["is_profitable"] = v
+                    if "growth_rate_pct" in persist:
+                        v = persist["growth_rate_pct"]
+                        if v is not None and v != _db_growth:
+                            delta["growth_rate_pct"] = v
+
+                    if delta:
+                        upsert_company_enrichment(company_id, delta)
                         logger.info(
-                            "Fundamentals persisted für %s (yahoo=%d kpi=%d): %s",
+                            "Fundamentals persisted für %s (yahoo=%d kpi=%d delta=%d): %s",
                             company_name,
                             len(_direct),
                             len(persist) - len(_direct),
-                            list(persist.keys()),
+                            len(delta),
+                            list(delta.keys()),
                         )
                     else:
-                        logger.debug("Keine Fundamentals zu persistieren für %s", company_name)
+                        logger.debug("Delta-Guard: keine neuen Fundamentals für %s", company_name)
                 except Exception as _e:
                     logger.warning("Fundamentals persist failed für %s: %s", company_name, _e)
 
