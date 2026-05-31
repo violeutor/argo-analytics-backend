@@ -241,7 +241,7 @@ def parse_hai_ownership(data: dict, company_id: str) -> list[dict]:
             "type":       "Shareholder",
             "role":       "Gesellschafter",
             "share_pct":  float(pct) if pct is not None else None,
-            "source":     "hai",
+            "source":     "handelsregister",
             "as_of_date": today,
         })
 
@@ -267,7 +267,7 @@ def parse_hai_ownership(data: dict, company_id: str) -> list[dict]:
             "type":       "Management",
             "role":       role_de,
             "share_pct":  None,
-            "source":     "hai",
+            "source":     "handelsregister",
             "as_of_date": start_date[:10] if start_date else today,
         })
 
