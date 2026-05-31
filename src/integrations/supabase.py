@@ -1014,3 +1014,93 @@ def update_patent_aggregates(patent_records: list[dict]) -> None:
         "update_patent_aggregates: %d Companies aktualisiert",
         len(by_company),
     )
+
+
+# ── Headcount Snapshots ───────────────────────────────────────────────────────
+
+def fetch_latest_headcount_snapshot(company_id: str) -> dict | None:
+    """
+    Gibt den neuesten Headcount-Snapshot für eine Company zurück.
+    Wird im Rolling Refresh genutzt um zu entscheiden ob ein neuer Snapshot nötig ist.
+    """
+    db = get_supabase()
+    try:
+        result = (
+            db.table("headcount_snapshots")
+            .select("headcount, source, snapshot_date")
+            .eq("company_id", company_id)
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning("fetch_latest_headcount_snapshot failed for %s: %s", company_id, e)
+        return None
+
+
+def fetch_headcount_snapshots(company_id: str, limit: int = 24) -> list[dict]:
+    """
+    Gibt alle Headcount-Snapshots für eine Company zurück (neueste zuerst).
+    Für Scoring-CAGR-Berechnung und Frontend-Anzeige (wenn vorhanden).
+    limit=24 → ~2 Jahre bei monatlichen Änderungen.
+    """
+    db = get_supabase()
+    try:
+        result = (
+            db.table("headcount_snapshots")
+            .select("headcount, source, snapshot_date")
+            .eq("company_id", company_id)
+            .order("snapshot_date", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_headcount_snapshots failed for %s: %s", company_id, e)
+        return []
+
+
+def write_headcount_snapshot(
+    company_id: str,
+    headcount: int,
+    source: str,
+) -> bool:
+    """
+    Schreibt einen Headcount-Snapshot nur wenn sich der Wert gegenüber dem
+    letzten Snapshot geändert hat. Idempotent via UNIQUE (company_id, snapshot_date).
+
+    Returns True wenn ein neuer Snapshot geschrieben wurde, False wenn Skip.
+    """
+    db = get_supabase()
+    try:
+        # Letzten Snapshot prüfen — kein Write wenn Wert identisch
+        latest = fetch_latest_headcount_snapshot(company_id)
+        if latest and latest["headcount"] == headcount:
+            logger.debug(
+                "write_headcount_snapshot: skip %s — headcount unverändert (%d)",
+                company_id, headcount,
+            )
+            return False
+
+        db.table("headcount_snapshots").upsert(
+            {
+                "company_id":    company_id,
+                "headcount":     headcount,
+                "source":        source,
+                "snapshot_date": __import__("datetime").date.today().isoformat(),
+            },
+            on_conflict="company_id,snapshot_date",
+            ignore_duplicates=False,   # Update wenn gleicher Tag, anderer Wert
+        ).execute()
+
+        logger.info(
+            "write_headcount_snapshot: %s → %d (%s)%s",
+            company_id, headcount, source,
+            f" [prev: {latest['headcount']}]" if latest else " [first snapshot]",
+        )
+        return True
+
+    except Exception as e:
+        logger.warning("write_headcount_snapshot failed for %s: %s", company_id, e)
+        return False
