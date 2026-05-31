@@ -1728,6 +1728,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 upsert_payload["ticker"] = enrichment.ticker
             if enrichment.exchange and not company.get("exchange"):
                 upsert_payload["exchange"] = enrichment.exchange
+            # EN-11: ISIN-First — nur schreiben wenn noch nicht vorhanden
+            if enrichment.isin and not company.get("isin"):
+                upsert_payload["isin"] = enrichment.isin
         # category / industry — erst Tag-Inferenz (aus enrichment), dann Claude-Fallback
         inferred_cat  = enrichment.category
         inferred_ind  = enrichment.industry
