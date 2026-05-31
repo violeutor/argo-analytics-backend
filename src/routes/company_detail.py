@@ -1058,14 +1058,45 @@ def _get_fundamentals_source(
 async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> CompanyDetailResponse:
     warnings: list[str] = []
 
-    # 1. Lookup
-    companies = fetch_companies(limit=500)
+    # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
+    #    Alt: alle 500 Companies laden + client-side durchsuchen — bei jedem Request.
+    #    Neu: nur Kandidaten via ILIKE holen; die Prioritäts-Match-Logik unten läuft
+    #    UNVERÄNDERT, nur auf der kleinen Kandidatenmenge.
+    #    Bonus: behebt latenten Skalierungs-Bug — bei >500 Companies in der DB fand der
+    #    alte Lookup neue Einträge nicht mehr → legte Duplikate an (One-Click-weltweit).
     q = name.lower().replace("-"," ").replace("_"," ")
+
     def _proxy_match(c: dict, ticker: str) -> bool:
         proxy = c.get("proxy_ticker") or c.get("proxy") or ""
         return proxy.upper().startswith(ticker.upper())
+
+    try:
+        _db = get_supabase()
+        # exakter Name-Treffer separat (limit=1) — garantiert gefunden, unabhängig vom
+        # Substring-Limit unten (verhindert dass ein klarer Treffer bei generischem
+        # Suchbegriff aus den 25 Substring-Kandidaten herausfällt).
+        _exact_hits = _db.table("companies").select("*").ilike("name", q).limit(1).execute().data or []
+        _name_hits  = _db.table("companies").select("*").ilike("name", f"%{q}%").limit(25).execute().data or []
+        _proxy_hits = _db.table("companies").select("*").ilike("proxy_ticker", f"{name}%").limit(10).execute().data or []
+        _raw_candidates = [*_exact_hits, *_name_hits, *_proxy_hits]
+    except Exception as _lookup_err:
+        logger.warning(
+            "Lookup-Query failed für '%s': %s — Fallback auf fetch_companies(500)",
+            name, _lookup_err,
+        )
+        _raw_candidates = fetch_companies(limit=500)
+
+    # Dedupe nach id (Fallback name), Reihenfolge erhalten → exakter Treffer zuerst
+    _seen: set = set()
+    candidates: list[dict] = []
+    for c in _raw_candidates:
+        _key = c.get("id") or c.get("name")
+        if _key not in _seen:
+            _seen.add(_key)
+            candidates.append(c)
+
     company = next(
-        (c for c in companies if
+        (c for c in candidates if
          c.get("name","").lower()==q or
          q in c.get("name","").lower() or
          c.get("name","").lower().replace(" ","-")==name.lower() or
