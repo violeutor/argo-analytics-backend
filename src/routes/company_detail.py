@@ -53,6 +53,7 @@ from src.services.enrichment import (
     _claude_infer_category,
     BundesanzeigerData,
     EnrichmentResult,
+    _is_likely_german,
 )
 
 logger = logging.getLogger(__name__)
@@ -1626,10 +1627,45 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
     yahoo = await _fetch_yahoo(_yahoo_ticker)
 
+    # HAI-01: DE-Erkennung — company_record nach Phase A mit enrichment-Daten anreichern
+    # für zuverlässigeren _is_likely_german-Check (HQ aus Phase A verfügbar).
+    _company_for_de_check = {
+        **company,
+        "headquarters": enrichment.headquarters or company.get("headquarters"),
+        "website":      enrichment.website or company.get("website"),
+    }
+    _is_likely_german_company = _is_likely_german(_company_for_de_check)
+
     # Phase B nachgelagert anstoßen (nur wenn nicht ohnehin schon vollständig)
     if not _enrichment_fields_complete:
         background_tasks.add_task(_enrichment_phase_b_bg)
         logger.info("Option2: Phase B Enrichment queued als BackgroundTask für %s", company_name)
+
+    # HAI-01: handelsregister.ai Anreicherung für DE Private Companies
+    # Nur beim Cold Path (neue Company), nur wenn DE erkannt, nie im Rolling Refresh.
+    # Schreibt: KPI-Zeitreihen + Headcount-Snapshots + Ownership (Gesellschafter + GF)
+    # Kosten: 13 Credits pro Call — gated auf Cold Path, kein proaktiver Trigger.
+    if (
+        not _enrichment_fields_complete   # Cold Path — neue/unvollständige Company
+        and not is_listed                 # nur Private
+        and company_id                   # company_id muss bekannt sein
+        and _is_likely_german_company    # DE erkannt (Flag aus Phase A)
+    ):
+        from src.services.hai_enrichment import enrich_hai_de_private
+        async def _hai_enrichment_bg():
+            try:
+                ok = await enrich_hai_de_private(
+                    company_name=company_name,
+                    company_id=company_id,
+                )
+                if ok:
+                    logger.info("HAI-01: BackgroundTask erfolgreich für %s", company_name)
+                else:
+                    logger.info("HAI-01: Kein Treffer oder Skip für %s", company_name)
+            except Exception as e:
+                logger.warning("HAI-01: BackgroundTask failed für %s: %s", company_name, e)
+        background_tasks.add_task(_hai_enrichment_bg)
+        logger.info("HAI-01: Anreicherung queued für %s", company_name)
 
     # Intro: aus DB (description) wenn vorhanden, sonst BackgroundTask triggern
     intro: str | None = company.get("description") or enrichment.description or None
