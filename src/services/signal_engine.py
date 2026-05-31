@@ -61,6 +61,8 @@ SignalCategory = Literal[
     "funding", "partnership", "ipo_progress", "market_growth", "patent", "investor_entry",
     # Risiko-Signale
     "regulatory", "negative_earnings", "supply_chain", "insider_selling", "customer_concentration",
+    # SE-18: Insider-Käufe (positives Signal — eigene Kategorie)
+    "insider_buying",
     # Neutral / Informativ
     "filing", "ownership_entry", "general_news",
 ]
@@ -1737,9 +1739,30 @@ async def run_signal_engine(
             if trends_signals:
                 await asyncio.sleep(1.0)   # Google Trends Rate-Limit: konservativ
 
+            # 9. SE-18: BaFin Directors' Dealings — nur listed DE Companies
+            # Bedingung: is_listed + DE-Börse (via exchange oder ISIN-Prefix)
+            _de_exchanges = {"xetra", "frankfurt", "fse", "hamburg", "berlin", "dusseldorf", "stuttgart", "munich"}
+            _exchange     = (company.get("exchange") or "").lower()
+            _isin         = (company.get("isin") or "").strip()
+            _is_de_listed = is_listed and (_exchange in _de_exchanges or _isin.startswith("DE"))
+
+            if _is_de_listed:
+                from src.services.bafin_insider import parse_bafin_insider
+                # Bevorzuge ISIN (präziser), Fallback: Company-Name als Issuer-Query
+                insider_signals = await parse_bafin_insider(
+                    company_id=cid,
+                    company_name=cname,
+                    isin=_isin,
+                    issuer_name=cname if not _isin else None,
+                    client=client,
+                )
+                company_events.extend(insider_signals)
+                if insider_signals:
+                    await asyncio.sleep(0.5)
+
             logger.info(
                 "Signal-Engine: %s → %d events "
-                "(edgar=%d news=%d tc=%d ownership=%d absence=%d patent=%d trends=%d) "
+                "(edgar=%d news=%d tc=%d ownership=%d absence=%d patent=%d trends=%d insider=%d) "
                 "pos=%d neg=%d neu=%d",
                 cname, len(company_events),
                 sum(1 for e in company_events if e.source == "edgar"),
@@ -1749,6 +1772,7 @@ async def run_signal_engine(
                 sum(1 for e in company_events if e.source == "internal_absence"),
                 sum(1 for e in company_events if e.source == "epo_ops"),
                 sum(1 for e in company_events if e.source == "google_trends"),
+                sum(1 for e in company_events if e.source == "bafin_insider"),
                 sum(1 for e in company_events if e.direction == "positive"),
                 sum(1 for e in company_events if e.direction == "negative"),
                 sum(1 for e in company_events if e.direction == "neutral"),

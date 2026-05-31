@@ -457,6 +457,60 @@ async def trigger_bafin_ondemand(company_name: str, background_tasks: Background
     return {"status": "triggered", "company": company_name}
 
 
+@app.post("/internal/bafin-insider/trigger")
+async def trigger_bafin_insider_cron(background_tasks: BackgroundTasks):
+    """
+    SE-18: Manueller Trigger für BaFin Directors' Dealings — alle listed DE Companies.
+    Nützlich für Testing außerhalb des 04:00 UTC Crons.
+    """
+    async def _run_se18():
+        try:
+            from src.integrations.supabase import fetch_companies
+            from src.services.bafin_insider import parse_bafin_insider
+            import httpx
+
+            companies = fetch_companies(limit=500)
+            de_exchanges = {"xetra", "frankfurt", "fse", "hamburg", "berlin", "dusseldorf", "stuttgart", "munich"}
+            de_listed = [
+                c for c in companies
+                if c.get("ticker") and (
+                    (c.get("exchange") or "").lower() in de_exchanges
+                    or (c.get("isin") or "").startswith("DE")
+                )
+            ]
+            logger.info("SE-18 Trigger: %d listed DE Companies", len(de_listed))
+
+            from src.integrations.supabase import upsert_signals
+            timeout = httpx.Timeout(12.0, connect=4.0)
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers={"User-Agent": "ArgoAnalytics/1.0 (research; contact@argo-analytics.io)"},
+                follow_redirects=True,
+            ) as client:
+                all_signals = []
+                for c in de_listed:
+                    events = await parse_bafin_insider(
+                        company_id=c["id"],
+                        company_name=c.get("name", ""),
+                        isin=(c.get("isin") or "").strip(),
+                        issuer_name=c.get("name") if not c.get("isin") else None,
+                        client=client,
+                    )
+                    all_signals.extend(events)
+                    await asyncio.sleep(0.5)
+
+            if all_signals:
+                written = upsert_signals([e.to_dict() for e in all_signals])
+                logger.info("SE-18 Trigger fertig — %d Signale, %d geschrieben", len(all_signals), written)
+            else:
+                logger.info("SE-18 Trigger fertig — keine neuen Insider-Signale")
+        except Exception as e:
+            logger.exception("SE-18 Trigger FEHLER: %s", e)
+
+    background_tasks.add_task(_run_se18)
+    return {"status": "triggered", "job": "se18_bafin_insider"}
+
+
 
 @app.post("/internal/edgar-kpi/trigger")
 async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
