@@ -64,14 +64,18 @@ _XBRL_MAP: dict[str, str] = {
     # ── KPI-06: Neue Metriken ─────────────────────────────────────────────
     # Gross Profit → gross_margin_pct
     "GrossProfit":                                                       "gross_profit_mn",
-    # Debt (Long + Short) → reales EV = Mktcap + Debt - Cash
+    # Debt (Long + Short + Current Portion of LT) → reales EV = Mktcap + Debt - Cash
     "LongTermDebt":                                                      "long_term_debt_mn",
     "LongTermDebtNoncurrent":                                            "long_term_debt_mn",
     "ShortTermBorrowings":                                               "short_term_debt_mn",
     "DebtCurrent":                                                       "short_term_debt_mn",
-    # Cash → reales EV
+    "LongTermDebtCurrent":                                               "short_term_debt_mn",
+    # Cash → reales EV.
+    # ASU 2016-18 (ab ~2018): viele Filer melden Cash nur noch unter dem kombinierten
+    # RestrictedCash-Tag, nicht mehr unter CashAndCashEquivalentsAtCarryingValue.
     "CashAndCashEquivalentsAtCarryingValue":                             "cash_mn",
     "CashCashEquivalentsAndShortTermInvestments":                        "cash_mn",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents":     "cash_mn",
     # Operating Cashflow
     "NetCashProvidedByUsedInOperatingActivities":                        "operating_cashflow_mn",
     # CapEx → FCF = OpCF - CapEx
@@ -96,6 +100,34 @@ _MONETARY: frozenset[str] = frozenset({
 
 # Shares-Metriken → XBRL unit key "shares", Wert als absolute Zahl (kein Divider)
 _SHARES_UNIT: frozenset[str] = frozenset({"shares_outstanding"})
+
+# Stock-Größen (Bilanz-Stichtag): kein start-Datum, KEIN Annual-Filter.
+# Flow-Größen (Income/Cashflow) haben start..end-Spanne und MÜSSEN ~annual sein.
+_STOCK_METRICS: frozenset[str] = frozenset({
+    "equity_mn", "total_assets_mn", "cash_mn",
+    "long_term_debt_mn", "short_term_debt_mn", "shares_outstanding",
+})
+
+# Tag-Priorität bei Kollision (gleiches metric+year+filed, mehrere Tags).
+# Höher = bevorzugt. Default 0. Nur dort gesetzt, wo mehrere Tags konkurrieren und
+# eines inhaltlich sauberer ist:
+#   Cash: reines Cash (2) > Cash+ShortTermInvest (1) > Cash+RestrictedCash (0).
+#   Restricted Cash ist nicht frei verfügbar → verfälscht EV (Mktcap+Debt−Cash).
+_TAG_PRIORITY: dict[str, int] = {
+    "CashAndCashEquivalentsAtCarryingValue":                         2,
+    "CashCashEquivalentsAndShortTermInvestments":                    1,
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents": 0,
+}
+
+# Additive Metriken: verschiedene Quell-Tags sind VERSCHIEDENE reale Posten und
+# werden über die Tags SUMMIERT (statt "einer gewinnt").
+#   short_term_debt_mn: ShortTermBorrowings + LongTermDebtCurrent + DebtCurrent
+#     sind unterschiedliche Schuldenpositionen → Summe = gesamte kurzfristige Schuld.
+# Pro EINZELNEM Tag gilt weiterhin "neuestes Filing gewinnt" (kein Aufaddieren von
+# Restatements desselben Tags). Nur DISTINKTE Tags werden addiert.
+_ADDITIVE_METRICS: frozenset[str] = frozenset({
+    "short_term_debt_mn",
+})
 
 # Helper-Metriken die nur für EBITDA-Berechnung gebraucht werden.
 # operating_income_mn wird NICHT mehr verworfen — es ist EBIT, eine eigene Kennzahl
@@ -176,8 +208,10 @@ def _extract_xbrl_values(
     Bei mehreren Einträgen für (metric, fy): neuesten nehmen (letzter in Liste = neueste Einreichung).
     """
     ns_data = facts.get(namespace, {})
-    # (metric, fy) → value — letzter Eintrag gewinnt (chronologisch in EDGAR sortiert)
+    # (metric, year) → beste Row (Stock/Flow, "einer gewinnt")
     best: dict[tuple[str, int], dict] = {}
+    # (metric, year, tag) → bester Wert pro Tag, wird danach über Tags summiert
+    additive: dict[tuple[str, int, str], dict] = {}
 
     for xbrl_tag, metric_key in tag_map.items():
         tag_data = ns_data.get(xbrl_tag, {})
@@ -192,26 +226,96 @@ def _extract_xbrl_values(
         for entry in tag_data.get("units", {}).get(unit_key, []):
             if entry.get("form") not in ("10-K", "10-K/A"):
                 continue
-            fy = entry.get("fy")
-            if not fy or fy < cutoff_year:
-                continue
             val = entry.get("val")
             if val is None:
                 continue
 
+            # FISCAL YEAR aus dem 'end'-Datum, NICHT aus 'fy'.
+            # EDGARs 'fy' ist das Geschäftsjahr des FILINGS, nicht der Kennzahl:
+            # ein FY2022-Wert taucht im 2023er-10-K als Vorjahr auf und trägt dort fy=2023.
+            # 'end' (Periodenende) ist die einzige verlässliche Jahreszuordnung.
+            end = entry.get("end")
+            if not end:
+                continue
+            try:
+                end_year = int(end[:4])
+            except (ValueError, TypeError):
+                continue
+            if end_year < cutoff_year:
+                continue
+
+            # ANNUAL-FILTER für Flow-Größen (Income/Cashflow):
+            # 10-K-Filings enthalten auch Quartals-Vergleichsperioden (start..end < 1 Jahr).
+            # Ohne diesen Filter konkurrieren Q- und FY-Spannen um dasselbe (metric, year)
+            # → "letzter gewinnt" wird Zufall. Stock-Größen (Bilanz: equity, assets, cash)
+            # haben KEIN start → werden nicht gefiltert.
+            start = entry.get("start")
+            if start and metric_key not in _STOCK_METRICS:
+                try:
+                    from datetime import date as _date
+                    _s = _date.fromisoformat(start)
+                    _e = _date.fromisoformat(end)
+                    span_days = (_e - _s).days
+                    if span_days < 320:   # annual ≈ 365; <320 = Quartal/Halbjahr → skip
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
             # Monetary: in Millionen umrechnen
             value = round(val / 1_000_000, 2) if metric_key in _MONETARY else float(val)
-            key = (metric_key, fy)
-            best[key] = {
-                "metric":      metric_key,
-                "fiscal_year": fy,
-                "value":       value,
-                "currency":    "USD" if metric_key in _MONETARY else None,
-                "source":      "edgar_xbrl",
-                "confidence":  "high",
-            }
 
-    return list(best.values())
+            if metric_key in _ADDITIVE_METRICS:
+                # Additiv: pro (metric, year, TAG) den besten (neuesten) Wert halten.
+                # Summiert wird erst nach der Schleife — verschiedene Tags = verschiedene
+                # Posten, gleicher Tag = Restatement (neuestes gewinnt, kein Aufaddieren).
+                akey = (metric_key, end_year, xbrl_tag)
+                filed = entry.get("filed", "")
+                prev = additive.get(akey)
+                if prev is None or filed >= prev["_filed"]:
+                    additive[akey] = {"value": value, "_filed": filed}
+                continue
+
+            key = (metric_key, end_year)
+            # Auswahlregel bei mehreren Kandidaten fürs selbe (metric, year):
+            #  1. neueste Einreichung gewinnt (Restatements korrigieren) — 'filed'
+            #  2. bei GLEICHEM filed-Datum (mehrere Tags im selben Filing, z.B. reines
+            #     Cash vs. Cash+RestrictedCash): höhere Tag-Priorität gewinnt.
+            filed = entry.get("filed", "")
+            prio  = _TAG_PRIORITY.get(xbrl_tag, 0)
+            prev  = best.get(key)
+            _take = (
+                prev is None
+                or filed > prev.get("_filed", "")
+                or (filed == prev.get("_filed", "") and prio > prev.get("_prio", 0))
+            )
+            if _take:
+                best[key] = {
+                    "metric":      metric_key,
+                    "fiscal_year": end_year,
+                    "value":       value,
+                    "currency":    "USD" if metric_key in _MONETARY else None,
+                    "source":      "edgar_xbrl",
+                    "confidence":  "high",
+                    "_filed":      filed,
+                    "_prio":       prio,
+                }
+
+    # Additive Metriken: über distinkte Tags summieren → eine Row pro (metric, year)
+    add_summed: dict[tuple[str, int], float] = {}
+    for (metric_key, end_year, _tag), v in additive.items():
+        add_summed[(metric_key, end_year)] = add_summed.get((metric_key, end_year), 0.0) + v["value"]
+    for (metric_key, end_year), total in add_summed.items():
+        best[(metric_key, end_year)] = {
+            "metric":      metric_key,
+            "fiscal_year": end_year,
+            "value":       round(total, 2),
+            "currency":    "USD",
+            "source":      "edgar_xbrl",
+            "confidence":  "high",
+        }
+
+    # Helper-Felder vor Rückgabe entfernen
+    return [{k: v for k, v in row.items() if not k.startswith("_")} for row in best.values()]
 
 
 def _derive_ebitda(rows: list[dict]) -> list[dict]:
