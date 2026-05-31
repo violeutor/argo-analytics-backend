@@ -177,7 +177,13 @@ def _classify_holder(name: str) -> str:
 
 
 def _is_de_company(company: dict) -> bool:
-    """Prüft ob eine Company eine listed DE-Company ist (Exchange oder HQ)."""
+    """Prüft ob eine Company eine listed DE-Company ist (ISIN-Prefix, Exchange oder HQ).
+    ISIN-Prefix 'DE' ist primäres Signal — eindeutig, kein String-Matching nötig.
+    """
+    # ISIN-First: DE-ISIN ist eindeutiger als Exchange-Name-Matching
+    isin = (company.get("isin") or "").strip().upper()
+    if isin.startswith("DE"):
+        return True
     exchange = (company.get("exchange") or "").lower()
     if any(x in exchange for x in ("xetra", "frankfurt", "fse", "xfra", "m:access")):
         return True
@@ -192,10 +198,13 @@ def _is_de_company(company: dict) -> bool:
 
 # ── BaFin Scraper ─────────────────────────────────────────────────────────────
 
-def fetch_bafin_stimmrechte(company_name: str) -> list[dict]:
+def fetch_bafin_stimmrechte(company_name: str, isin: str | None = None) -> list[dict]:
     """
     Scrapt BaFin-Portal nach Stimmrechtsmitteilungen für einen Emittenten.
     Gibt Liste von Ownership-Einträgen zurück (kompatibel mit ownership_entries Schema).
+
+    ISIN-First: wenn ISIN vorhanden → als primärer Query-Parameter (präziser als Name).
+    Fallback: Emittenten-Name.
 
     Rate-Limit liegt beim Aufrufer (RATE_LIMIT_SECS zwischen Calls einhalten).
     Gibt leere Liste zurück bei Fehler — kein Hard-Fail.
@@ -203,12 +212,21 @@ def fetch_bafin_stimmrechte(company_name: str) -> list[dict]:
     Gesuchte Spalten im BaFin-Response-HTML:
         Datum | Meldepflichtiger | Emittent | Schwelle | Anteil in %
     """
-    params = {
-        "emittent.name": company_name,
-        "cmd":           "search",
-        "zeitraum":      "0",    # alle Zeiträume (nicht nur letztes Jahr)
-        "d-4012147-s":   "1",    # Sortierung nach Datum DESC
-    }
+    # ISIN-First: präziserer Treffer, kein Name-Fuzzy-Matching nötig
+    if isin:
+        params = {
+            "emittent.isin": isin,
+            "cmd":           "search",
+            "zeitraum":      "0",
+            "d-4012147-s":   "1",
+        }
+    else:
+        params = {
+            "emittent.name": company_name,
+            "cmd":           "search",
+            "zeitraum":      "0",
+            "d-4012147-s":   "1",
+        }
     results: list[dict] = []
 
     try:
@@ -344,7 +362,8 @@ def _fetch_and_store_company(company: dict, db) -> int:
         return 0
 
     company_normalized = _normalize_name(name)
-    entries = fetch_bafin_stimmrechte(name)
+    isin   = (company.get("isin") or "").strip() or None
+    entries = fetch_bafin_stimmrechte(name, isin=isin)
     written = 0
 
     for e in entries:
@@ -407,7 +426,7 @@ def run_bafin_on_demand(
 
     db     = create_client(supabase_url, supabase_key)
     result = db.table("companies").select(
-        "id, name, ticker, exchange, headquarters, ipo_status"
+        "id, name, ticker, exchange, isin, headquarters, ipo_status"
     ).ilike("name", company_name).limit(1).execute()
 
     companies = result.data or []
@@ -416,7 +435,13 @@ def run_bafin_on_demand(
         return {"entries_written": 0, "skipped": "not_found"}
 
     company = companies[0]
-    if not _is_de_company(company) or company.get("ipo_status") != "listed":
+    # ISIN-First: listed wenn ticker ODER ISIN vorhanden (ticker or isin Guard)
+    _has_listed_signal = (
+        company.get("ipo_status") == "listed"
+        or bool(company.get("ticker"))
+        or (company.get("isin") or "").startswith("DE")
+    )
+    if not _is_de_company(company) or not _has_listed_signal:
         logger.info(
             "BaFin on-demand: '%s' ist keine listed DE-Company", company_name
         )
@@ -454,7 +479,7 @@ def run_bafin_ownership_cron(supabase_url: str, supabase_key: str) -> dict:
         db = create_client(supabase_url, supabase_key)
 
         result = db.table("companies").select(
-            "id, name, ticker, exchange, headquarters, ipo_status"
+            "id, name, ticker, exchange, isin, headquarters, ipo_status"
         ).eq("ipo_status", "listed").execute()
 
         all_listed   = result.data or []

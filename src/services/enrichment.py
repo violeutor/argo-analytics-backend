@@ -94,6 +94,7 @@ class EnrichmentResult:
     employee_count: str | None = None
     ticker: str | None = None      # EN-06: Börsen-Ticker aus Wikipedia-Infobox
     exchange: str | None = None    # EN-06: Börsenplatz aus Wikipedia-Infobox
+    isin: str | None = None        # EN-11: ISIN aus Wikipedia-Infobox
     ipo_status: str | None = None  # BUG-47: "listed" | "private" aus Wikipedia-Infobox
     category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
@@ -388,6 +389,20 @@ async def _fetch_wikipedia(company: str) -> dict:
                             # Fallback: Ticker vorhanden → listed
                             if not out.get("ipo_status") and out.get("ticker"):
                                 out["ipo_status"] = "listed"
+
+                        # EN-11: ISIN aus Wikipedia Infobox
+                        # | isin = DE000BASF111  oder  | ISIN = DE000BASF111
+                        if not out.get("isin"):
+                            m = re.search(
+                                r"\|\s*isin\s*=\s*([A-Z]{2}[A-Z0-9]{9}[0-9])",
+                                wikitext, re.I,
+                            )
+                            if m:
+                                out["isin"] = m.group(1).strip().upper()
+                                logger.info(
+                                    "EN-11: ISIN aus Wikipedia-Infobox für '%s': %s",
+                                    company, out["isin"],
+                                )
             except Exception as e:
                 logger.debug("Wikipedia Wikitext fallback failed for '%s': %s", company, e)
 
@@ -1252,9 +1267,13 @@ async def enrich_company(
     Returns EnrichmentResult — caller persists to Supabase.
     """
     company_record = company_record or {}
+    # ISIN-First: listed wenn ticker ODER ISIN vorhanden — unabhängig von investment_path-Feldern
     is_listed = (
         company_record.get("investment_path") == "IPO-direkt"
         or company_record.get("ipo_potential") == "IPO erfolgt"
+        or bool(company_record.get("ticker"))
+        or bool(company_record.get("isin"))
+        or company_record.get("ipo_status") == "listed"
     )
 
     # ── Verlustfreie Basis ───────────────────────────────────────────────────
@@ -1337,8 +1356,9 @@ async def enrich_company(
             _set_if_better("ipo_status", wiki.get("ipo_status"))
         _set_if_better("ticker",   wiki.get("ticker"))
         _set_if_better("exchange", wiki.get("exchange"))
+        _set_if_better("isin",     wiki.get("isin"))   # EN-11: ISIN-First
         # is_listed aktualisieren wenn Wikipedia es klar sagt
-        if result.ipo_status == "listed" or result.ticker:
+        if result.ipo_status == "listed" or result.ticker or result.isin:
             is_listed = True
         elif result.ipo_status == "private":
             is_listed = False
