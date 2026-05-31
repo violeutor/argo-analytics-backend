@@ -1567,4 +1567,26 @@ async def enrich_company(
     if (not result.category or not result.industry) and result.description:
         _derive_tags_and_category()
 
+    # ── Headcount Snapshot ────────────────────────────────────────────────────
+    # Nur wenn company_id bekannt (Rolling Refresh) + employee_count vorhanden.
+    # Schreibt nur bei Wertänderung gegenüber letztem Snapshot (write_headcount_snapshot
+    # prüft selbst) — akkumulierende Zeitreihe für CAGR + Frontend-Verlauf.
+    _company_id = company_record.get("id")
+    if _company_id and result.employee_count:
+        try:
+            _hc_raw = str(result.employee_count).replace(",", "").replace(".", "").strip()
+            _hc_int = int("".join(filter(str.isdigit, _hc_raw)) or "0") or None
+            if _hc_int:
+                from src.integrations.supabase import write_headcount_snapshot
+                # Quelle: Wikipedia wenn founding_year aus Wiki stammt (Proxy),
+                # sonst 'enrichment' als generischer Label für DDG/Website-Mix.
+                _hc_source = "wikipedia" if company_record.get("headcount") else "enrichment"
+                write_headcount_snapshot(
+                    company_id=_company_id,
+                    headcount=_hc_int,
+                    source=_hc_source,
+                )
+        except Exception as _e:
+            logger.debug("headcount snapshot skip for %s: %s", company_name, _e)
+
     return result
