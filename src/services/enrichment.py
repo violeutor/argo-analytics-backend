@@ -1237,10 +1237,17 @@ async def enrich_company(
     company_name: str,
     company_record: dict | None = None,
     existing_tags: list[str] | None = None,
+    fast_only: bool = False,
 ) -> EnrichmentResult:
     """
-    Full async enrichment. Runs Wikipedia + DDG/Wikidata concurrently;
-    adds Bundesanzeiger if company is likely German-registered and private.
+    Async enrichment. Runs Wikipedia + DDG/Wikidata concurrently (Phase A: Identität
+    inkl. EN-09 Ticker/canonical, Tags, category/industry), dann optionale Fallbacks
+    (Phase B: description/headcount/HQ parallel + Bundesanzeiger).
+
+    fast_only=True  → nur Phase A (Identität), kehrt vor den langsamen Fallbacks zurück.
+                      Für den blockierenden On-Demand-Pfad: liefert Identität + Ticker
+                      sofort, Phase B läuft beim Caller als BackgroundTask.
+    fast_only=False → vollständig (Phase A + B). Default — Rolling Refresh / Cron.
 
     Returns EnrichmentResult — caller persists to Supabase.
     """
@@ -1250,7 +1257,36 @@ async def enrich_company(
         or company_record.get("ipo_potential") == "IPO erfolgt"
     )
 
-    result = EnrichmentResult(name=company_name)
+    # ── Verlustfreie Basis ───────────────────────────────────────────────────
+    # result wird mit dem DB-Record VORBELEGT, statt leer zu starten.
+    # Damit kann enrich_company keinen vorhandenen Wert mehr verlieren: findet
+    # keine Quelle in diesem Lauf z.B. den Ticker, bleibt der DB-Wert stehen,
+    # statt als None zurückzukommen. Gilt für JEDEN Caller (On-Demand, Rolling
+    # Refresh, Cron) — der Schutz sitzt an der Wurzel, nicht in jedem Persist.
+    # Namens-Mapping DB → Result: founding_year→founded_year, headcount→employee_count.
+    result = EnrichmentResult(
+        name=company_name,
+        description=company_record.get("description"),
+        website=company_record.get("website"),
+        founded_year=company_record.get("founding_year"),
+        headquarters=company_record.get("headquarters"),
+        employee_count=company_record.get("headcount"),
+        ticker=company_record.get("ticker"),
+        exchange=company_record.get("exchange"),
+        ipo_status=company_record.get("ipo_status"),
+    )
+
+    def _set_if_better(field_name: str, new_value) -> None:
+        """Überschreibt result.<field> nur mit einem echten Neuwert.
+        Leere Werte (None, '', leere Liste) lassen den Bestand unberührt —
+        verlustfreie Merge-Regel für alle Quellen unten."""
+        if new_value is None:
+            return
+        if isinstance(new_value, str) and not new_value.strip():
+            return
+        if isinstance(new_value, (list, dict)) and not new_value:
+            return
+        setattr(result, field_name, new_value)
 
     # Concurrent: Wikipedia (primär) + DDG/Wikidata (Fakten-Fallback)
     # Crunchbase entfernt: JS-Rendering seit ~2024, 403/429, keine SSR-Daten (BUG-04)
@@ -1285,20 +1321,22 @@ async def enrich_company(
                     "kein Token-Overlap (falsche Wikipedia-Weiterleitung?)",
                     wiki_canonical, company_name,
                 )
-        result.description    = wiki.get("description")
-        result.wikipedia_url  = wiki.get("wikipedia_url")
-        result.website        = wiki.get("website")
-        result.founded_year   = wiki.get("founded_year")
-        result.headquarters   = wiki.get("headquarters")
-        result.employee_count = wiki.get("employee_count")
+        # Verlustfrei: nur mit echtem Neuwert überschreiben, sonst DB-Wert halten
+        if wiki.get("wikipedia_url"):
+            result.wikipedia_url = wiki.get("wikipedia_url")
+        _set_if_better("description",    wiki.get("description"))
+        _set_if_better("website",        wiki.get("website"))
+        _set_if_better("founded_year",   wiki.get("founded_year"))
+        _set_if_better("headquarters",   wiki.get("headquarters"))
+        _set_if_better("employee_count", wiki.get("employee_count"))
         # BUG-47: ipo_status aus Wikipedia-Infobox (type-Feld + traded_as)
         # Ticker-Extraktion entkoppelt von is_listed — Ticker impliziert listed
         # Guard: listed-Status (Ticker in DB) niemals durch Wikipedia überschreiben
         _db_ipo_status = company_record.get("ipo_status")
         if _db_ipo_status != "listed":
-            result.ipo_status = wiki.get("ipo_status")
-        result.ticker     = wiki.get("ticker")
-        result.exchange   = wiki.get("exchange")
+            _set_if_better("ipo_status", wiki.get("ipo_status"))
+        _set_if_better("ticker",   wiki.get("ticker"))
+        _set_if_better("exchange", wiki.get("exchange"))
         # is_listed aktualisieren wenn Wikipedia es klar sagt
         if result.ipo_status == "listed" or result.ticker:
             is_listed = True
@@ -1332,78 +1370,190 @@ async def enrich_company(
                     company_name, _official,
                 )
 
-    # Fix B: DuckDuckGo-Fallback für description — greift wenn Wikipedia Disambig oder 404
-    if not result.description:
+    # ── Optionale Fallbacks: drei UNABHÄNGIGE Gruppen, jetzt PARALLEL ──────────
+    # Vorher sequenziell: description(8s) → website(6+6s) → edgar+ddg(8+6s) = bis 34s
+    # Wall-Clock, was den 8s-Kill des Callers garantiert riss und ALLES verwarf.
+    # Jetzt: die drei Gruppen laufen gleichzeitig (gather), Wall-Clock = langsamste
+    # Einzelgruppe statt Summe. Reihenfolge INNERHALB einer Gruppe bleibt erhalten
+    # (Website: resolve→scrape; Basics: EDGAR→DDG-Fallback). Identität (Wikipedia+DDG
+    # oben) ist zu diesem Zeitpunkt bereits gemerged — diese Gruppen füllen nur Lücken.
+    # Jede Gruppe schreibt nur via _set_if_better → kein Überschreiben mit leer,
+    # Teilresultate überleben auch wenn eine Gruppe in den Timeout läuft.
+
+    async def _fill_description() -> None:
+        # Fix B: DDG-Fallback für description — wenn Wikipedia Disambig/404
+        if result.description:
+            return
         try:
             ddg_desc = await asyncio.wait_for(
-                _ddg_description_fallback(company_name),
-                timeout=8.0,
+                _ddg_description_fallback(company_name), timeout=6.0,
             )
             if ddg_desc:
-                result.description = ddg_desc
+                _set_if_better("description", ddg_desc)
                 logger.info("DDG description fallback OK für '%s'", company_name)
         except asyncio.TimeoutError:
             logger.warning("DDG description fallback timeout für '%s'", company_name)
         except Exception as e:
             logger.warning("DDG description fallback failed für '%s': %s", company_name, e)
 
-    # Company-Website: Headcount-Fallback wenn Wikipedia + DDG leer
-    # Priorität: DB-URL → Wikipedia-Wikitext-URL → Heuristik aus Company-Name
-    _known_url = company_record.get("website") or result.website
-    if not result.employee_count:
+    async def _fill_headcount() -> None:
+        # Company-Website: Headcount-Fallback. resolve → scrape (interne Reihenfolge).
+        if result.employee_count:
+            return
+        _known_url = company_record.get("website") or result.website
         try:
             _website_url = await asyncio.wait_for(
-                _resolve_website(company_name, _known_url),
-                timeout=6.0,
+                _resolve_website(company_name, _known_url), timeout=5.0,
             )
             if _website_url:
-                # URL in result speichern damit Upsert sie in DB schreibt
-                result.website = result.website or _website_url
+                _set_if_better("website", _website_url)
                 website_data = await asyncio.wait_for(
-                    _fetch_company_website(_website_url),
-                    timeout=6.0,
+                    _fetch_company_website(_website_url), timeout=5.0,
                 )
                 if website_data.get("employee_count"):
-                    result.employee_count = website_data["employee_count"]
+                    _set_if_better("employee_count", website_data["employee_count"])
         except asyncio.TimeoutError:
             logger.debug("Company website timeout for %s", company_name)
         except Exception as e:
             logger.debug("Company website failed for %s: %s", company_name, e)
 
-    # EDGAR + DuckDuckGo: Fallback für fehlende HQ und Gründungsjahr
-    # EDGAR: strukturierte US-Adresse (city + state) — nur für US/unbekannte Region
-    # DuckDuckGo: weltweiter Fallback via Wikipedia/Wikidata Infobox
-    _needs_hq      = not result.headquarters
-    _needs_founded = not result.founded_year
-    if _needs_hq or _needs_founded:
+    async def _fill_hq_founded() -> None:
+        # EDGAR (US-Adresse) → DDG-Basics (weltweit). Interne Fallback-Reihenfolge.
+        if result.headquarters and result.founded_year:
+            return
         _region = (company_record.get("region") or "").upper()
-
+        _needs_hq = not result.headquarters
         if _needs_hq and _region in ("US", ""):
             try:
                 edgar_data = await asyncio.wait_for(
-                    _fetch_edgar_basics(company_name), timeout=8.0
+                    _fetch_edgar_basics(company_name), timeout=6.0,
                 )
                 if edgar_data.get("headquarters"):
-                    result.headquarters = edgar_data["headquarters"]
+                    _set_if_better("headquarters", edgar_data["headquarters"])
                     _needs_hq = False
             except asyncio.TimeoutError:
                 logger.debug("EDGAR basics timeout for %s", company_name)
             except Exception as e:
                 logger.debug("EDGAR basics failed for %s: %s", company_name, e)
 
-        if _needs_hq or _needs_founded:
+        if _needs_hq or not result.founded_year:
             try:
                 ddg_data = await asyncio.wait_for(
-                    _fetch_duckduckgo_basics(company_name), timeout=6.0
+                    _fetch_duckduckgo_basics(company_name), timeout=6.0,
                 )
-                result.founded_year = result.founded_year or ddg_data.get("founded_year")
-                result.headquarters = result.headquarters or ddg_data.get("headquarters")
+                _set_if_better("founded_year", ddg_data.get("founded_year"))
+                _set_if_better("headquarters", ddg_data.get("headquarters"))
             except asyncio.TimeoutError:
                 logger.debug("DuckDuckGo basics timeout for %s", company_name)
             except Exception as e:
                 logger.debug("DuckDuckGo basics failed for %s: %s", company_name, e)
 
-    # Bundesanzeiger: private DE companies only
+    await asyncio.gather(_fill_description(), _fill_headcount(), _fill_hq_founded())
+
+    # ── Phase A abschließen: Tags + category/industry (kein I/O, schnell) ──────
+    # Vorgezogen vor die Fallbacks, damit fast_only eine identitäts-vollständige
+    # Antwort liefert (Name, Ticker, Kategorie) — genau das Set für den ersten Paint.
+    def _derive_tags_and_category() -> None:
+        text_for_tags = " ".join(filter(None, [
+            result.description,
+            company_record.get("category", ""),
+            company_record.get("industry", ""),
+        ]))
+        result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
+        if not company_record.get("category") or not company_record.get("industry"):
+            inferred_cat, inferred_ind = infer_category_industry(result.tags)
+            result.category = inferred_cat if not company_record.get("category") else None
+            result.industry = inferred_ind if not company_record.get("industry") else None
+        # Taxonomy-Normalisierung als Write-Guard — kein Freitext in die DB
+        if result.industry:
+            result.industry = normalize_sector(result.industry) or result.industry
+        if result.category:
+            result.category = normalize_category(result.category, result.industry) or result.category
+
+    _derive_tags_and_category()
+
+    if fast_only:
+        # Phase A komplett — Identität + Ticker + Kategorie. Phase B (langsam) läuft
+        # beim Caller als BackgroundTask via enrich_company(fast_only=False).
+        return result
+
+    # ── Phase B: optionale Fallbacks (drei UNABHÄNGIGE Gruppen, PARALLEL) ──────
+    # Füllt Lücken (description/headcount/HQ). Identität steht bereits.
+    # Jede Gruppe schreibt nur via _set_if_better → kein Überschreiben mit leer,
+    # Teilresultate überleben auch wenn eine Gruppe in den Timeout läuft.
+
+    async def _fill_description() -> None:
+        # Fix B: DDG-Fallback für description — wenn Wikipedia Disambig/404
+        if result.description:
+            return
+        try:
+            ddg_desc = await asyncio.wait_for(
+                _ddg_description_fallback(company_name), timeout=6.0,
+            )
+            if ddg_desc:
+                _set_if_better("description", ddg_desc)
+                logger.info("DDG description fallback OK für '%s'", company_name)
+        except asyncio.TimeoutError:
+            logger.warning("DDG description fallback timeout für '%s'", company_name)
+        except Exception as e:
+            logger.warning("DDG description fallback failed für '%s': %s", company_name, e)
+
+    async def _fill_headcount() -> None:
+        # Company-Website: Headcount-Fallback. resolve → scrape (interne Reihenfolge).
+        if result.employee_count:
+            return
+        _known_url = company_record.get("website") or result.website
+        try:
+            _website_url = await asyncio.wait_for(
+                _resolve_website(company_name, _known_url), timeout=5.0,
+            )
+            if _website_url:
+                _set_if_better("website", _website_url)
+                website_data = await asyncio.wait_for(
+                    _fetch_company_website(_website_url), timeout=5.0,
+                )
+                if website_data.get("employee_count"):
+                    _set_if_better("employee_count", website_data["employee_count"])
+        except asyncio.TimeoutError:
+            logger.debug("Company website timeout for %s", company_name)
+        except Exception as e:
+            logger.debug("Company website failed for %s: %s", company_name, e)
+
+    async def _fill_hq_founded() -> None:
+        # EDGAR (US-Adresse) → DDG-Basics (weltweit). Interne Fallback-Reihenfolge.
+        if result.headquarters and result.founded_year:
+            return
+        _region = (company_record.get("region") or "").upper()
+        _needs_hq = not result.headquarters
+        if _needs_hq and _region in ("US", ""):
+            try:
+                edgar_data = await asyncio.wait_for(
+                    _fetch_edgar_basics(company_name), timeout=6.0,
+                )
+                if edgar_data.get("headquarters"):
+                    _set_if_better("headquarters", edgar_data["headquarters"])
+                    _needs_hq = False
+            except asyncio.TimeoutError:
+                logger.debug("EDGAR basics timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("EDGAR basics failed for %s: %s", company_name, e)
+
+        if _needs_hq or not result.founded_year:
+            try:
+                ddg_data = await asyncio.wait_for(
+                    _fetch_duckduckgo_basics(company_name), timeout=6.0,
+                )
+                _set_if_better("founded_year", ddg_data.get("founded_year"))
+                _set_if_better("headquarters", ddg_data.get("headquarters"))
+            except asyncio.TimeoutError:
+                logger.debug("DuckDuckGo basics timeout for %s", company_name)
+            except Exception as e:
+                logger.debug("DuckDuckGo basics failed for %s: %s", company_name, e)
+
+    await asyncio.gather(_fill_description(), _fill_headcount(), _fill_hq_founded())
+
+    # Bundesanzeiger: private DE companies only.
+    # Bleibt in Phase B (Background) — echter Tempo-Hebel ist HAI-01 in der Bridge.
     if not is_listed and _is_likely_german(company_record):
         ba = await _fetch_bundesanzeiger(company_name)
         result.bundesanzeiger = ba
@@ -1412,26 +1562,9 @@ async def enrich_company(
             if sh.name.lower() not in known:
                 result.investors.append(sh)
 
-    # Tags
-    text_for_tags = " ".join(filter(None, [
-        result.description,
-        company_record.get("category", ""),
-        company_record.get("industry", ""),
-    ]))
-    result.tags = list(set((existing_tags or []) + _infer_tags(text_for_tags)))
-
-    # category / industry aus Tags — schnell, kein I/O, bleibt im 8s-Timeout
-    # Claude-Fallback läuft separat in company_detail.py mit eigenem Timeout
-    if not company_record.get("category") or not company_record.get("industry"):
-        inferred_cat, inferred_ind = infer_category_industry(result.tags)
-        result.category = inferred_cat if not company_record.get("category") else None
-        result.industry = inferred_ind if not company_record.get("industry") else None
-
-    # Taxonomy-Normalisierung als Write-Guard — kein Freitext in die DB
-    # Verhindert Inkonsistenzen auch wenn company_record bereits Werte enthält
-    if result.industry:
-        result.industry = normalize_sector(result.industry) or result.industry
-    if result.category:
-        result.category = normalize_category(result.category, result.industry) or result.category
+    # category/industry erneut prüfen: Phase B kann description nachgeliefert haben,
+    # aus der sich jetzt Tags/Kategorie ableiten lassen (wenn Phase A noch leer war).
+    if (not result.category or not result.industry) and result.description:
+        _derive_tags_and_category()
 
     return result

@@ -1337,37 +1337,97 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
     # ein On-Demand-Fetch beim Request ist nur nötig wenn Felder tatsächlich fehlen.
     # Spart ~8s beim Warm-Path (CropX-Referenz: 8s Enrichment-Timeout ohne neuen Wert).
     #
-    # Felder die als "vollständig" gelten (alle vier müssen gesetzt sein):
-    #   headquarters, headcount, founding_year, description
-    # Ausnahme: immer enrichen wenn category oder industry fehlen (Scoring-Dependency).
-    _enrichment_fields_complete = bool(
-        company.get("headquarters")
-        and company.get("headcount")
-        and company.get("founding_year")
-        and company.get("description")
-        and company.get("category")
+    # R1-GUARD Skip-Kriterium (Session 38 überarbeitet):
+    #   Skip nur wenn die STABILEN Identitäts-/Klassifikationsfelder stehen.
+    #   - category + industry: ändern sich praktisch nie (Scoring-Dependency, bewährte
+    #     done-Bedingung aus MODUL06). Kern des Kriteriums.
+    #   - ticker NUR wenn is_listed: löst das Henne-Ei. Eine listed Company ohne Ticker
+    #     darf NICHT skippen, sonst läuft EN-09 nie → Yahoo bekommt keinen Ticker →
+    #     Fundamentals bleiben leer (LanzaTech/Fervo-Effekt). Private brauchen keinen.
+    #   Bewusst NICHT mehr Pflicht: headcount + description — bei privaten Companies oft
+    #   nicht auffindbar; ihr Fehlen würde den Skip dauerhaft blockieren (alte
+    #   Alles-oder-nichts-Falle). Diese Felder backfillt der Rolling Refresh (voller Fetch).
+    _identity_complete = bool(
+        company.get("category")
         and company.get("industry")
     )
+    _ticker_ok = (not is_listed) or bool(company.get("ticker"))
+    _enrichment_fields_complete = _identity_complete and _ticker_ok
 
     async def _safe_enrichment():
-        # R1-GUARD: Skip wenn alle Basisdaten vorhanden — Cron hält Daten aktuell
+        # R1-GUARD: Skip wenn Identität steht (category+industry, ticker wenn listed).
+        # Cron (Rolling Refresh) hält Daten aktuell — der umgeht diesen Guard bewusst.
         if _enrichment_fields_complete:
-            logger.info("R1-GUARD: Enrichment skipped für %s — alle Basisdaten vorhanden", company_name)
+            logger.info("R1-GUARD: Enrichment skipped für %s — Identität vollständig", company_name)
             from src.services.enrichment import EnrichmentResult
-            return EnrichmentResult(name=company_name)
+            # Verlustfrei: DB-Stand spiegeln, NICHT leeres Result (das würde beim
+            # Persist vorhandene Werte überschreiben). Namens-Mapping DB→Result.
+            return EnrichmentResult(
+                name=company.get("name") or company_name,
+                description=company.get("description"),
+                website=company.get("website"),
+                founded_year=company.get("founding_year"),
+                headquarters=company.get("headquarters"),
+                employee_count=company.get("headcount"),
+                ticker=company.get("ticker"),
+                exchange=company.get("exchange"),
+                ipo_status=company.get("ipo_status"),
+                category=company.get("category"),
+                industry=company.get("industry"),
+            )
+        # Option 2: nur Phase A (Identität + Ticker + Kategorie) im blockierenden Pfad.
+        # Phase B (langsame Fallbacks + BA) läuft unten als BackgroundTask.
+        # Timeout 4s statt 8s — Phase A ist nur der obere Wikipedia+DDG-gather.
         try:
             return await asyncio.wait_for(
-                enrich_company(company_name=company_name, company_record=company),
-                timeout=8.0,
+                enrich_company(company_name=company_name, company_record=company, fast_only=True),
+                timeout=4.0,
             )
         except asyncio.TimeoutError:
-            logger.warning("Enrichment timeout for %s — using empty result", company_name)
+            logger.warning("Enrichment (Phase A) timeout for %s — DB-Stand gespiegelt", company_name)
             from src.services.enrichment import EnrichmentResult
-            return EnrichmentResult(name=company_name)
+            # Verlustfrei auch im Timeout: DB-Stand statt leerem Result
+            return EnrichmentResult(
+                name=company.get("name") or company_name,
+                description=company.get("description"),
+                founded_year=company.get("founding_year"),
+                headquarters=company.get("headquarters"),
+                employee_count=company.get("headcount"),
+                ticker=company.get("ticker"),
+                exchange=company.get("exchange"),
+                ipo_status=company.get("ipo_status"),
+                category=company.get("category"),
+                industry=company.get("industry"),
+            )
         except Exception as e:
-            logger.warning("Enrichment failed for %s: %s", company_name, e)
+            logger.warning("Enrichment (Phase A) failed for %s: %s", company_name, e)
             from src.services.enrichment import EnrichmentResult
-            return EnrichmentResult(name=company_name)
+            return EnrichmentResult(name=company.get("name") or company_name)
+
+    # Phase B als BackgroundTask: volle Anreicherung (inkl. langsame Fallbacks + BA),
+    # persistiert die Lücken in die DB. Erscheint im Response NICHT — landet in der DB
+    # und wird beim nächsten Load / via Frontend-Poll sichtbar.
+    # Skip wenn Identität ohnehin vollständig war (dann gab's nichts nachzuladen,
+    # Cron hält den Rest aktuell).
+    async def _enrichment_phase_b_bg():
+        try:
+            full = await enrich_company(
+                company_name=company_name, company_record=company, fast_only=False,
+            )
+            if not company_id:
+                return
+            payload = {
+                "founding_year": full.founded_year,
+                "headquarters":  full.headquarters,
+                "headcount":     full.employee_count,
+                "description":   full.description,
+                "website":       full.website,
+            }
+            # upsert_company_enrichment filtert None — kein Overwrite mit leer
+            upsert_company_enrichment(company_id, payload)
+            logger.info("Phase B Enrichment persisted für %s", company_name)
+        except Exception as e:
+            logger.warning("Phase B Enrichment failed für %s: %s", company_name, e)
 
     # R18: Intro als BackgroundTask — blockiert Response nicht mehr.
     # Generiertes Intro wird in companies.description geschrieben (wenn description leer).
@@ -1384,13 +1444,32 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         except Exception as e:
             logger.warning("R18: Intro BackgroundTask failed für %s: %s", company_name, e)
 
+    # ── Option 2: Identität ZUERST (blockierend, schnell), dann Yahoo ──────────
+    # Sequenz statt Parallel-gather — löst das Henne-Ei: Phase A resolved den Ticker
+    # (EN-09 Wikidata), erst danach läuft Yahoo MIT dem frischen Ticker.
+    # Warm-Path: _safe_enrichment skippt sofort (DB-Spiegel) → kein realer Verlust
+    # der früheren Parallelität. Cold-Path: Sequenz ist für korrekten Ticker nötig.
+    enrichment = await _safe_enrichment()
+
+    # Ticker aus frischer Identität nachziehen, falls die DB noch keinen hatte
+    # (frisch gelistete Company, Ticker kommt erst aus EN-09).
+    if enrichment.ticker and not company.get("ticker"):
+        company["ticker"]   = enrichment.ticker
+        company["exchange"] = company.get("exchange") or enrichment.exchange
+        if not proxy or proxy == "—":
+            proxy = f"{enrichment.ticker} · {enrichment.exchange}".strip(" ·") if enrichment.exchange else enrichment.ticker
+        is_listed = True
+        logger.info("Option2: Ticker aus Phase A nachgezogen für %s → %s", company_name, enrichment.ticker)
+
     # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
     # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
     _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
-    enrichment, yahoo = await asyncio.gather(
-        _safe_enrichment(),
-        _fetch_yahoo(_yahoo_ticker),
-    )
+    yahoo = await _fetch_yahoo(_yahoo_ticker)
+
+    # Phase B nachgelagert anstoßen (nur wenn nicht ohnehin schon vollständig)
+    if not _enrichment_fields_complete:
+        background_tasks.add_task(_enrichment_phase_b_bg)
+        logger.info("Option2: Phase B Enrichment queued als BackgroundTask für %s", company_name)
 
     # Intro: aus DB (description) wenn vorhanden, sonst BackgroundTask triggern
     intro: str | None = company.get("description") or enrichment.description or None
