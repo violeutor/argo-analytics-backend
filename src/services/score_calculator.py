@@ -248,7 +248,11 @@ def _investor_tier(name: str, investor_type: str) -> int:
 
 # ── SC-01 · Financial Score ────────────────────────────────────────────────────
 
-def compute_financial_score(company: dict) -> tuple[float, dict]:
+def compute_financial_score(
+    company: dict,
+    funding_momentum: dict | None = None,
+    headcount_snapshots: list[dict] | None = None,
+) -> tuple[float, dict]:
     """
     SC-01: Financial Score (0–10).
 
@@ -258,15 +262,81 @@ def compute_financial_score(company: dict) -> tuple[float, dict]:
       revenue_cagr       → Wachstumsrate (aus kpi_timeseries)
       funding_stage      → Reifegrad-Proxy wenn Fundamentals fehlen
 
-    Gewichtung:
-      Revenue    0–3 Pkt  (Größe + Relevanz)
-      Marge      0–3 Pkt  (Profitabilität)
-      CAGR       0–2 Pkt  (Wachstumsdynamik)
-      Stage      0–2 Pkt  (Reifegrad-Proxy)
+    Für private Companies ohne Financials (US Private):
+      funding_momentum   → Ersetzt Stage-Proxy durch Momentum Score (Rundengröße,
+                           Frequenz, Wachstum, Stage-Progression)
+      headcount_snapshots→ Optionaler CAGR-Bonus wenn ≥2 Snapshots mit ≥90d Abstand
+
+    Gewichtung listed / DE private (mit BA-Daten):
+      Revenue    0–3 Pkt
+      Marge      0–3 Pkt
+      CAGR       0–2 Pkt
+      Stage      0–2 Pkt
+
+    Gewichtung US private (kein Revenue/Marge):
+      Momentum   0–8 Pkt  (normalisiert aus FundingMomentum.momentum_score)
+      Headcount  0–2 Pkt  (CAGR-Bonus, only if → then)
     """
     inputs: dict = {}
     score = 0.0
     data_points = 0
+
+    is_private = not _is_listed(company)
+    has_financials = bool(
+        company.get("revenue_usd_mn") or
+        company.get("ba_revenue_mn") or
+        company.get("ebitda_margin")
+    )
+
+    # ── US Private ohne Financials → Momentum-Pfad ───────────────────────────
+    if is_private and not has_financials and funding_momentum:
+        raw_momentum = funding_momentum.get("momentum_score")
+        if raw_momentum is not None:
+            # Momentum Score 0–10 → auf 8 Pkt skalieren (lässt Raum für HC-Bonus)
+            momentum_pts = _clamp(float(raw_momentum)) * 0.8
+            score += momentum_pts
+            inputs["momentum_score"]            = raw_momentum
+            inputs["rounds_count"]              = funding_momentum.get("rounds_count")
+            inputs["days_since_last_round"]     = funding_momentum.get("days_since_last_round")
+            inputs["avg_months_between_rounds"] = funding_momentum.get("avg_months_between_rounds")
+            inputs["round_size_growth_pct"]     = funding_momentum.get("round_size_growth_pct")
+            inputs["last_round_amount_usd_mn"]  = funding_momentum.get("last_round_amount_usd_mn")
+            data_points += 1
+
+        # Headcount CAGR Bonus (0–2 Pkt) — if → then, nur wenn Verlauf vorhanden
+        if headcount_snapshots and len(headcount_snapshots) >= 2:
+            try:
+                from datetime import date
+                snapshots_sorted = sorted(headcount_snapshots, key=lambda s: s["snapshot_date"])
+                first = snapshots_sorted[0]
+                last  = snapshots_sorted[-1]
+                first_date = date.fromisoformat(first["snapshot_date"])
+                last_date  = date.fromisoformat(last["snapshot_date"])
+                days_span  = (last_date - first_date).days
+
+                if days_span >= 90 and first["headcount"] > 0 and last["headcount"] > 0:
+                    years = days_span / 365.25
+                    hc_cagr = ((last["headcount"] / first["headcount"]) ** (1 / years) - 1) * 100
+                    hc_bonus = (
+                        2.0 if hc_cagr >= 50 else
+                        1.5 if hc_cagr >= 25 else
+                        1.0 if hc_cagr >= 10 else
+                        0.5 if hc_cagr >= 0  else
+                        0.0
+                    )
+                    score += hc_bonus
+                    inputs["headcount_cagr_pct"]    = round(hc_cagr, 1)
+                    inputs["headcount_bonus_pts"]   = hc_bonus
+                    inputs["headcount_span_days"]   = days_span
+                    inputs["headcount_first"]       = first["headcount"]
+                    inputs["headcount_last"]        = last["headcount"]
+                    data_points += 1
+            except Exception:
+                pass  # Snapshot-Fehler → Score bleibt unverändert, kein Crash
+
+        return _safe_round(min(score, 10.0)), inputs
+
+    # ── Standard-Pfad: listed + private DE mit BA-Daten ─────────────────────
 
     # Revenue (0–3)
     rev = company.get("revenue_usd_mn")
@@ -1180,11 +1250,13 @@ def compute_compound_risk_score(dimension_risks: dict) -> tuple[float, dict]:
 
 def compute_all_scores(
     company: dict,
-    market_data:       dict | None       = None,
-    signals:           list[dict] | None = None,
-    ownership_entries: list[dict] | None = None,
-    buyers:            list[dict] | None = None,
-    value_drivers:     list[dict] | None = None,
+    market_data:         dict | None       = None,
+    signals:             list[dict] | None = None,
+    ownership_entries:   list[dict] | None = None,
+    buyers:              list[dict] | None = None,
+    value_drivers:       list[dict] | None = None,
+    funding_momentum:    dict | None       = None,   # SC-01: Momentum-Pfad für US Private
+    headcount_snapshots: list[dict] | None = None,   # SC-01: optionaler CAGR-Bonus
 ) -> ScoreResult:
     """
     SC-Haupt-Pipeline: Berechnet alle Sub-Scores, Path-Scores und Composite.
@@ -1215,7 +1287,7 @@ def compute_all_scores(
     all_inputs: dict = {}
 
     # ── Sub-Scores ──────────────────────────────────────────────────────────
-    _run(result, "financial_score",    lambda: compute_financial_score(company),             all_inputs, "financial",    "SC-01")
+    _run(result, "financial_score",    lambda: compute_financial_score(company, funding_momentum, headcount_snapshots), all_inputs, "financial",    "SC-01")
     _run(result, "strategic_score",    lambda: compute_strategic_score(company, buy),        all_inputs, "strategic",    "SC-02")
     _run(result, "market_score",       lambda: compute_market_score(mkt, company),           all_inputs, "market",       "SC-03")
     _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
