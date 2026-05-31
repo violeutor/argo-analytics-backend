@@ -45,9 +45,17 @@ _XBRL_MAP: dict[str, str] = {
     "NetIncomeLoss":                                                     "net_income_mn",
     # Operating Income (für EBITDA-Annäherung)
     "OperatingIncomeLoss":                                               "operating_income_mn",
-    # D&A (für EBITDA)
+    # D&A (für EBITDA) — Income- UND Cashflow-Statement-Varianten.
+    # Viele Filer führen D&A NICHT im Income Statement, sondern nur im Cashflow
+    # Statement unter abweichenden Tags → ohne diese Varianten fehlt EBITDA
+    # systematisch (LanzaTech-Fall). Reihenfolge unkritisch: pro FY gewinnt der
+    # letzte Eintrag, alle mappen auf denselben metric-Key.
     "DepreciationDepletionAndAmortization":                              "depreciation_mn",
     "DepreciationAndAmortization":                                       "depreciation_mn",
+    "DepreciationAmortizationAndAccretionNet":                           "depreciation_mn",
+    "DepreciationDepletionAndAmortizationNonproductionExpense":          "depreciation_mn",
+    "Depreciation":                                                      "depreciation_mn",
+    "AmortizationOfIntangibleAssets":                                    "depreciation_mn",
     # Equity
     "StockholdersEquity":                                                "equity_mn",
     "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": "equity_mn",
@@ -89,8 +97,11 @@ _MONETARY: frozenset[str] = frozenset({
 # Shares-Metriken → XBRL unit key "shares", Wert als absolute Zahl (kein Divider)
 _SHARES_UNIT: frozenset[str] = frozenset({"shares_outstanding"})
 
-# Helper-Metriken die nur für EBITDA-Berechnung gebraucht werden
-_HELPER_METRICS: frozenset[str] = frozenset({"operating_income_mn", "depreciation_mn"})
+# Helper-Metriken die nur für EBITDA-Berechnung gebraucht werden.
+# operating_income_mn wird NICHT mehr verworfen — es ist EBIT, eine eigene Kennzahl
+# (EBIT-Marge). _derive_ebitda gibt es zusätzlich als ebit_mn aus. Nur depreciation_mn
+# bleibt reiner Helper (D&A wird nicht separat angezeigt).
+_HELPER_METRICS: frozenset[str] = frozenset({"depreciation_mn"})
 
 # Debt-Komponenten: werden zu total_debt_mn summiert, dann aus Output entfernt
 _DEBT_COMPONENTS: frozenset[str] = frozenset({"long_term_debt_mn", "short_term_debt_mn"})
@@ -206,15 +217,22 @@ def _extract_xbrl_values(
 def _derive_ebitda(rows: list[dict]) -> list[dict]:
     """
     Berechnet ebitda_mn = operating_income_mn + depreciation_mn wo beide vorhanden.
-    Entfernt Helper-Metriken (operating_income_mn, depreciation_mn) aus Output.
+    operating_income_mn = EBIT → wird als ebit_mn ausgegeben (eigene Kennzahl für
+    EBIT-Marge in company_detail). Nur depreciation_mn bleibt reiner Helper.
     """
     op_by_fy  = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "operating_income_mn"}
     dep_by_fy = {r["fiscal_year"]: r["value"] for r in rows if r["metric"] == "depreciation_mn"}
 
-    # Helper-Metriken rausfiltern
-    clean = [r for r in rows if r["metric"] not in _HELPER_METRICS]
+    # Helper (D&A) rausfiltern. operating_income_mn → ebit_mn umbenennen (behalten!).
+    clean = []
+    for r in rows:
+        if r["metric"] in _HELPER_METRICS:
+            continue
+        if r["metric"] == "operating_income_mn":
+            r = {**r, "metric": "ebit_mn"}
+        clean.append(r)
 
-    # EBITDA-Rows wo beide vorhanden
+    # EBITDA-Rows wo operating_income UND D&A vorhanden
     for fy in sorted(set(op_by_fy) & set(dep_by_fy)):
         clean.append({
             "metric":      "ebitda_mn",

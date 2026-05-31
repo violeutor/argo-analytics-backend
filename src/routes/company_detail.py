@@ -94,6 +94,7 @@ class FundamentalsData(BaseModel):
     # Margen (%)
     gross_margin_pct: float | None = None
     operating_margin_pct: float | None = None
+    ebitda_margin_pct: float | None = None
     profit_margin_pct: float | None = None
     # Growth
     revenue_growth_pct: float | None = None
@@ -938,6 +939,7 @@ def _build_fundamentals(
             week_52_low=yahoo.get("week_52_low"), currency=yahoo.get("currency"),
             gross_margin_pct=yahoo.get("gross_margin_pct"),
             operating_margin_pct=yahoo.get("operating_margin_pct"),
+            ebitda_margin_pct=yahoo.get("ebitda_margin_pct"),
             profit_margin_pct=yahoo.get("profit_margin_pct"),
             revenue_growth_pct=yahoo.get("revenue_growth_pct"),
             earnings_growth_pct=yahoo.get("earnings_growth_pct"),
@@ -1837,6 +1839,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             if fundamentals.operating_margin_pct is None and _ebit_mn and _rev_mn and _rev_mn > 0:
                 fundamentals.operating_margin_pct = round(_ebit_mn / _rev_mn * 100, 1)
                 logger.info("KPI-Supplement operating_margin_pct für %s: %.1f%%", company_name, fundamentals.operating_margin_pct)
+
+            # ebitda_margin_pct: ebitda_mn / revenue_mn — bisher NUR im Yahoo-Pfad
+            # berechnet (Z.722). Hat Yahoo kein EBITDA (kleine Nasdaq-Caps → .info
+            # timeout), blieb die Marge leer obwohl ebitda_mn aus EDGAR vorlag.
+            # Jetzt auch hier abgeleitet — schließt EBITDA-Marge "—" bei LanzaTech & Co.
+            if fundamentals.ebitda_margin_pct is None and _ebitda_mn and _rev_mn and _rev_mn > 0:
+                fundamentals.ebitda_margin_pct = round(_ebitda_mn / _rev_mn * 100, 1)
+                logger.info("KPI-Supplement ebitda_margin_pct für %s: %.1f%%", company_name, fundamentals.ebitda_margin_pct)
 
             # profit_margin_pct: net_income_mn / revenue_mn (analog zu netIncome/totalRevenue)
             if fundamentals.profit_margin_pct is None and _ni_mn and _rev_mn and _rev_mn > 0:
