@@ -458,6 +458,7 @@ async def trigger_bafin_ondemand(company_name: str, background_tasks: Background
 
 
 
+@app.post("/internal/edgar-kpi/trigger")
 async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
     """Manueller Trigger für _cron_edgar_kpi (Testing/Debugging)."""
     background_tasks.add_task(_cron_edgar_kpi)

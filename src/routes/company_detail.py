@@ -166,6 +166,10 @@ class CompanyDetailResponse(BaseModel):
     website: str | None
     founded: str | None
     intro: str | None        # R18: async generiert, None bis BackgroundTask fertig
+    # Option 2: True wenn Phase-B-Enrichment als BackgroundTask läuft (Basisfelder
+    # kommen nach). Frontend-Poller gated darauf — pollt NICHT bei Warm-Companies,
+    # die per R1-GUARD geskippt wurden (dort kommt nichts nach).
+    enrichment_pending: bool = False
     description: str | None
     wikipedia_url: str | None
     crunchbase_url: str | None
@@ -2312,6 +2316,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         website=company.get("website"),
         founded=founded_display,
         intro=intro,
+        enrichment_pending=(not _enrichment_fields_complete),
         description=description_disp,
         wikipedia_url=enrichment.wikipedia_url,
         crunchbase_url=None,  # Crunchbase entfernt (BUG-04) — Feld nicht mehr in EnrichmentResult
