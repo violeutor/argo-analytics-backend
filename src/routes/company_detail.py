@@ -1072,20 +1072,40 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         proxy = c.get("proxy_ticker") or c.get("proxy") or ""
         return proxy.upper().startswith(ticker.upper())
 
+    _raw_candidates: list[dict] = []
+    _exact_hit_found = False
     try:
         _db = get_supabase()
-        # exakter Name-Treffer separat (limit=1) — garantiert gefunden, unabhängig vom
-        # Substring-Limit unten (verhindert dass ein klarer Treffer bei generischem
-        # Suchbegriff aus den 25 Substring-Kandidaten herausfällt).
+        # Exact-Match (case-insensitive, kein Wildcard) — beweisbar stabil (Log: 200).
+        # Deckt den häufigsten Fall: Frontend schickt den kanonischen Namen.
         _exact_hits = _db.table("companies").select("*").ilike("name", q).limit(1).execute().data or []
-        _name_hits  = _db.table("companies").select("*").ilike("name", f"%{q}%").limit(25).execute().data or []
-        _proxy_hits = _db.table("companies").select("*").ilike("proxy_ticker", f"{name}%").limit(10).execute().data or []
-        _raw_candidates = [*_exact_hits, *_name_hits, *_proxy_hits]
-    except Exception as _lookup_err:
-        logger.warning(
-            "Lookup-Query failed für '%s': %s — Fallback auf fetch_companies(500)",
-            name, _lookup_err,
-        )
+        _raw_candidates.extend(_exact_hits)
+        _exact_hit_found = bool(_exact_hits)
+    except Exception as _exact_err:
+        logger.warning("Exact-Lookup failed für '%s': %s", name, _exact_err)
+
+    # Substring + Proxy nur als Erweiterung, und nur wenn KEIN Exact-Treffer.
+    # WICHTIG: PostgREST-Wildcard ist '*', NICHT '%' — '%' landet roh in der URL und
+    # lässt die Supabase-Edge werfen (Cloudflare 1101 / HTTP 500). '*' wird korrekt
+    # zu LIKE-'%' übersetzt. Eigener try: schlägt die Erweiterung fehl, bleibt der
+    # Exact-Treffer bestehen statt auf die teure 500er-Ladung zu kippen.
+    if not _exact_hit_found:
+        try:
+            _db = get_supabase()
+            _name_hits  = _db.table("companies").select("*").ilike("name", f"*{q}*").limit(25).execute().data or []
+            _proxy_hits = _db.table("companies").select("*").ilike("proxy_ticker", f"{name}*").limit(10).execute().data or []
+            _raw_candidates.extend(_name_hits)
+            _raw_candidates.extend(_proxy_hits)
+        except Exception as _ext_err:
+            logger.warning(
+                "Substring/Proxy-Lookup failed für '%s': %s — nur Exact-Treffer genutzt",
+                name, _ext_err,
+            )
+
+    # Letzter Ausweg: gar kein Kandidat gefunden (auch kein Exact) → fetch_companies.
+    # Tritt nur ein wenn der Exact-Match-Query selbst scheiterte UND Substring leer/Fehler.
+    if not _raw_candidates:
+        logger.warning("Lookup ohne Kandidaten für '%s' — Fallback auf fetch_companies(500)", name)
         _raw_candidates = fetch_companies(limit=500)
 
     # Dedupe nach id (Fallback name), Reihenfolge erhalten → exakter Treffer zuerst
@@ -1368,7 +1388,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 name=company.get("name") or company_name,
                 description=company.get("description"),
                 website=company.get("website"),
-                founded_year=company.get("founding_year"),
+                # founded_year ist im EnrichmentResult/Response ein str — DB liefert int.
+                # Casten, sonst ValidationError "founded: Input should be a valid string".
+                founded_year=(str(company["founding_year"]) if company.get("founding_year") else None),
                 headquarters=company.get("headquarters"),
                 employee_count=company.get("headcount"),
                 ticker=company.get("ticker"),
@@ -1392,7 +1414,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             return EnrichmentResult(
                 name=company.get("name") or company_name,
                 description=company.get("description"),
-                founded_year=company.get("founding_year"),
+                founded_year=(str(company["founding_year"]) if company.get("founding_year") else None),
                 headquarters=company.get("headquarters"),
                 employee_count=company.get("headcount"),
                 ticker=company.get("ticker"),
@@ -1693,7 +1715,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         getattr(enrichment.bundesanzeiger, "employees", None)
         if enrichment.bundesanzeiger else None
     )
-    founded_display   = enrichment.founded_year   or (str(company.get("founding_year")) if company.get("founding_year") else None)
+    # founded_display: Response-Feld 'founded' ist str — jede Quelle (Enrichment ODER
+    # DB-int) defensiv zu str casten, damit nie wieder eine ValidationError entsteht.
+    _founded_raw      = enrichment.founded_year or company.get("founding_year")
+    founded_display   = str(_founded_raw) if _founded_raw else None
     headquarters_disp = enrichment.headquarters   or company.get("headquarters")
     headcount_disp    = (
         enrichment.employee_count
