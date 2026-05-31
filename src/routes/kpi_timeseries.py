@@ -10,11 +10,12 @@ Wird aufgerufen von:
   - BA-Bridge Cron (03:00 UTC) nach parse_pending
   - On-demand via _push_kpi_to_argo() nach /ba/company/{name}
 
-GET /api/v1/company/{name}/kpi-timeseries
+GET /api/v1/company/{name}/kpi-timeseries?company_id={uuid}
   → Gibt Zeitreihe für eine Company zurück (für Frontend-Modal)
+  → company_id als Query-Parameter — kein interner Name-Lookup, kein Supabase-Connection-Stress
 """
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from src.integrations.supabase import get_supabase, fetch_company_by_name
@@ -99,18 +100,16 @@ async def write_kpi_timeseries(name: str, body: KPIWriteRequest):
 # ── Read Endpoint (Frontend-Modal) ────────────────────────────────────────────
 
 @router.get("/company/{name}/kpi-timeseries", response_model=KPITimeseriesResponse)
-async def get_kpi_timeseries(name: str):
+async def get_kpi_timeseries(
+    name: str,
+    company_id: str = Query(..., description="Company UUID — vom Frontend aus dem Haupt-Response übergeben"),
+):
     """
     Gibt alle KPI-Zeitreihen für eine Company zurück.
     Gruppiert nach metric — für Chart-Modal im Frontend.
+    company_id wird als Query-Parameter übergeben (kein interner Name-Lookup nötig).
     """
     db = get_supabase()
-
-    company = fetch_company_by_name(name)
-    if not company:
-        raise HTTPException(status_code=404, detail=f"Company '{name}' nicht gefunden.")
-
-    company_id = company["id"]
 
     try:
         result = (
