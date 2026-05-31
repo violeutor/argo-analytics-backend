@@ -456,17 +456,43 @@ async def _fetch_ddg_company_facts(company: str) -> dict:
     except Exception as e:
         logger.debug("DDG company facts failed für '%s': %s", company, e)
 
-    # ── 2. Wikidata SPARQL — Fallback für founded_year + HQ ─────────────────
-    if not out.get("founded_year") or not out.get("headquarters"):
+    # ── 2. Wikidata SPARQL — Fallback + Entity Resolution (EN-09) ───────────
+    #
+    # Erweiterte Query — holt in einem einzigen Call:
+    #   ?founded      P571  — Gründungsjahr
+    #   ?hqLabel      P159  — Hauptsitz
+    #   ?officialName P1448 — offizieller Firmenname (z.B. "Uniper SE" statt "Uniper")
+    #   ?ticker       P249  — Börsenkürzel
+    #   ?exchangeLabel P414 — Börse (z.B. "Frankfurt Stock Exchange")
+    #
+    # Entity Resolution: P31/wdt:P279* erfasst Subklassen von Q4830453
+    # → Q6881511 (publicly traded company), Q891723 (public company) etc.
+    # ORDER BY DESC(?isPublic) bevorzugt listed Entities bei mehreren Treffern.
+    #
+    # Gate: läuft immer wenn ticker oder canonical_name noch fehlen — nicht nur bei
+    # fehlenden founded_year/HQ — damit Ticker-Detection auch im Warm-Path greift.
+    _wikidata_needed = (
+        not out.get("founded_year")
+        or not out.get("headquarters")
+        or not out.get("ticker")
+        or not out.get("canonical_name")
+    )
+    if _wikidata_needed:
         try:
             sparql = f"""
-SELECT ?founded ?hqLabel WHERE {{
-  ?item wdt:P31 wd:Q4830453 ;
+SELECT ?founded ?hqLabel ?officialName ?ticker ?exchangeLabel
+       (IF(EXISTS {{ ?item wdt:P31/wdt:P279* wd:Q6881511. }}, true, false) AS ?isPublic)
+WHERE {{
+  ?item wdt:P31/wdt:P279* wd:Q4830453 ;
         rdfs:label "{company}"@en .
   OPTIONAL {{ ?item wdt:P571 ?founded. }}
   OPTIONAL {{ ?item wdt:P159 ?hq. }}
+  OPTIONAL {{ ?item wdt:P1448 ?officialName. FILTER(LANG(?officialName) = "en") }}
+  OPTIONAL {{ ?item wdt:P249 ?ticker. }}
+  OPTIONAL {{ ?item wdt:P414 ?exchange. }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
 }}
+ORDER BY DESC(?isPublic)
 LIMIT 1
 """
             async with httpx.AsyncClient(timeout=8, headers={**HEADERS, "Accept": "application/json"}) as client:
@@ -478,14 +504,33 @@ LIMIT 1
                 bindings = wd_resp.json().get("results", {}).get("bindings", [])
                 if bindings:
                     row = bindings[0]
+                    # founded_year
                     if not out.get("founded_year") and "founded" in row:
                         year_str = row["founded"]["value"][:4]
                         if year_str.isdigit():
                             out["founded_year"] = year_str
+                    # headquarters
                     if not out.get("headquarters") and "hqLabel" in row:
                         out["headquarters"] = row["hqLabel"]["value"]
-                    if out:
-                        logger.debug("Wikidata facts OK für '%s': %s", company, out)
+                    # EN-09: offizieller Name (P1448) — "Uniper" → "Uniper SE"
+                    if "officialName" in row:
+                        _official = row["officialName"]["value"].strip()
+                        if _official and 2 <= len(_official) <= 120:
+                            out["canonical_name"] = _official
+                    # EN-09: Ticker (P249) — nur wenn noch nicht aus Wikipedia-Infobox
+                    if not out.get("ticker") and "ticker" in row:
+                        _tk = row["ticker"]["value"].strip().upper()
+                        if _tk and 1 <= len(_tk) <= 12:
+                            out["ticker"] = _tk
+                            out["ticker_source"] = "wikidata"
+                    # EN-09: Börse (P414)
+                    if not out.get("exchange") and "exchangeLabel" in row:
+                        out["exchange"] = row["exchangeLabel"]["value"]
+                    logger.debug(
+                        "Wikidata EN-09 OK für '%s': ticker=%s official=%s hq=%s",
+                        company,
+                        out.get("ticker"), out.get("canonical_name"), out.get("headquarters"),
+                    )
         except Exception as e:
             logger.debug("Wikidata SPARQL failed für '%s': %s", company, e)
 
@@ -1265,6 +1310,27 @@ async def enrich_company(
         result.founded_year   = result.founded_year   or ddg.get("founded_year")
         result.headquarters   = result.headquarters   or ddg.get("headquarters")
         result.employee_count = result.employee_count or ddg.get("employee_count")
+        # EN-09: Ticker + Exchange aus Wikidata (P249/P414) — Fallback wenn Infobox leer
+        if not result.ticker and ddg.get("ticker"):
+            result.ticker   = ddg.get("ticker")
+            result.exchange = result.exchange or ddg.get("exchange")
+            if not result.ipo_status:
+                result.ipo_status = "listed"
+            logger.info(
+                "EN-09: Wikidata Ticker für '%s': %s (%s)",
+                company_name, result.ticker, result.exchange or "—",
+            )
+        # EN-09: Offizieller Name aus Wikidata P1448 — Fallback wenn Wikipedia kein canonical
+        if ddg.get("canonical_name") and result.name == company_name:
+            _official = ddg["canonical_name"]
+            _orig_tokens = {t.lower() for t in company_name.split() if len(t) > 2}
+            _off_tokens  = {t.lower() for t in _official.split() if len(t) > 2}
+            if _orig_tokens & _off_tokens:
+                result.name = _official
+                logger.info(
+                    "EN-09: Wikidata P1448 canonical name für '%s': '%s'",
+                    company_name, _official,
+                )
 
     # Fix B: DuckDuckGo-Fallback für description — greift wenn Wikipedia Disambig oder 404
     if not result.description:

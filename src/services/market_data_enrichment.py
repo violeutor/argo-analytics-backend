@@ -736,6 +736,13 @@ async def enrich_market_data(
         result.update(sam_data)
 
     # ── 5. Competition Signals vorab fetchen (MD-B05-ext) ────────────────────
+    # EN-10: DDG Rate-Limit Guard — kurze Pause nach MD-B01 DDG-Calls.
+    # _fetch_market_snippets macht 2 DDG-Calls; fetch_competition_signals weitere 2.
+    # 4 Calls in < 2s triggert DDG 202 Accepted (Rate-Limit).
+    # 1.5s Pause zwischen den Blöcken eliminiert das Problem ohne nennenswerten
+    # Timing-Impact (competition_signals läuft im Background-Task, nicht auf dem Request-Pfad).
+    await asyncio.sleep(1.5)
+
     # async hier, damit sync_wrapper das Ergebnis direkt konsumieren kann.
     # Wird via _competition_signals_cache an sync_wrapper übergeben.
     competition_signals: dict = {}

@@ -1300,7 +1300,30 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                 logger.info("enrichment_status → done (market_data frisch, category+industry befüllt): %s", company_name)
 
     # 5. Parallel: enrichment (with timeout) + yahoo + intro
+    #
+    # R1-GUARD: Enrichment überspringen wenn Basisdaten vollständig vorhanden.
+    # Basis-Enrichment (Wikipedia/DDG/Wikidata/SEC) wird vom Rolling Cron aktualisiert —
+    # ein On-Demand-Fetch beim Request ist nur nötig wenn Felder tatsächlich fehlen.
+    # Spart ~8s beim Warm-Path (CropX-Referenz: 8s Enrichment-Timeout ohne neuen Wert).
+    #
+    # Felder die als "vollständig" gelten (alle vier müssen gesetzt sein):
+    #   headquarters, headcount, founding_year, description
+    # Ausnahme: immer enrichen wenn category oder industry fehlen (Scoring-Dependency).
+    _enrichment_fields_complete = bool(
+        company.get("headquarters")
+        and company.get("headcount")
+        and company.get("founding_year")
+        and company.get("description")
+        and company.get("category")
+        and company.get("industry")
+    )
+
     async def _safe_enrichment():
+        # R1-GUARD: Skip wenn alle Basisdaten vorhanden — Cron hält Daten aktuell
+        if _enrichment_fields_complete:
+            logger.info("R1-GUARD: Enrichment skipped für %s — alle Basisdaten vorhanden", company_name)
+            from src.services.enrichment import EnrichmentResult
+            return EnrichmentResult(name=company_name)
         try:
             return await asyncio.wait_for(
                 enrich_company(company_name=company_name, company_record=company),
@@ -1406,7 +1429,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         # description: enrichment-Wert oder DB-Fallback (falls Timeout)
         _desc_for_claude = enrichment.description or company.get("description")
 
-        logger.warning(
+        logger.debug(
             "CATEGORY_DEBUG %s — inferred_cat=%s desc_len=%s company_cat=%s",
             company_name,
             inferred_cat,
