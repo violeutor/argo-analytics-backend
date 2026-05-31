@@ -77,6 +77,21 @@ class FundingRoundItem(BaseModel):
     notes: str | None = None
 
 
+class FundingMomentum(BaseModel):
+    """
+    Momentum-Indikatoren aus funding_rounds — nur für private Companies sinnvoll.
+    Alle Werte aus DB berechenbar, kein externer API-Call.
+    """
+    rounds_count:               int = 0
+    days_since_last_round:      int | None = None   # heute − letztes Datum
+    avg_months_between_rounds:  float | None = None # Ø Abstand bei ≥2 Runden
+    last_round_amount_usd_mn:   float | None = None
+    round_size_growth_pct:      float | None = None # letzte vs. vorletzte in %
+    lead_investors:             list[str] = []      # dedupliziert über alle Runden
+    stage_progression:          list[str] = []      # ["Seed", "Series A", "Series B"]
+    momentum_score:             float | None = None # 0–10, ersetzt Stage-Proxy in SC-01
+
+
 class FundamentalsData(BaseModel):
     is_listed: bool
     # Yahoo Finance (listed)
@@ -194,6 +209,7 @@ class CompanyDetailResponse(BaseModel):
     funding_last_round: str | None
     funding_stage: str | None
     funding_rounds: list[FundingRoundItem]
+    funding_momentum: FundingMomentum | None = None   # nur für private Companies
     # Ownership
     ownership: list[OwnershipItem]
     # Fundamentals
@@ -966,6 +982,121 @@ def _build_fundamentals(
         fd.ba_total_assets_mn=ba.total_assets_mn; fd.ba_employees=ba.employees
         fd.ba_source_url=ba.source_url
     return _apply_beta(fd)
+
+
+# ── Funding Momentum ─────────────────────────────────────────────────────────
+
+def _compute_funding_momentum(
+    rounds: list[FundingRoundItem],
+    is_listed: bool,
+) -> FundingMomentum | None:
+    """
+    Berechnet Momentum-Indikatoren aus funding_rounds.
+    Nur für private Companies — listed haben Yahoo-Fundamentals.
+    Gibt None zurück wenn keine Runden vorhanden.
+    """
+    if is_listed or not rounds:
+        return None
+
+    from datetime import date, datetime
+
+    # Runden nach Datum sortieren (älteste zuerst) — None-Daten ans Ende
+    def _parse_date(d: str | None):
+        if not d:
+            return None
+        try:
+            return datetime.strptime(d[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    dated = [(r, _parse_date(r.date)) for r in rounds]
+    dated_valid = [(r, d) for r, d in dated if d is not None]
+    dated_valid.sort(key=lambda x: x[1])
+
+    rounds_count = len(rounds)
+
+    # Tage seit letzter Runde
+    days_since_last_round: int | None = None
+    last_round_amount:     float | None = None
+    if dated_valid:
+        last_r, last_d = dated_valid[-1]
+        days_since_last_round = (date.today() - last_d).days
+        last_round_amount     = last_r.amount_usd_mn
+
+    # Ø Monate zwischen Runden
+    avg_months: float | None = None
+    if len(dated_valid) >= 2:
+        gaps = []
+        for i in range(1, len(dated_valid)):
+            delta = (dated_valid[i][1] - dated_valid[i-1][1]).days
+            gaps.append(delta / 30.44)
+        avg_months = round(sum(gaps) / len(gaps), 1)
+
+    # Rundenwachstum letzte vs. vorletzte
+    round_size_growth_pct: float | None = None
+    if len(dated_valid) >= 2:
+        prev_amount = dated_valid[-2][0].amount_usd_mn
+        curr_amount = dated_valid[-1][0].amount_usd_mn
+        if prev_amount and prev_amount > 0 and curr_amount:
+            round_size_growth_pct = round((curr_amount / prev_amount - 1) * 100, 1)
+
+    # Lead Investoren dedupliziert
+    lead_investors = list(dict.fromkeys(
+        r.lead_investor for r in rounds if r.lead_investor
+    ))
+
+    # Stage Progression (Reihenfolge aus dated_valid, Fallback aus undatierten)
+    stage_progression = []
+    seen_stages: set[str] = set()
+    for r, _ in dated_valid:
+        if r.type and r.type not in seen_stages:
+            stage_progression.append(r.type)
+            seen_stages.add(r.type)
+    # undatierte Runden anhängen wenn Stage noch nicht gesehen
+    for r, d in dated:
+        if d is None and r.type and r.type not in seen_stages:
+            stage_progression.append(r.type)
+            seen_stages.add(r.type)
+
+    # Momentum Score 0–10 (ersetzt Stage-Proxy in SC-01 für US Private)
+    score = 0.0
+
+    # Rundengröße letzte Runde (max 4 Pkt)
+    if last_round_amount:
+        if last_round_amount >= 100:  score += 4.0
+        elif last_round_amount >= 20: score += 3.0
+        elif last_round_amount >= 5:  score += 2.0
+        else:                         score += 1.0
+
+    # Rundenfrequenz (max 2 Pkt)
+    if days_since_last_round is not None:
+        if days_since_last_round <= 365:   score += 2.0
+        elif days_since_last_round <= 730:  score += 1.0
+        # >730 Tage = 0
+
+    # Rundenwachstum (max 2 Pkt)
+    if round_size_growth_pct is not None:
+        if round_size_growth_pct >= 100:   score += 2.0
+        elif round_size_growth_pct >= 0:   score += 1.0
+        # negativ = 0
+
+    # Stage-Bonus (max 2 Pkt)
+    latest_stage = (dated_valid[-1][0].type or "").lower() if dated_valid else ""
+    if any(s in latest_stage for s in ["series c", "series d", "series e", "growth", "late"]):
+        score += 2.0
+    elif any(s in latest_stage for s in ["series b"]):
+        score += 1.0
+
+    return FundingMomentum(
+        rounds_count=rounds_count,
+        days_since_last_round=days_since_last_round,
+        avg_months_between_rounds=avg_months,
+        last_round_amount_usd_mn=last_round_amount,
+        round_size_growth_pct=round_size_growth_pct,
+        lead_investors=lead_investors,
+        stage_progression=stage_progression,
+        momentum_score=round(min(score, 10.0), 1),
+    )
 
 
 # ── FD-01 · Fundamentals-Routing ─────────────────────────────────────────────
@@ -2337,6 +2468,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         funding_last_round=company.get("funding_last_round"),
         funding_stage=company.get("funding_stage"),
         funding_rounds=funding_rounds,
+        funding_momentum=_compute_funding_momentum(funding_rounds, is_listed),
         ownership=ownership,
         fundamentals=fundamentals,
         scorings=scorings,
