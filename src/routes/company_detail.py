@@ -35,6 +35,7 @@ from src.integrations.supabase import (
     fetch_signals,
     fetch_ownership_entries,
     upsert_ownership_entries,
+    fetch_headcount_snapshots,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
 from src.services.score_calculator import compute_all_scores
@@ -2098,6 +2099,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         for r in db_rounds
     ]
 
+    # SC-01: funding_momentum einmal berechnen — genutzt in Response + Scoring
+    _funding_momentum_obj = _compute_funding_momentum(funding_rounds, is_listed)
+    _funding_momentum_dict = (
+        {k: v for k, v in _funding_momentum_obj.__dict__.items()}
+        if _funding_momentum_obj else None
+    )
+
     # BUG-30: Funding History → Investoren immer in Ownership aufnehmen
     # Investoren aus funding_rounds werden immer gemerged (Lead + Co-Investoren),
     # deduped gegen bereits vorhandene Einträge (curated overrides / enrichment).
@@ -2417,6 +2425,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
                     ownership_entries=ownership_raw,
                     buyers=buyers_raw,
                     value_drivers=vd_list,
+                    # SC-01: Momentum-Pfad für US Private ohne Financials
+                    funding_momentum=_funding_momentum_dict,
+                    # SC-01: Headcount CAGR-Bonus (if → then, nur wenn Verlauf vorhanden)
+                    headcount_snapshots=(
+                        fetch_headcount_snapshots(company_id) if company_id and not is_listed else None
+                    ),
                 )
                 scores_result = sc_result.to_dict()
 
@@ -2468,7 +2482,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
         funding_last_round=company.get("funding_last_round"),
         funding_stage=company.get("funding_stage"),
         funding_rounds=funding_rounds,
-        funding_momentum=_compute_funding_momentum(funding_rounds, is_listed),
+        funding_momentum=_funding_momentum_obj,
         ownership=ownership,
         fundamentals=fundamentals,
         scorings=scorings,
