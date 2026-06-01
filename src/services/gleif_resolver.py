@@ -254,17 +254,33 @@ async def resolve_entity(
         if not raw:
             return ResolutionResult(query, [], False, None, "no_gleif_match")
 
-        # ISINs für die Top-Kandidaten parallel auflösen (gekappt).
-        # Alle Kandidaten nach Rechtsform-Relevanz vorsortieren.
-        # Kandidaten mit Listed-Rechtsform (AG/SE/KGaA etc.) immer ins ISIN-Check-Fenster
-        # ziehen — auch wenn sie in der Rohliste weiter hinten stehen.
-        form_priority = [c for c in raw if c.legal_form and any(
-            h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)]
-        # DEBUG: log alle Kandidaten mit Rechtsform für Diagnose
-        for c in raw[:10]:
-            logger.info("GLEIF candidate: %s | form=%s | has_isin=%s",
-                        c.legal_name, c.legal_form, c.has_isin)
-        logger.info("GLEIF form_priority count: %d / %d raw", len(form_priority), len(raw))
+        # Option B: Suffix-Fallback wenn keine Listed-Rechtsform in Rohliste.
+        # GLEIF hinterlegt für manche DE-Konzerne keinen ELF-Code.
+        # Zweite Suche mit "{name} AG", "{name} SE" etc. trifft exakten Legal Name.
+        _seen_names = {_norm(c.legal_name) for c in raw}
+        suffix_candidates: list[EntityCandidate] = []
+        has_listed_form = any(
+            c.legal_form and any(h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)
+            for c in raw
+        )
+        if not has_listed_form:
+            suffixes = ["AG", "SE", "KGaA", "N.V.", "PLC", "S.A."]
+            suffix_results = await asyncio.gather(*[
+                _search_records(client, f"{query} {s}", country) for s in suffixes
+            ])
+            for results in suffix_results:
+                for c in results:
+                    if _norm(c.legal_name) not in _seen_names:
+                        suffix_candidates.append(c)
+                        _seen_names.add(_norm(c.legal_name))
+            if suffix_candidates:
+                logger.info("GLEIF suffix-search: %d neue Kandidaten fuer %r", len(suffix_candidates), query)
+        raw = raw + suffix_candidates
+
+        # Suffix-Kandidaten immer ins ISIN-Check-Fenster ziehen (vor dem Cap).
+        suffix_ids = {id(c) for c in suffix_candidates}
+        form_priority = [c for c in raw if id(c) in suffix_ids or (
+            c.legal_form and any(h in c.legal_form.upper() for h in _LISTED_FORM_HINTS))]
         form_priority_ids = {id(c) for c in form_priority}
         rest = [c for c in raw if id(c) not in form_priority_ids]
         prioritized = form_priority + rest
