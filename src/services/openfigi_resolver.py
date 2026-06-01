@@ -262,7 +262,15 @@ async def resolve_entity(
             if not c.composite_figi or c.composite_figi not in equity_composites
         ]
 
-        all_candidates = _sort_candidates(_deduplicate(equity + unique_drs))
+        raw_all = equity + unique_drs
+        logger.info("OpenFIGI raw: %d equity + %d drs = %d total",
+                    len(equity), len(unique_drs), len(raw_all))
+        for c in raw_all:
+            logger.info("  FIGI candidate: name=%r ticker=%r exchange=%r composite=%r",
+                        c.name, c.ticker, c.exchange, c.composite_figi)
+        deduped = _deduplicate(raw_all)
+        logger.info("OpenFIGI after dedup: %d candidates", len(deduped))
+        all_candidates = _sort_candidates(deduped)
 
         if not all_candidates:
             return ResolutionResult(query, [], False, None, "no_figi_match")
