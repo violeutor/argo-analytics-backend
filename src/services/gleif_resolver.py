@@ -210,7 +210,9 @@ def _sort_candidates(cands: list[EntityCandidate]) -> list[EntityCandidate]:
         form_rank = 0 if (c.legal_form and any(
             h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)) else 1
         status_rank = 0 if (c.status or "").upper() in ("ISSUED", "ACTIVE") else 1
-        return (status_rank, form_rank, len(c.legal_name))
+        # ISIN-Treffer vor Rechtsform-Fallback, Rechtsform vor Rest
+        isin_rank = 0 if c.has_isin else (1 if form_rank == 0 else 2)
+        return (status_rank, isin_rank, form_rank, len(c.legal_name))
     return sorted(cands, key=key)
 
 
@@ -248,7 +250,14 @@ async def resolve_entity(
             return ResolutionResult(query, [], False, None, "no_gleif_match")
 
         # ISINs für die Top-Kandidaten parallel auflösen (gekappt).
-        ranked = _sort_candidates(raw)[:_MAX_ISIN_CHECKS]
+        # Alle Kandidaten nach Rechtsform-Relevanz vorsortieren.
+        # Kandidaten mit Listed-Rechtsform (AG/SE/KGaA etc.) immer ins ISIN-Check-Fenster
+        # ziehen — auch wenn sie in der Rohliste weiter hinten stehen.
+        form_priority = [c for c in raw if c.legal_form and any(
+            h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)]
+        rest = [c for c in raw if c not in set(form_priority)]
+        prioritized = form_priority + rest
+        ranked = prioritized[:_MAX_ISIN_CHECKS]
         isin_lists = await asyncio.gather(
             *[_fetch_isins(client, c.lei) for c in ranked]
         )
