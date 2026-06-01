@@ -59,11 +59,10 @@ _CONNECTED_CAP = 5       # max. verbundene (ISIN-lose) Treffer im Modal; darübe
 # Plausibilitätssignal. ISO-20275 ELF-Codes wären die robustere Quelle, aber
 # der Legal-Form-String reicht für die Sortierung.
 _LISTED_FORM_HINTS = ("AG", "SE", "KGAA", "N.V.", "NV", "PLC", "S.A.", "SA",
-                      "AKTIENGESELLSCHAFT",   # DE Volltext
-                      "8Z6G",                 # ELF-Code AG (Deutschland)
-                      "V2YH",                 # ELF-Code SE (Societas Europaea)
-                      "NAAMLOZE VENNOOTSCHAP", # NL Volltext
-                      "SOCIETE ANONYME")      # FR/BE Volltext
+                      "AKTIENGESELLSCHAFT",      # DE Volltext
+                      "NAAMLOZE VENNOOTSCHAP",   # NL Volltext
+                      "SOCIETE ANONYME",         # FR/BE Volltext
+                      "KOMMANDITGESELLSCHAFT AUF AKTIEN")  # KGaA Volltext
 
 
 @dataclass
