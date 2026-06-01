@@ -257,7 +257,27 @@ async def resolve_entity(
 
         # Gelistete (emissionsfähig, ISIN) vs. verbundene (Namens-Treffer ohne ISIN).
         listed = _sort_candidates([c for c in ranked if c.has_isin])
-        connected_all = _sort_candidates([c for c in ranked if not c.has_isin])
+
+        # Fallback für Companies ohne ISIN-Eintrag bei GLEIF (häufig bei DE/EU-Konzernen):
+        # Rechtsform AG/SE/KGaA/NV/PLC/S.A. = wahrscheinlich börsennotiert.
+        # Diese werden als "listed_form" in die listed-Gruppe aufgenommen, damit
+        # z.B. Bayer AG trotz fehlender GLEIF-ISIN im Modal erscheint.
+        listed_form_fallback = _sort_candidates([
+            c for c in ranked
+            if not c.has_isin
+            and c.legal_form
+            and any(h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)
+        ])
+        # Nur aufnehmen wenn nicht bereits durch ISIN abgedeckt (kein Doppel-Eintrag).
+        listed_names = {_norm(c.legal_name) for c in listed}
+        listed_form_fallback = [c for c in listed_form_fallback if _norm(c.legal_name) not in listed_names]
+        listed = _sort_candidates(listed + listed_form_fallback)
+
+        connected_all = _sort_candidates([
+            c for c in ranked
+            if not c.has_isin
+            and not (c.legal_form and any(h in c.legal_form.upper() for h in _LISTED_FORM_HINTS))
+        ])
 
         # Variante 2: verbundene Gruppe cappen. >Cap -> unterdrücken + Hinweis-Flag.
         # Eine willkürlich abgeschnittene Teilliste wäre irreführend ("warum diese 5?"),
