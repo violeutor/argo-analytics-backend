@@ -181,7 +181,7 @@ async def _search_records(
     """lei-records-Suche nach legalName (+ optional country), nur ACTIVE."""
     params = {
         "filter[entity.legalName]": name,
-        "filter[entity.registrationStatus]": "ISSUED",  # ACTIVE-Äquivalent in LEI-Daten
+        "filter[registration.status]": "ISSUED",  # ACTIVE-Äquivalent in LEI-Daten
         "page[size]": _PAGE_SIZE,
     }
     if country:
