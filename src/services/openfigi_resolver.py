@@ -294,6 +294,87 @@ def _sort_candidates(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     return sorted(cands, key=key)
 
 
+async def resolve_exchange_from_composite(
+    composite_figi: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+) -> str | None:
+    """
+    Zweiter OpenFIGI-Call: compositeFIGI → echtes Primär-Exchange (z.B. "GY" für XETRA).
+
+    OpenFIGI /v3/search liefert für DE-Konzerne den Bloomberg-Global-Composite (QT),
+    nicht das echte Handelslisting. Dieser Call holt via /v3/mapping alle Listings
+    für denselben compositeFIGI und wählt das beste (höchster _EXCHANGE_RANK).
+
+    Wird in Phase A parallel gestartet, muss vor Phase B completed sein — damit
+    Yahoo den korrekten Exchange-Suffix (.DE, .L, .PA) bekommt.
+
+    Gibt None zurück bei Fehler oder wenn kein bekannter Primär-Exchange gefunden.
+    """
+    if not composite_figi:
+        return None
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=_TIMEOUT)
+
+    headers = dict(_HEADERS)
+    if _OPENFIGI_API_KEY:
+        headers["X-OPENFIGI-APIKEY"] = _OPENFIGI_API_KEY
+
+    try:
+        resp = await client.post(
+            f"{OPENFIGI_BASE}/mapping",
+            json=[{"idType": "COMPOSITE_ID_BB_GLOBAL", "idValue": composite_figi}],
+            headers=headers,
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "resolve_exchange_from_composite HTTP %s für compositeFIGI=%s",
+                resp.status_code, composite_figi,
+            )
+            return None
+
+        data = resp.json()
+        # /v3/mapping gibt eine Liste von Batches zurück — wir haben genau einen Request.
+        items = []
+        for batch in data:
+            items.extend(batch.get("data") or [])
+
+        best_exchange: str | None = None
+        best_rank = -1
+        for item in items:
+            exch = item.get("exchCode") or ""
+            rank = _EXCHANGE_RANK.get(exch, -1)
+            # Nur echte Handelsplätze — Composite-Codes (QT) explizit ausschließen.
+            if rank > best_rank and exch != "QT":
+                best_rank = rank
+                best_exchange = exch
+
+        if best_exchange:
+            logger.info(
+                "resolve_exchange_from_composite: compositeFIGI=%s → exchange=%s",
+                composite_figi, best_exchange,
+            )
+        else:
+            logger.debug(
+                "resolve_exchange_from_composite: kein Primär-Exchange für compositeFIGI=%s",
+                composite_figi,
+            )
+        return best_exchange
+
+    except Exception as exc:
+        logger.warning(
+            "resolve_exchange_from_composite failed für compositeFIGI=%s: %s",
+            composite_figi, exc,
+        )
+        return None
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
 async def resolve_entity(
     name: str,
     *,

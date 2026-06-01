@@ -1224,6 +1224,7 @@ class ResolveResponse(BaseModel):
     resolved_isin: str | None = None
     resolved_ticker: str | None = None
     resolved_exchange: str | None = None
+    resolved_composite_figi: str | None = None   # DISAMBIG-01: für Exchange-Resolution in Phase A
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1235,7 +1236,7 @@ async def resolve_company(name: str) -> ResolveResponse:
     # 1. Warm-Path: Company bereits in DB mit geklärter Identität (ISIN vorhanden).
     try:
         _db = get_supabase()
-        _hits = _db.table("companies").select("name,isin,ticker,exchange").ilike("name", q).limit(1).execute().data or []
+        _hits = _db.table("companies").select("name,isin,ticker,exchange,composite_figi").ilike("name", q).limit(1).execute().data or []
         if _hits:
             hit = _hits[0]
             if hit.get("isin"):
@@ -1246,6 +1247,7 @@ async def resolve_company(name: str) -> ResolveResponse:
                     resolved_isin=hit.get("isin"),
                     resolved_ticker=hit.get("ticker"),
                     resolved_exchange=hit.get("exchange"),
+                    resolved_composite_figi=hit.get("composite_figi"),
                     candidates=[],
                     reason="db_hit",
                 )
@@ -1279,6 +1281,7 @@ async def resolve_company(name: str) -> ResolveResponse:
         resolved_isin=result.resolved.isin if result.resolved else None,
         resolved_ticker=result.resolved.ticker if result.resolved else None,
         resolved_exchange=_resolved_exchange,
+        resolved_composite_figi=result.resolved.composite_figi if result.resolved else None,
         candidates=[
             ResolveCandidate(
                 figi=c.figi,
@@ -1297,7 +1300,7 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None) -> CompanyDetailResponse:
     warnings: list[str] = []
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
@@ -1397,6 +1400,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     _insert["ticker"] = ticker
                 if exchange:
                     _insert["exchange"] = exchange
+                # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
+                # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
+                # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
+                # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
+                if composite_figi:
+                    _insert["composite_figi"] = composite_figi
                 result = db.table("companies").insert(_insert).execute()
                 company = result.data[0] if result.data else {"name": name}
                 warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
@@ -1728,8 +1737,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # Ticker aus frischer Identität nachziehen, falls die DB noch keinen hatte
     # (frisch gelistete Company, Ticker kommt erst aus EN-09).
     if enrichment.ticker and not company.get("ticker"):
-        company["ticker"]   = enrichment.ticker
-        company["exchange"] = company.get("exchange") or enrichment.exchange
+        company["ticker"]         = enrichment.ticker
+        company["exchange"]       = company.get("exchange") or enrichment.exchange
+        company["composite_figi"] = company.get("composite_figi") or enrichment.composite_figi
         if not proxy or proxy == "—":
             proxy = f"{enrichment.ticker} · {enrichment.exchange}".strip(" ·") if enrichment.exchange else enrichment.ticker
         is_listed = True
@@ -1856,6 +1866,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             # EN-11: ISIN-First — nur schreiben wenn noch nicht vorhanden
             if enrichment.isin and not company.get("isin"):
                 upsert_payload["isin"] = enrichment.isin
+            # DISAMBIG-01: compositeFIGI persistieren — wird für Exchange-Resolution
+            # in Phase A bei nachfolgenden Loads verwendet (Rolling Refresh holt Exchange nach).
+            _cfigi = enrichment.composite_figi or company_record.get("composite_figi") if enrichment else None
+            if _cfigi and not company.get("composite_figi"):
+                upsert_payload["composite_figi"] = _cfigi
         # category / industry — erst Tag-Inferenz (aus enrichment), dann Claude-Fallback
         inferred_cat  = enrichment.category
         inferred_ind  = enrichment.industry

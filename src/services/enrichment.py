@@ -92,9 +92,10 @@ class EnrichmentResult:
     founded_year: str | None = None
     headquarters: str | None = None
     employee_count: str | None = None
-    ticker: str | None = None      # EN-06: Börsen-Ticker aus Wikipedia-Infobox
-    exchange: str | None = None    # EN-06: Börsenplatz aus Wikipedia-Infobox
-    isin: str | None = None        # EN-11: ISIN aus Wikipedia-Infobox
+    ticker: str | None = None           # EN-06: Börsen-Ticker aus Wikipedia-Infobox
+    exchange: str | None = None         # EN-06: Börsenplatz aus Wikipedia-Infobox
+    composite_figi: str | None = None   # DISAMBIG-01: Bloomberg compositeFIGI für Exchange-Resolution Phase A
+    isin: str | None = None             # EN-11: ISIN aus Wikipedia-Infobox
     ipo_status: str | None = None  # BUG-47: "listed" | "private" aus Wikipedia-Infobox
     category: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
     industry: str | None = None   # abgeleitet aus Tags oder Claude-Fallback
@@ -1498,6 +1499,33 @@ async def enrich_company(
             result.category = normalize_category(result.category, result.industry) or result.category
 
     _derive_tags_and_category()
+
+    # ── Exchange-Resolution (DISAMBIG-01 / BAYN.DE-Fix) ─────────────────────
+    # OpenFIGI /v3/search liefert für DE-Konzerne nur den Bloomberg-Global-Composite
+    # (QT) — kein echtes Handelslisting. Ohne Exchange-Suffix schlägt Yahoo 404 fehl.
+    # Lösung: wenn compositeFIGI bekannt (aus /resolve → company_record) und noch
+    # kein echter Exchange in result, zweiter OpenFIGI-Call /v3/mapping → bestes
+    # Primär-Listing (z.B. GY=XETRA). Läuft HIER — endet garantiert vor Phase B,
+    # damit Yahoo in company_detail.py den richtigen Suffix bekommt.
+    # composite_figi kommt aus company_record (DB-Feld, geschrieben beim /resolve-Insert).
+    _composite_figi = company_record.get("composite_figi") or result.composite_figi
+    if _composite_figi and (not result.exchange or result.exchange == "QT"):
+        try:
+            from src.services.openfigi_resolver import resolve_exchange_from_composite
+            _resolved_exch = await asyncio.wait_for(
+                resolve_exchange_from_composite(_composite_figi),
+                timeout=5.0,
+            )
+            if _resolved_exch:
+                result.exchange = _resolved_exch
+                logger.info(
+                    "Exchange-Resolution: %s compositeFIGI=%s → exchange=%s",
+                    company_name, _composite_figi, _resolved_exch,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("Exchange-Resolution timeout für %s (compositeFIGI=%s)", company_name, _composite_figi)
+        except Exception as _exc:
+            logger.warning("Exchange-Resolution failed für %s: %s", company_name, _exc)
 
     if fast_only:
         # Phase A komplett — Identität + Ticker + Kategorie. Phase B (langsam) läuft
