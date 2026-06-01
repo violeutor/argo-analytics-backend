@@ -178,16 +178,49 @@ async def _search_figi(
         return []
 
 
+# Exchange-Priorität: höherer Rank = bevorzugte Primärlistung.
+_EXCHANGE_RANK: dict[str, int] = {
+    "GY": 100,   # XETRA (DE Primär)
+    "GF": 90,    # Frankfurt
+    "UN": 85,    # NYSE
+    "UQ": 85,    # NASDAQ
+    "LN": 80,    # London
+    "FP": 75,    # Paris (Euronext)
+    "SM": 70,    # Madrid
+    "IM": 70,    # Milano
+    "AV": 65,    # Wien
+    "SW": 65,    # Zürich
+    "SS": 60,    # Stockholm
+    "NA": 60,    # Amsterdam
+}
+
+
+def _deduplicate(cands: list[FigiCandidate]) -> list[FigiCandidate]:
+    """
+    Pro Aktie nur den besten Exchange-Eintrag behalten.
+    Key: compositeFIGI wenn vorhanden, sonst normalisierter Name.
+    Verhindert dass "BAYER AG" 20x für jede Exchange auftaucht.
+    """
+    best: dict[str, FigiCandidate] = {}
+    for c in cands:
+        # compositeFIGI ist der sauberste Key; /v3/search liefert ihn nicht immer.
+        # Fallback: normalisierter Name (gleiche Aktie heißt auf allen Exchanges gleich).
+        key = c.composite_figi or _norm(c.name)
+        rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
+        if key not in best or rank > _EXCHANGE_RANK.get(best[key].exchange or "", 0):
+            best[key] = c
+    return list(best.values())
+
+
 def _sort_candidates(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     """
-    Sortierung: DE-Primärlistung zuerst, dann andere Exchanges.
-    ADRs/GDRs nach hinten (Duplikat der Konzernmutter, anderer Market).
+    Sortierung nach Exchange-Priorität: DE-Primärlistung zuerst.
+    ADRs/GDRs nach hinten (gleiche Konzernmutter, anderer Market).
     """
     def key(c: FigiCandidate):
-        # Primärlistung (XETRA/Frankfurt/NYSE/NASDAQ) vor Sekundär
-        is_primary = c.exchange in ("GY", "GF", "UN", "UQ", "LN", "FP", "SM", "IM")
         is_dr = c.security_type == "Depositary Receipt"
-        return (int(is_dr), int(not is_primary), c.name)
+        rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
+        return (int(is_dr), -rank, c.name)
     return sorted(cands, key=key)
 
 
@@ -229,7 +262,7 @@ async def resolve_entity(
             if not c.composite_figi or c.composite_figi not in equity_composites
         ]
 
-        all_candidates = _sort_candidates(equity + unique_drs)
+        all_candidates = _sort_candidates(_deduplicate(equity + unique_drs))
 
         if not all_candidates:
             return ResolutionResult(query, [], False, None, "no_figi_match")
