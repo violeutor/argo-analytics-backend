@@ -13,7 +13,7 @@ import asyncio
 import httpx
 from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 from src.integrations.supabase import (
     get_supabase,
@@ -55,7 +55,7 @@ from src.services.enrichment import (
     EnrichmentResult,
     _is_likely_german,
 )
-from src.services.gleif_resolver import resolve_entity
+from src.services.openfigi_resolver import resolve_entity, FigiCandidate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["company"])
@@ -192,14 +192,7 @@ class CompanyDetailResponse(BaseModel):
     wikipedia_url: str | None
     crunchbase_url: str | None
     headquarters: str | None
-    employee_count: str | None = None
-
-    @field_validator("employee_count", mode="before")
-    @classmethod
-    def coerce_employee_count(cls, v):
-        if v is None:
-            return None
-        return str(v)
+    employee_count: str | None
     # IPO
     ipo_status: str | None          # listed | pre_ipo_high | pre_ipo_medium | pre_ipo_low
     ipo_potential: str | None       # legacy label für Frontend-Anzeige
@@ -1214,21 +1207,22 @@ def _get_fundamentals_source(
 # R1-Schutz: DB-Treffer (warm) → sofort show_modal=false, KEIN GLEIF-Call.
 # GLEIF feuert ausschließlich im Cold-Path (Company unbekannt).
 class ResolveCandidate(BaseModel):
-    lei: str
-    legal_name: str
-    legal_form: str | None = None
-    country: str | None = None
+    figi: str
+    name: str
+    ticker: str | None = None
+    exchange: str | None = None
+    display_exchange: str | None = None
+    security_type: str | None = None
     isin: str | None = None
 
 
 class ResolveResponse(BaseModel):
     query: str
     show_modal: bool
-    resolved_name: str | None = None   # kanonischer Legal Name (wenn eindeutig)
+    resolved_name: str | None = None
     resolved_isin: str | None = None
-    candidates: list[ResolveCandidate] = []          # gelistete (ISIN)
-    connected: list[ResolveCandidate] = []           # verbundene Treffer ohne ISIN (gecappt)
-    connected_truncated: bool = False                # True -> Verfeinern-Hinweis im Modal
+    resolved_ticker: str | None = None
+    candidates: list[ResolveCandidate] = []
     reason: str
 
 
@@ -1236,63 +1230,50 @@ class ResolveResponse(BaseModel):
 async def resolve_company(name: str) -> ResolveResponse:
     q = name.lower().replace("-", " ").replace("_", " ").strip()
 
-    # 1. Warm-Path: ist die Company schon in der DB? Dann ist die Identität geklärt.
-    #    Exact-ILIKE (wie get_company_detail) — kein Wildcard, beweisbar stabil.
+    # 1. Warm-Path: Company bereits in DB mit geklärter Identität (ISIN vorhanden).
     try:
         _db = get_supabase()
-        _hits = _db.table("companies").select("name,isin").ilike("name", q).limit(1).execute().data or []
+        _hits = _db.table("companies").select("name,isin,ticker").ilike("name", q).limit(1).execute().data or []
         if _hits:
             hit = _hits[0]
-            # Warm-Path nur wenn Identität geklärt (ISIN vorhanden).
-            # ISIN NULL = roher User-String aus pre-DISAMBIG-Lauf → Cold-Path (GLEIF) trotzdem feuern.
             if hit.get("isin"):
                 return ResolveResponse(
                     query=name,
                     show_modal=False,
                     resolved_name=hit.get("name"),
                     resolved_isin=hit.get("isin"),
+                    resolved_ticker=hit.get("ticker"),
                     candidates=[],
                     reason="db_hit",
                 )
     except Exception as exc:
-        # DB-Check darf die Resolution nicht blockieren — im Zweifel weiter zu GLEIF.
         logger.warning("resolve DB-Check failed für '%s': %s", name, exc)
 
-    # 2. Cold-Path: GLEIF-Entity-Resolution. country=None → global (DE+US+EU).
+    # 2. Cold-Path: OpenFIGI Entity-Resolution.
     try:
-        result = await resolve_entity(name, country=None)
+        result = await resolve_entity(name)
     except Exception as exc:
-        # GLEIF-Ausfall darf One-Click nicht brechen: ohne Modal weiter zum
-        # bestehenden /company-Flow mit dem Roh-Namen (degradiert sauber).
-        logger.warning("GLEIF resolve failed für '%s': %s — fallthrough ohne Modal", name, exc)
-        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="gleif_error")
+        logger.warning("OpenFIGI resolve failed für '%s': %s — fallthrough ohne Modal", name, exc)
+        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="figi_error")
 
     return ResolveResponse(
         query=result.query,
         show_modal=result.show_modal,
-        resolved_name=result.resolved.legal_name if result.resolved else None,
-        resolved_isin=result.resolved.primary_isin if result.resolved else None,
+        resolved_name=result.resolved.name if result.resolved else None,
+        resolved_isin=result.resolved.isin if result.resolved else None,
+        resolved_ticker=result.resolved.ticker if result.resolved else None,
         candidates=[
             ResolveCandidate(
-                lei=c.lei,
-                legal_name=c.legal_name,
-                legal_form=c.legal_form,
-                country=c.country,
-                isin=c.primary_isin,
+                figi=c.figi,
+                name=c.name,
+                ticker=c.ticker,
+                exchange=c.exchange,
+                display_exchange=c.display_exchange,
+                security_type=c.security_type,
+                isin=c.isin,
             )
             for c in result.candidates
         ],
-        connected=[
-            ResolveCandidate(
-                lei=c.lei,
-                legal_name=c.legal_name,
-                legal_form=c.legal_form,
-                country=c.country,
-                isin=c.primary_isin,
-            )
-            for c in result.connected
-        ],
-        connected_truncated=result.connected_truncated,
         reason=result.reason,
     )
 
