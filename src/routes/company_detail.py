@@ -13,7 +13,7 @@ import asyncio
 import httpx
 from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from src.integrations.supabase import (
     get_supabase,
@@ -192,7 +192,14 @@ class CompanyDetailResponse(BaseModel):
     wikipedia_url: str | None
     crunchbase_url: str | None
     headquarters: str | None
-    employee_count: str | None
+    employee_count: str | None = None
+
+    @field_validator("employee_count", mode="before")
+    @classmethod
+    def coerce_employee_count(cls, v):
+        if v is None:
+            return None
+        return str(v)
     # IPO
     ipo_status: str | None          # listed | pre_ipo_high | pre_ipo_medium | pre_ipo_low
     ipo_potential: str | None       # legacy label für Frontend-Anzeige
