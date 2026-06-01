@@ -1236,14 +1236,17 @@ async def resolve_company(name: str) -> ResolveResponse:
         _hits = _db.table("companies").select("name,isin").ilike("name", q).limit(1).execute().data or []
         if _hits:
             hit = _hits[0]
-            return ResolveResponse(
-                query=name,
-                show_modal=False,
-                resolved_name=hit.get("name"),
-                resolved_isin=hit.get("isin"),
-                candidates=[],
-                reason="db_hit",
-            )
+            # Warm-Path nur wenn Identität geklärt (ISIN vorhanden).
+            # ISIN NULL = roher User-String aus pre-DISAMBIG-Lauf → Cold-Path (GLEIF) trotzdem feuern.
+            if hit.get("isin"):
+                return ResolveResponse(
+                    query=name,
+                    show_modal=False,
+                    resolved_name=hit.get("name"),
+                    resolved_isin=hit.get("isin"),
+                    candidates=[],
+                    reason="db_hit",
+                )
     except Exception as exc:
         # DB-Check darf die Resolution nicht blockieren — im Zweifel weiter zu GLEIF.
         logger.warning("resolve DB-Check failed für '%s': %s", name, exc)
