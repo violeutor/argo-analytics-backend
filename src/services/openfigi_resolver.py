@@ -181,6 +181,7 @@ async def _search_figi(
 # Exchange-Priorität: höherer Rank = bevorzugte Primärlistung.
 _EXCHANGE_RANK: dict[str, int] = {
     "GY": 100,   # XETRA (DE Primär)
+    "QT": 95,    # Bloomberg Global Composite — kanonischer Ticker (BAYN, AAPL etc.)
     "GF": 90,    # Frankfurt
     "UN": 85,    # NYSE
     "UQ": 85,    # NASDAQ
