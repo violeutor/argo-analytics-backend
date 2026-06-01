@@ -197,15 +197,23 @@ _EXCHANGE_RANK: dict[str, int] = {
 
 def _deduplicate(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     """
-    Pro Aktie nur den besten Exchange-Eintrag behalten.
-    Key: compositeFIGI wenn vorhanden, sonst normalisierter Name.
-    Verhindert dass "BAYER AG" 20x für jede Exchange auftaucht.
+    Zwei Stufen:
+    1. Nur bekannte Primär-Exchanges behalten (filtert EO/E1/EB/XE/XU/XA/QT/PO etc.)
+    2. Pro normalisiertem Namen den besten verbleibenden Exchange-Eintrag behalten.
+
+    Hintergrund: OpenFIGI gibt für "Bayer AG" 10 Einträge mit verschiedenen
+    compositeFIGIs zurück — jedes Exchange-Listing hat eine eigene Bloomberg-ID.
+    Der einzige reliable Deduplizierungs-Key ist Name + Exchange-Filter.
     """
+    # Stufe 1: nur bekannte Exchanges (Primär-Listings).
+    known = [c for c in cands if c.exchange in _EXCHANGE_RANK]
+    # Wenn keine bekannten Exchanges: alle behalten (Fallback, verhindert leeres Modal).
+    pool = known if known else cands
+
+    # Stufe 2: pro normalisiertem Namen besten Exchange-Rank behalten.
     best: dict[str, FigiCandidate] = {}
-    for c in cands:
-        # compositeFIGI ist der sauberste Key; /v3/search liefert ihn nicht immer.
-        # Fallback: normalisierter Name (gleiche Aktie heißt auf allen Exchanges gleich).
-        key = c.composite_figi or _norm(c.name)
+    for c in pool:
+        key = _norm(c.name)
         rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
         if key not in best or rank > _EXCHANGE_RANK.get(best[key].exchange or "", 0):
             best[key] = c
