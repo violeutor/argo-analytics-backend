@@ -55,6 +55,7 @@ from src.services.enrichment import (
     EnrichmentResult,
     _is_likely_german,
 )
+from src.services.gleif_resolver import resolve_entity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["company"])
@@ -1193,8 +1194,101 @@ def _get_fundamentals_source(
 
 # ── Main route ────────────────────────────────────────────────────────────────
 
+# ── DISAMBIG-01 / R25: Entity-Resolution VOR dem Detail-Load ──────────────────
+# Klärt erst, WAS gesucht ist, bevor ein DB-Entry entsteht und die Fetches feuern.
+# Vertrag bewusst getrennt von /company: dieser Endpoint schreibt NICHTS, er
+# entscheidet nur den gestuften Trigger (siehe gleif_resolver.py).
+#
+# Flow im Frontend:
+#   GET /resolve/{name}
+#     show_modal=false → GET /company/{resolved.legal_name oder name}  (+ ?isin=)
+#     show_modal=true  → Modal → User-Auswahl → GET /company/{legal_name} (+ ?isin=)
+#
+# R1-Schutz: DB-Treffer (warm) → sofort show_modal=false, KEIN GLEIF-Call.
+# GLEIF feuert ausschließlich im Cold-Path (Company unbekannt).
+class ResolveCandidate(BaseModel):
+    lei: str
+    legal_name: str
+    legal_form: str | None = None
+    country: str | None = None
+    isin: str | None = None
+
+
+class ResolveResponse(BaseModel):
+    query: str
+    show_modal: bool
+    resolved_name: str | None = None   # kanonischer Legal Name (wenn eindeutig)
+    resolved_isin: str | None = None
+    candidates: list[ResolveCandidate] = []          # gelistete (ISIN)
+    connected: list[ResolveCandidate] = []           # verbundene Treffer ohne ISIN (gecappt)
+    connected_truncated: bool = False                # True -> Verfeinern-Hinweis im Modal
+    reason: str
+
+
+@router.get("/resolve/{name}", response_model=ResolveResponse)
+async def resolve_company(name: str) -> ResolveResponse:
+    q = name.lower().replace("-", " ").replace("_", " ").strip()
+
+    # 1. Warm-Path: ist die Company schon in der DB? Dann ist die Identität geklärt.
+    #    Exact-ILIKE (wie get_company_detail) — kein Wildcard, beweisbar stabil.
+    try:
+        _db = get_supabase()
+        _hits = _db.table("companies").select("name,isin").ilike("name", q).limit(1).execute().data or []
+        if _hits:
+            hit = _hits[0]
+            return ResolveResponse(
+                query=name,
+                show_modal=False,
+                resolved_name=hit.get("name"),
+                resolved_isin=hit.get("isin"),
+                candidates=[],
+                reason="db_hit",
+            )
+    except Exception as exc:
+        # DB-Check darf die Resolution nicht blockieren — im Zweifel weiter zu GLEIF.
+        logger.warning("resolve DB-Check failed für '%s': %s", name, exc)
+
+    # 2. Cold-Path: GLEIF-Entity-Resolution. country=None → global (DE+US+EU).
+    try:
+        result = await resolve_entity(name, country=None)
+    except Exception as exc:
+        # GLEIF-Ausfall darf One-Click nicht brechen: ohne Modal weiter zum
+        # bestehenden /company-Flow mit dem Roh-Namen (degradiert sauber).
+        logger.warning("GLEIF resolve failed für '%s': %s — fallthrough ohne Modal", name, exc)
+        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="gleif_error")
+
+    return ResolveResponse(
+        query=result.query,
+        show_modal=result.show_modal,
+        resolved_name=result.resolved.legal_name if result.resolved else None,
+        resolved_isin=result.resolved.primary_isin if result.resolved else None,
+        candidates=[
+            ResolveCandidate(
+                lei=c.lei,
+                legal_name=c.legal_name,
+                legal_form=c.legal_form,
+                country=c.country,
+                isin=c.primary_isin,
+            )
+            for c in result.candidates
+        ],
+        connected=[
+            ResolveCandidate(
+                lei=c.lei,
+                legal_name=c.legal_name,
+                legal_form=c.legal_form,
+                country=c.country,
+                isin=c.primary_isin,
+            )
+            for c in result.connected
+        ],
+        connected_truncated=result.connected_truncated,
+        reason=result.reason,
+    )
+
+
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None) -> CompanyDetailResponse:
     warnings: list[str] = []
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
@@ -1280,11 +1374,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks) -> Co
             logger.info("Unknown company '%s' — creating DB entry + enriching", name)
             try:
                 db = get_supabase()
-                result = db.table("companies").insert({
+                # DISAMBIG-01: kam die ISIN aus /resolve mit, schreiben wir sie direkt
+                # in den Blank-Entry → Identität von Anfang an sauber, ISIN-First greift
+                # sofort (is_listed-Guard, BaFin/EDGAR-Pfad) statt erst nach EN-11.
+                _insert = {
                     "name": name,
                     "investment_path": "Beobachten",
                     "enrichment_status": "pending",
-                }).execute()
+                }
+                if isin:
+                    _insert["isin"] = isin
+                result = db.table("companies").insert(_insert).execute()
                 company = result.data[0] if result.data else {"name": name}
                 warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
             except Exception as e:
