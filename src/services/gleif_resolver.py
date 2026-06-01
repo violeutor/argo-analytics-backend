@@ -255,7 +255,8 @@ async def resolve_entity(
         # ziehen — auch wenn sie in der Rohliste weiter hinten stehen.
         form_priority = [c for c in raw if c.legal_form and any(
             h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)]
-        rest = [c for c in raw if c not in set(form_priority)]
+        form_priority_ids = {id(c) for c in form_priority}
+        rest = [c for c in raw if id(c) not in form_priority_ids]
         prioritized = form_priority + rest
         ranked = prioritized[:_MAX_ISIN_CHECKS]
         isin_lists = await asyncio.gather(
