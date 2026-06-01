@@ -1209,6 +1209,7 @@ def _get_fundamentals_source(
 class ResolveCandidate(BaseModel):
     figi: str
     name: str
+    legal_name: str | None = None
     ticker: str | None = None
     exchange: str | None = None
     display_exchange: str | None = None
@@ -1222,6 +1223,7 @@ class ResolveResponse(BaseModel):
     resolved_name: str | None = None
     resolved_isin: str | None = None
     resolved_ticker: str | None = None
+    resolved_exchange: str | None = None
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1233,7 +1235,7 @@ async def resolve_company(name: str) -> ResolveResponse:
     # 1. Warm-Path: Company bereits in DB mit geklärter Identität (ISIN vorhanden).
     try:
         _db = get_supabase()
-        _hits = _db.table("companies").select("name,isin,ticker").ilike("name", q).limit(1).execute().data or []
+        _hits = _db.table("companies").select("name,isin,ticker,exchange").ilike("name", q).limit(1).execute().data or []
         if _hits:
             hit = _hits[0]
             if hit.get("isin"):
@@ -1243,6 +1245,7 @@ async def resolve_company(name: str) -> ResolveResponse:
                     resolved_name=hit.get("name"),
                     resolved_isin=hit.get("isin"),
                     resolved_ticker=hit.get("ticker"),
+                    resolved_exchange=hit.get("exchange"),
                     candidates=[],
                     reason="db_hit",
                 )
@@ -1256,18 +1259,31 @@ async def resolve_company(name: str) -> ResolveResponse:
         logger.warning("OpenFIGI resolve failed für '%s': %s — fallthrough ohne Modal", name, exc)
         return ResolveResponse(query=name, show_modal=False, candidates=[], reason="figi_error")
 
+    # C: Exchange nur durchreichen wenn es ein ECHTER Handelsplatz ist.
+    # display_exchange mappt bekannte exchCodes (GY→XETRA, UN→NYSE). Bei Composite-/
+    # Pseudo-Codes (QT) bleibt display_exchange == exchange → kein Venue → None.
+    # Verhindert dass "QT" als Pseudo-Exchange in companies.exchange landet.
+    _resolved_exchange = None
+    if result.resolved:
+        _dx = result.resolved.display_exchange
+        if _dx and _dx != result.resolved.exchange:
+            _resolved_exchange = _dx
+
     return ResolveResponse(
         query=result.query,
         show_modal=result.show_modal,
-        # Kanonischer Name = User-Input (nicht OpenFIGI-Instrumentenname wie "BAYER AG-REG").
-        # OpenFIGI liefert Ticker + ISIN als Metadaten, nicht den Legal Name.
-        resolved_name=name if result.resolved else None,
+        # Kanonischer Name = normalisierter Legal Name aus dem Bloomberg-Instrumentennamen
+        # ("BAYER AG-REG" → "Bayer AG"). Findbar für Wikipedia/Wikidata/HAI, anders als
+        # der rohe Instrumentenname UND anders als der unscharfe User-Input ("Bayer").
+        resolved_name=result.resolved.legal_name if result.resolved else None,
         resolved_isin=result.resolved.isin if result.resolved else None,
         resolved_ticker=result.resolved.ticker if result.resolved else None,
+        resolved_exchange=_resolved_exchange,
         candidates=[
             ResolveCandidate(
                 figi=c.figi,
                 name=c.name,
+                legal_name=c.legal_name,
                 ticker=c.ticker,
                 exchange=c.exchange,
                 display_exchange=c.display_exchange,
@@ -1281,7 +1297,7 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None) -> CompanyDetailResponse:
     warnings: list[str] = []
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
@@ -1379,6 +1395,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     _insert["isin"] = isin
                 if ticker:
                     _insert["ticker"] = ticker
+                if exchange:
+                    _insert["exchange"] = exchange
                 result = db.table("companies").insert(_insert).execute()
                 company = result.data[0] if result.data else {"name": name}
                 warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
@@ -1811,9 +1829,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         # BUG-34 complete: Wikipedia-Titel als kanonischen Namen übernehmen
         # ("Linde" → "Linde plc", "SpaceX" → korrekte Schreibweise)
         # Nur wenn enrichment.name vom DB-Namen abweicht und plausibel ist
+        # B' (DISAMBIG-01): NICHT übernehmen wenn der Wikipedia-Titel den bestehenden
+        # Legal-Form-Namen VERKÜRZT (Bayer AG → Bayer). en.wikipedia titelt Konzerne
+        # ohne Rechtsform ("Bayer", "Volkswagen") — das würde den aus OpenFIGI
+        # normalisierten Legal Name wieder zerstören. Case-Fixes bleiben erlaubt
+        # (vergleich case-sensitiv, nicht .lower()): heilt Akronym-Casing aus der
+        # OpenFIGI-Normalisierung ("Sap SE" → Wikipedia "SAP SE"), solange nicht verkürzt.
+        _wiki_truncates = (
+            enrichment.name
+            and len(company_name) > len(enrichment.name)
+            and company_name.lower().startswith(enrichment.name.lower())
+        )
         if (enrichment.name
-                and enrichment.name.lower() != company_name.lower()
-                and 2 <= len(enrichment.name) <= 120):
+                and enrichment.name != company_name
+                and 2 <= len(enrichment.name) <= 120
+                and not _wiki_truncates):
             upsert_payload["name"] = enrichment.name
             logger.info("Canonical name update: '%s' → '%s'", company_name, enrichment.name)
         # EN-06: Ticker + Exchange nur für börsennotierte Companies schreiben

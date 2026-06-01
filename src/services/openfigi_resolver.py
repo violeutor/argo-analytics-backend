@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -74,6 +75,11 @@ class FigiCandidate:
         return self.security_type in _EQUITY_TYPES
 
     @property
+    def legal_name(self) -> str:
+        """Bloomberg-Instrumentenname → Legal Name ("BAYER AG-REG" → "Bayer AG")."""
+        return _normalize_legal_name(self.name, fallback=self.name)
+
+    @property
     def display_exchange(self) -> str | None:
         """Lesbarer Exchange-Name für das Modal."""
         _map = {
@@ -88,6 +94,7 @@ class FigiCandidate:
         return {
             "figi": self.figi,
             "name": self.name,
+            "legal_name": self.legal_name,
             "ticker": self.ticker,
             "exchange": self.exchange,
             "display_exchange": self.display_exchange,
@@ -118,6 +125,60 @@ class ResolutionResult:
 
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
+
+
+# Bloomberg-Instrumentennamen → Legal Name.
+# Bloomberg liefert "BAYER AG-REG", "ALPHABET INC-CL A", "VOLKSWAGEN AG-PFD" —
+# Instrumentennamen mit Share-Class-/Registrierungs-Qualifier, KEINE Legal Names.
+# Enrichment-Quellen (Wikipedia/Wikidata/HAI) finden damit nichts. Wir schneiden
+# an der Rechtsform-Grenze ab (alles nach der Rechtsform ist Qualifier) + title-casen.
+_LEGAL_FORM_ALT = (
+    r"AG|SE|GMBH|KGAA|MBH|KG|EG|INC|CORP|CORPORATION|CO|LLC|LLP|LP|LTD|"
+    r"PLC|NV|BV|SAS|SARL|SA|SPA|SRL|ASA|OYJ|AB|OY|A/S|AS"
+)
+_LEGAL_FORM_CANON: dict[str, str] = {
+    "AG": "AG", "SE": "SE", "GMBH": "GmbH", "KGAA": "KGaA", "MBH": "mbH",
+    "KG": "KG", "EG": "eG", "INC": "Inc", "CORP": "Corp",
+    "CORPORATION": "Corporation", "CO": "Co", "LLC": "LLC", "LLP": "LLP",
+    "LP": "LP", "LTD": "Ltd", "PLC": "plc", "NV": "NV", "BV": "BV",
+    "SAS": "SAS", "SARL": "SARL", "SA": "SA", "SPA": "SpA", "SRL": "Srl",
+    "ASA": "ASA", "OYJ": "Oyj", "AB": "AB", "OY": "Oy", "A/S": "A/S", "AS": "AS",
+}
+
+
+def _normalize_legal_name(bloomberg_name: str | None, fallback: str = "") -> str:
+    """
+    "BAYER AG-REG" → "Bayer AG", "ALPHABET INC-CL A" → "Alphabet Inc",
+    "MERCEDES-BENZ GROUP AG" → "Mercedes-Benz Group AG", "SAP SE" → "SAP SE".
+
+    Schneidet an der ERSTEN Rechtsform-Grenze ab (non-greedy), wirft den
+    Bloomberg-Qualifier weg, title-cased wortweise und stellt die kanonische
+    Rechtsform-Schreibweise wieder her. Fällt auf `fallback` (i.d.R. User-Input)
+    zurück, wenn keine Rechtsform erkennbar ist.
+
+    Casing-Hinweis: All-Caps-Akronyme ("SAP", "BASF") werden hier zu "Sap"/"Basf"
+    title-gecased — das korrigiert der BUG-34-Wikipedia-Kanonik-Pfad im Enrichment
+    (Wikipedia-Titel "SAP" überschreibt). Der Guard dort verhindert nur die
+    Verkürzung von Legal-Form-Namen (Bayer AG ↛ Bayer).
+    """
+    if not bloomberg_name or not bloomberg_name.strip():
+        return fallback
+    raw = bloomberg_name.strip()
+    m = re.match(rf"^(.*?\b(?:{_LEGAL_FORM_ALT}))\b", raw, re.I)
+    core = m.group(1) if m else None
+    if not core:
+        return fallback
+
+    def _title(word: str) -> str:
+        # Bindestrich-Namen erhalten (Mercedes-Benz → Mercedes-Benz)
+        return "-".join(p.capitalize() for p in word.split("-"))
+
+    out_words: list[str] = []
+    for w in core.split():
+        canon = _LEGAL_FORM_CANON.get(w.upper().strip("."))
+        out_words.append(canon if canon else _title(w))
+    result = " ".join(out_words).strip()
+    return result or fallback
 
 
 def _parse_result(item: dict) -> Optional[FigiCandidate]:

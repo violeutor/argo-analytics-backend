@@ -229,8 +229,15 @@ async def _fetch_wikipedia(company: str) -> dict:
                     break
 
         # ── Wikitext-Fallback: Infobox parsen ─────────────────────────────────
-        # Nur wenn founding_year noch fehlt oder HQ/Mitarbeiter gebraucht werden
-        if not out.get("founded_year") or not out.get("headquarters"):
+        # Die Infobox trägt STRUKTURELLE Felder (ISIN, Ticker, Exchange, ipo_status),
+        # die der Prosa-Summary NIE liefert. Daher öffnen wir das Gate auch wenn nur
+        # eines dieser Felder fehlt — nicht nur bei Gründung/HQ. Sonst überspringen
+        # EN-06 (Ticker) + EN-11 (ISIN) still für gut dokumentierte Companies, deren
+        # Prosa bereits Gründung+HQ liefert (Bayer-Effekt: Lede nennt "founded 1863
+        # in Barmen" + "Headquartered in Leverkusen" → Gate schloss → Infobox nie geholt).
+        if (not out.get("founded_year") or not out.get("headquarters")
+                or not out.get("ticker") or not out.get("isin")
+                or not out.get("ipo_status")):
             try:
                 async with httpx.AsyncClient(timeout=6, headers=HEADERS) as client:
                     wt = await client.get(
