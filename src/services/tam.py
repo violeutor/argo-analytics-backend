@@ -114,6 +114,76 @@ MARKET_BASE_2024: dict[str, float] = {
 }
 
 
+# ── Branchen-Fallback-CAGR (Cross-Industry, außerhalb Climate Tech) ───────────
+# CURATED_CAGR oben deckt nur Climate-Tech-Sektoren ab. Für jede andere Branche
+# (Pharma, Software, Industrials etc.) fehlte bisher jeder Match → Code fiel auf
+# den 12%-Climate-Median. Das ist für einen Cross-Industry-Screener falsch und
+# unglaubwürdig (Pharma wächst ~6%, nicht 12% wie Climate Tech).
+#
+# Diese Tabelle liefert grobe, konservative Branchen-Mediane für die häufigsten
+# Nicht-Climate-Sektoren. Match via lowercase-Substring (sektor- ODER category-Name).
+# Bewusst grob — ein ehrlicher Branchen-Median schlägt einen falschen Climate-Wert.
+# Confidence immer "low": es ist eine Branchen-Heuristik, kein recherchierter Wert.
+# Quellen: aggregierte Branchen-Wachstumsraten (öffentliche Marktberichte, grobe Mediane).
+_SECTOR_FALLBACK_CAGR: dict[str, dict] = {
+    # Healthcare / Life Sciences
+    "pharma":         {"cagr_pct": 6.0,  "source": "Branchen-Median Pharma"},
+    "biotech":        {"cagr_pct": 11.0, "source": "Branchen-Median Biotech"},
+    "medtech":        {"cagr_pct": 7.0,  "source": "Branchen-Median Medizintechnik"},
+    "medical":        {"cagr_pct": 7.0,  "source": "Branchen-Median Medizintechnik"},
+    "healthcare":     {"cagr_pct": 7.0,  "source": "Branchen-Median Healthcare"},
+    "health":         {"cagr_pct": 7.0,  "source": "Branchen-Median Healthcare"},
+    "diagnostics":    {"cagr_pct": 8.0,  "source": "Branchen-Median Diagnostik"},
+    # Tech / Software
+    "software":       {"cagr_pct": 14.0, "source": "Branchen-Median Software"},
+    "saas":           {"cagr_pct": 16.0, "source": "Branchen-Median SaaS"},
+    "ai":             {"cagr_pct": 25.0, "source": "Branchen-Median KI/ML"},
+    "artificial-intelligence": {"cagr_pct": 25.0, "source": "Branchen-Median KI/ML"},
+    "cybersecurity":  {"cagr_pct": 13.0, "source": "Branchen-Median Cybersecurity"},
+    "security":       {"cagr_pct": 13.0, "source": "Branchen-Median Security"},
+    "cloud":          {"cagr_pct": 17.0, "source": "Branchen-Median Cloud"},
+    "fintech":        {"cagr_pct": 15.0, "source": "Branchen-Median Fintech"},
+    "semiconductor":  {"cagr_pct": 9.0,  "source": "Branchen-Median Halbleiter"},
+    "hardware":       {"cagr_pct": 6.0,  "source": "Branchen-Median Hardware"},
+    # Industrials / Materials
+    "industrial":     {"cagr_pct": 4.0,  "source": "Branchen-Median Industrie"},
+    "manufacturing":  {"cagr_pct": 4.0,  "source": "Branchen-Median Fertigung"},
+    "automotive":     {"cagr_pct": 4.0,  "source": "Branchen-Median Automotive"},
+    "aerospace":      {"cagr_pct": 6.0,  "source": "Branchen-Median Luft-/Raumfahrt"},
+    "defense":        {"cagr_pct": 6.0,  "source": "Branchen-Median Verteidigung"},
+    "chemical":       {"cagr_pct": 4.0,  "source": "Branchen-Median Chemie"},
+    "materials":      {"cagr_pct": 4.0,  "source": "Branchen-Median Materials"},
+    "construction":   {"cagr_pct": 4.0,  "source": "Branchen-Median Bau"},
+    "logistics":      {"cagr_pct": 6.0,  "source": "Branchen-Median Logistik"},
+    # Consumer / Services
+    "consumer":       {"cagr_pct": 5.0,  "source": "Branchen-Median Consumer"},
+    "retail":         {"cagr_pct": 5.0,  "source": "Branchen-Median Retail"},
+    "ecommerce":      {"cagr_pct": 10.0, "source": "Branchen-Median E-Commerce"},
+    "food":           {"cagr_pct": 5.0,  "source": "Branchen-Median Food/Beverage"},
+    "media":          {"cagr_pct": 6.0,  "source": "Branchen-Median Media"},
+    "telecom":        {"cagr_pct": 4.0,  "source": "Branchen-Median Telekom"},
+    "financial":      {"cagr_pct": 6.0,  "source": "Branchen-Median Finanzdienstleistungen"},
+    "insurance":      {"cagr_pct": 6.0,  "source": "Branchen-Median Versicherung"},
+    "real-estate":    {"cagr_pct": 4.0,  "source": "Branchen-Median Immobilien"},
+    "energy":         {"cagr_pct": 6.0,  "source": "Branchen-Median Energie"},
+}
+
+
+def _match_sector_fallback(tag: str) -> dict | None:
+    """
+    Findet einen Branchen-Fallback-CAGR via lowercase-Substring.
+    Längster matchender Key gewinnt (spezifischster Sektor).
+    Match in beide Richtungen: key-in-tag ODER tag-in-key.
+    """
+    best: dict | None = None
+    best_len = -1
+    for key, data in _SECTOR_FALLBACK_CAGR.items():
+        if (key in tag or tag in key) and len(key) > best_len:
+            best = data
+            best_len = len(key)
+    return best
+
+
 def compute_cagr(
     sector_tag: str | None,
     tam_usd_bn: float | None,
@@ -186,6 +256,20 @@ def compute_cagr(
         }
         tag = _ALIASES.get(tag, tag)
 
+        # 0. Branchen-Gate: Ist der Tag ein generischer Branchenname (pharma, software,
+        # energy etc.)? Dann nimm den Branchen-Median und überspring die Climate-Substring-
+        # Suche ganz. Verhindert dass ein generischer Sektor ("software") einen spezifischen
+        # Climate-Nischen-Key ("ai-grid-software") per Substring kapert. Nur EXAKTER
+        # Branchen-Match gated — Climate-Spezialtags (z.B. "co2-to-fuels") treffen die
+        # Branchentabelle nicht und laufen unverändert in die Climate-Suche unten.
+        if tag in _SECTOR_FALLBACK_CAGR:
+            _fb = _SECTOR_FALLBACK_CAGR[tag]
+            return {
+                "cagr_pct":        _fb["cagr_pct"],
+                "cagr_source":     _fb["source"],
+                "cagr_confidence": "low",
+            }
+
         # 1. Curated CAGR — exakter Match zuerst, dann längster Substring-Match
         # Reihenfolge: exact → tag-in-key (spezifischster key gewinnt) → key-in-tag
         # Bugfix: "battery" darf nicht auf "solid-state-battery" matchen wenn
@@ -245,10 +329,24 @@ def compute_cagr(
                 except Exception:
                     pass
 
-    # 3. Fallback
+    # 3. Branchen-Fallback — sektor-spezifischer Median (Cross-Industry).
+    # Match auf der normalisierten tag-Variante (oben gebaut), sonst auf der rohen
+    # category/sector-Eingabe. Climate-Median (12%) nur noch als allerletzter Notnagel
+    # wenn die Branche unbekannt ist — dann ehrlich als "Markt-Median" gelabelt.
+    if sector_tag:
+        _fb_tag = sector_tag.lower().strip()
+        _fb = _match_sector_fallback(tag) or _match_sector_fallback(_fb_tag)
+        if _fb:
+            return {
+                "cagr_pct":        _fb["cagr_pct"],
+                "cagr_source":     _fb["source"],
+                "cagr_confidence": "low",
+            }
+
+    # 4. Letzter Notnagel — Branche unbekannt. Konservativer Markt-Median, ehrlich gelabelt.
     return {
-        "cagr_pct":        12.0,
-        "cagr_source":     "Climate Tech Median-Fallback (BNEF 2024)",
+        "cagr_pct":        8.0,
+        "cagr_source":     "Markt-Median (Branche nicht klassifiziert)",
         "cagr_confidence": "low",
     }
 
