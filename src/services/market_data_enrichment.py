@@ -95,8 +95,25 @@ Rules:
             logger.warning("Claude market details HTTP %s for %s: %s", resp.status_code, company, resp.text[:200])
             return {}
         raw = resp.json()["content"][0]["text"].strip()
+        # Codefences entfernen (Haiku ignoriert "no markdown fences" gelegentlich)
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
-        return json.loads(raw)
+        # Robustes Parsing: erstes valides JSON-Objekt extrahieren statt den ganzen
+        # String zu parsen. Behebt "Extra data: line N" — Haiku hängt trotz Anweisung
+        # manchmal Erklärtext, ein zweites Objekt oder abgeschnittenes Material an.
+        # raw_decode() parst ab dem ersten "{" und ignoriert alles dahinter.
+        _start = raw.find("{")
+        if _start == -1:
+            logger.warning("Claude market details: kein JSON-Objekt in Antwort für %s", company)
+            return {}
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(raw[_start:])
+            return obj
+        except json.JSONDecodeError as je:
+            logger.warning(
+                "Claude market details JSON-Parse fehlgeschlagen für %s: %s — raw[:200]=%r",
+                company, je, raw[:200],
+            )
+            return {}
     except Exception as e:
         logger.warning("Claude market details extraction failed for %s: %s", company, e)
         return {}
