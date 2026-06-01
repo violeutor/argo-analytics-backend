@@ -58,7 +58,12 @@ _CONNECTED_CAP = 5       # max. verbundene (ISIN-lose) Treffer im Modal; darübe
 # (ISIN-Vorhandensein ist der harte Filter) — nur als sekundäres Sortier-/
 # Plausibilitätssignal. ISO-20275 ELF-Codes wären die robustere Quelle, aber
 # der Legal-Form-String reicht für die Sortierung.
-_LISTED_FORM_HINTS = ("AG", "SE", "KGAA", "N.V.", "NV", "PLC", "S.A.", "SA")
+_LISTED_FORM_HINTS = ("AG", "SE", "KGAA", "N.V.", "NV", "PLC", "S.A.", "SA",
+                      "AKTIENGESELLSCHAFT",   # DE Volltext
+                      "8Z6G",                 # ELF-Code AG (Deutschland)
+                      "V2YH",                 # ELF-Code SE (Societas Europaea)
+                      "NAAMLOZE VENNOOTSCHAP", # NL Volltext
+                      "SOCIETE ANONYME")      # FR/BE Volltext
 
 
 @dataclass
@@ -255,6 +260,11 @@ async def resolve_entity(
         # ziehen — auch wenn sie in der Rohliste weiter hinten stehen.
         form_priority = [c for c in raw if c.legal_form and any(
             h in c.legal_form.upper() for h in _LISTED_FORM_HINTS)]
+        # DEBUG: log alle Kandidaten mit Rechtsform für Diagnose
+        for c in raw[:10]:
+            logger.info("GLEIF candidate: %s | form=%s | has_isin=%s",
+                        c.legal_name, c.legal_form, c.has_isin)
+        logger.info("GLEIF form_priority count: %d / %d raw", len(form_priority), len(raw))
         form_priority_ids = {id(c) for c in form_priority}
         rest = [c for c in raw if id(c) not in form_priority_ids]
         prioritized = form_priority + rest
