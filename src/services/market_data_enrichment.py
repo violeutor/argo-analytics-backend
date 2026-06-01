@@ -668,6 +668,25 @@ async def enrich_market_data(
     if tam_usd_bn:
         result["tam_2035_usd_bn"] = tam_usd_bn
 
+    # ── Category-Gate (Race-Fix Session 44) ───────────────────────────────────
+    # MD-B01 (DDG-Suche + Claude-Extraktion) braucht einen aufgelösten Sektor.
+    # Cold-Path-Problem: enrich_market_data wird teils getriggert BEVOR
+    # _claude_infer_category die Kategorie aufgelöst hat (parallele /market-Route,
+    # frischer Blank-Entry). Ohne Sektor läuft die DDG-Query als q="" ins Leere
+    # UND verbrennt das DDG-Kontingent (→ 202 Accepted für den späteren Lauf MIT
+    # Sektor → snippets=0). Lösung: ohne Sektor MD-B01 überspringen. Die Pipeline
+    # läuft beim nächsten Load mit aufgelöster Kategorie erneut (enrichment_status
+    # bleibt pending → kein verlorener Lauf). TAM/SAM/Competition unten brauchen
+    # keinen DDG-Call und laufen weiter.
+    if not sector or not sector.strip():
+        logger.info(
+            "MD-B01 skip für %s — keine Kategorie aufgelöst (Race-Guard). "
+            "Pipeline läuft beim nächsten Load mit Sektor erneut.",
+            company_name,
+        )
+        result["enriched_at"] = datetime.now(timezone.utc).isoformat()
+        return result
+
     # ── 2. Marktsegmente + Wachstumstreiber (MD-B01) ─────────────────────────
     # BUG-28: MD-B01 läuft unabhängig von TAM und Competitors.
     # Seiteninhalt statt Snippets — deutlich reichhaltigere Basis für Claude.
