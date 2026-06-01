@@ -1259,7 +1259,9 @@ async def resolve_company(name: str) -> ResolveResponse:
     return ResolveResponse(
         query=result.query,
         show_modal=result.show_modal,
-        resolved_name=result.resolved.name if result.resolved else None,
+        # Kanonischer Name = User-Input (nicht OpenFIGI-Instrumentenname wie "BAYER AG-REG").
+        # OpenFIGI liefert Ticker + ISIN als Metadaten, nicht den Legal Name.
+        resolved_name=name if result.resolved else None,
         resolved_isin=result.resolved.isin if result.resolved else None,
         resolved_ticker=result.resolved.ticker if result.resolved else None,
         candidates=[
@@ -1279,7 +1281,7 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None) -> CompanyDetailResponse:
     warnings: list[str] = []
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
@@ -1375,6 +1377,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 }
                 if isin:
                     _insert["isin"] = isin
+                if ticker:
+                    _insert["ticker"] = ticker
                 result = db.table("companies").insert(_insert).execute()
                 company = result.data[0] if result.data else {"name": name}
                 warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
