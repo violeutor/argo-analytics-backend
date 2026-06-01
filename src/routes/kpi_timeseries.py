@@ -102,14 +102,22 @@ async def write_kpi_timeseries(name: str, body: KPIWriteRequest):
 @router.get("/company/{name}/kpi-timeseries", response_model=KPITimeseriesResponse)
 async def get_kpi_timeseries(
     name: str,
-    company_id: str = Query(..., description="Company UUID — vom Frontend aus dem Haupt-Response übergeben"),
+    company_id: str | None = Query(None, description="Company UUID — optional, Fallback via Name-Lookup"),
 ):
     """
     Gibt alle KPI-Zeitreihen für eine Company zurück.
     Gruppiert nach metric — für Chart-Modal im Frontend.
-    company_id wird als Query-Parameter übergeben (kein interner Name-Lookup nötig).
+    company_id optional — wenn nicht übergeben (z.B. d.id=undefined im Frontend),
+    wird per Name-Lookup aufgelöst.
     """
     db = get_supabase()
+
+    # company_id-Fallback: wenn nicht übergeben oder "undefined" → Name-Lookup
+    if not company_id or company_id == "undefined":
+        company = fetch_company_by_name(name)
+        if not company:
+            raise HTTPException(status_code=404, detail=f"Company '{name}' nicht gefunden.")
+        company_id = company["id"]
 
     try:
         result = (

@@ -292,7 +292,9 @@ def upsert_market_data(company_id: str, data: dict) -> None:
             market_cycle, market_cycle_note, regional_sources, enriched_at
     """
     db = get_supabase()
-    payload = {k: v for k, v in data.items() if v is not None}
+    # Interne Übergabe-Keys (Prefix "_") explizit ausfiltern — nie in die DB schreiben.
+    # _competition_signals wird vom async-Teil an den sync_wrapper übergeben (nicht persistiert).
+    payload = {k: v for k, v in data.items() if v is not None and not k.startswith("_")}
     if not payload:
         return
     payload["company_id"] = company_id
