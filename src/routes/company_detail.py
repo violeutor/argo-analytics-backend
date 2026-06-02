@@ -1043,6 +1043,79 @@ async def _trigger_beta_enrich_on_bridge(
         logger.debug("_trigger_beta_enrich_on_bridge failed für %s: %s", symbol, e)
 
 
+def _looks_us_listed(ticker: str | None, exchange: str | None) -> bool:
+    """
+    EDGAR-OD-01 / Gate-Stufe 2: US-Heuristik (kostenlos, in-memory).
+
+    EDGAR liefert NUR für US-Companies. Ohne diese Vorfilterung würde der
+    On-Demand-Trigger bei jedem DE/EU-Listing einen aussichtslosen EDGAR-Call
+    feuern → genau EDGAR-DE-CIK (falsche CIK für DE Foreign Private Issuer → 404).
+
+    Heuristik: nicht-US, wenn der Ticker einen Yahoo-Suffix trägt (".DE", ".L" …)
+    ODER das Exchange in _EXCHANGE_SUFFIX matcht (GY/LN/FP / xetra/london …).
+    Umgekehrt: Bare-Ticker ohne Suffix + kein bekanntes Nicht-US-Exchange → US-Annahme.
+    _EXCHANGE_SUFFIX ist die bestehende SSOT für „Nicht-US-Venue" (S45).
+    """
+    _t = (ticker or "").split("·")[0].split("→")[-1].strip().upper()
+    if not _t:
+        return False
+    # Suffix-Check: alles mit Punkt-Suffix (.DE/.L/.PA/.SW …) ist nicht-US.
+    if "." in _t:
+        return False
+    # Exchange-Check: bekanntes Nicht-US-Venue (Display-Name ODER exchCode) → nicht-US.
+    _ex = (exchange or "").split("·")[-1].strip().lower()
+    if _ex and _ex in _EXCHANGE_SUFFIX:
+        return False
+    return True
+
+
+async def _trigger_edgar_kpi_ondemand(
+    company_id,
+    company_name: str,
+    ticker: str | None,
+    exchange: str | None,
+) -> None:
+    """
+    EDGAR-OD-01: Fire-and-Forget On-Demand EDGAR-KPI-Enrichment beim Cold-Load.
+
+    Schließt die Cold-Path-Lücke: EDGAR-KPIs wurden bisher NUR vom 05:15-Cron
+    befüllt ([:50]-Lotterie). Eine frische US-Company bekam Fundamentals erst Tage
+    später (oder bei >50 US-Companies nie garantiert) → bricht den One-Click-Anspruch.
+
+    Dreistufiges Gate (billig → teuer), Stufe 1+2 hier im Caller bereits geprüft:
+      1. is_listed         (aus OpenFIGI, kostenlos — Caller-Guard)
+      2. US-Heuristik      (_looks_us_listed, kostenlos — Caller-Guard)
+      3. kpi_timeseries-Read: schon edgar_xbrl-Rows? → dann NICHT erneut feuern.
+         Verhindert sinnlosen EDGAR-Roundtrip bei jedem Warm-Reload (EDGAR-freundlich,
+         10-req/s-Limit). Idempotenz wäre zwar durch upsert ohnehin gegeben, aber der
+         Read spart den ~1-2s-Task + den ~7MB tickers_map-Download komplett.
+    """
+    try:
+        db = get_supabase()
+        existing = (
+            db.table("kpi_timeseries")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("source", "edgar_xbrl")
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        if existing:
+            logger.debug("EDGAR-OD-01: %s hat bereits edgar_xbrl-Rows — kein Re-Trigger", company_name)
+            return
+
+        from src.services.edgar_kpi import enrich_one_company
+        result = await enrich_one_company(company_id, company_name, ticker)
+        logger.info(
+            "EDGAR-OD-01: On-Demand-Enrich für %s — found=%s, %d rows written",
+            company_name, result.get("found"), result.get("rows_written", 0),
+        )
+    except Exception as e:
+        # Fire-and-Forget — EDGAR-Ausfall darf den Cold-Load nicht beeinträchtigen
+        logger.debug("_trigger_edgar_kpi_ondemand failed für %s: %s", company_name, e)
+
+
 def _build_fundamentals(
     is_listed: bool,
     yahoo: dict,
@@ -2255,6 +2328,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             ticker=_beta_ticker_raw,
             exchange=_beta_exchange,
         )
+
+    # EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für frische US-Companies.
+    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier, Stufe 3 (DB-Read) im Trigger.
+    # BackgroundTask (nicht await): EDGAR-Fetch + tickers_map-Download dauern ~1-2s+,
+    # dürfen die Response nicht blockieren. Beim nächsten Frontend-Poll / Reload liegen
+    # die KPIs vor (analog Beta-Poller). Nicht-US-Listings (DE/EU) feuern gar nicht
+    # erst → fängt EDGAR-DE-CIK gleich mit ab.
+    if is_listed and _cid and _looks_us_listed(_beta_ticker_raw, _beta_exchange):
+        background_tasks.add_task(
+            _trigger_edgar_kpi_ondemand,
+            _cid,
+            company_name,
+            (_beta_ticker_raw or "").split("·")[0].strip() or None,
+            _beta_exchange,
+        )
+        logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
 
     # yfinance Beta-Fallback: wenn Bridge keinen Cache hat (404) und Company listed
     # yahoo["yf_beta"] = Yahoos pre-calculated trailing-12M Beta vs. S&P 500

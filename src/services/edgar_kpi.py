@@ -456,6 +456,104 @@ async def fetch_edgar_kpis(
     return rows
 
 
+# ── Supabase Write (geteilt: Pipeline + On-Demand) ─────────────────────────────
+
+def _write_kpi_rows(db, company_id, name: str, kpi_rows: list[dict]) -> tuple[int, int]:
+    """
+    Schreibt KPI-Rows nach kpi_timeseries (Upsert, ignore_duplicates).
+    Single Source of Truth für die Schreiblogik — von run_edgar_kpi_pipeline
+    UND enrich_one_company verwendet, damit kein Drift zwischen Cron- und
+    On-Demand-Pfad entsteht.
+    Gibt (written, skipped) zurück.
+    """
+    written = skipped = 0
+    for row in kpi_rows:
+        payload = {
+            "company_id":  company_id,
+            "metric":      row["metric"],
+            "fiscal_year": row["fiscal_year"],
+            "value":       row["value"],
+            "source":      row["source"],
+        }
+        if row.get("currency"):
+            payload["currency"] = row["currency"]
+        if row.get("confidence"):
+            payload["confidence"] = row["confidence"]
+
+        try:
+            result = (
+                db.table("kpi_timeseries")
+                .upsert(
+                    payload,
+                    on_conflict="company_id,metric,fiscal_year,source",
+                    ignore_duplicates=True,
+                )
+                .execute()
+            )
+            if result.data:
+                written += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            logger.debug("KPI upsert skip für '%s' %s FY%s: %s",
+                         name, row["metric"], row["fiscal_year"], e)
+            skipped += 1
+    return written, skipped
+
+
+# ── On-Demand (EDGAR-OD-01) ─────────────────────────────────────────────────────
+
+async def enrich_one_company(
+    company_id,
+    name: str,
+    ticker: str | None = None,
+) -> dict:
+    """
+    EDGAR-OD-01: On-Demand-Enrichment einer EINZELNEN Company.
+
+    Aufgerufen als Fire-and-Forget BackgroundTask beim Cold-Load einer frischen
+    US-Company (company_detail.py) — schließt die Cold-Path-Lücke, dass EDGAR-KPIs
+    bisher NUR vom 05:15-Cron befüllt wurden ([:50]-Lotterie → frische Company
+    bekam KPIs erst Tage später, oder bei >50 US-Companies nie garantiert).
+
+    Idempotent: upsert mit ignore_duplicates → ein zweiter Aufruf schreibt nichts.
+    Eigener tickers_map-Load (kein gecachter Map wie im Cron) — ~7MB Einmal-Download,
+    akzeptabel weil pro frischer US-Company nur EINMAL getriggert (DB-Read-Gate im
+    Caller verhindert Re-Trigger bei Warm-Loads).
+
+    company_id wird vom Caller übergeben (aus dem Cold-Path-Insert bekannt) — KEIN
+    Name-Lookup nötig, anders als der Cron-Pfad (der über fetch_company_by_name geht).
+
+    Gibt {"rows_written", "rows_skipped", "found"} zurück.
+    """
+    from src.integrations.supabase import get_supabase
+
+    if not name:
+        return {"rows_written": 0, "rows_skipped": 0, "found": False}
+
+    # tickers_map für genau diese eine Company laden (CIK-Lookup via Ticker bevorzugt)
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15) as _client:
+        tickers_map = await _fetch_tickers_map(_client)
+
+    try:
+        kpi_rows = await fetch_edgar_kpis(name, ticker, tickers_map=tickers_map)
+    except Exception as e:
+        logger.warning("EDGAR-OD-01: fetch failed für '%s': %s", name, e)
+        return {"rows_written": 0, "rows_skipped": 0, "found": False}
+
+    if not kpi_rows:
+        logger.info("EDGAR-OD-01: kein EDGAR-Treffer für '%s' (ticker=%s)", name, ticker)
+        return {"rows_written": 0, "rows_skipped": 0, "found": False}
+
+    db = get_supabase()
+    written, skipped = _write_kpi_rows(db, company_id, name, kpi_rows)
+    logger.info(
+        "EDGAR-OD-01: '%s' — %d rows written, %d skipped (on-demand)",
+        name, written, skipped,
+    )
+    return {"rows_written": written, "rows_skipped": skipped, "found": True}
+
+
 # ── Pipeline (KPI-03) ─────────────────────────────────────────────────────────
 
 async def run_edgar_kpi_pipeline(companies: list[dict]) -> dict:
@@ -495,39 +593,7 @@ async def run_edgar_kpi_pipeline(companies: list[dict]) -> dict:
                 continue
 
             company_id = co["id"]
-            written = skipped = 0
-
-            for row in kpi_rows:
-                payload = {
-                    "company_id":  company_id,
-                    "metric":      row["metric"],
-                    "fiscal_year": row["fiscal_year"],
-                    "value":       row["value"],
-                    "source":      row["source"],
-                }
-                if row.get("currency"):
-                    payload["currency"] = row["currency"]
-                if row.get("confidence"):
-                    payload["confidence"] = row["confidence"]
-
-                try:
-                    result = (
-                        db.table("kpi_timeseries")
-                        .upsert(
-                            payload,
-                            on_conflict="company_id,metric,fiscal_year,source",
-                            ignore_duplicates=True,
-                        )
-                        .execute()
-                    )
-                    if result.data:
-                        written += 1
-                    else:
-                        skipped += 1
-                except Exception as e:
-                    logger.debug("KPI upsert skip für '%s' %s FY%s: %s",
-                                 name, row["metric"], row["fiscal_year"], e)
-                    skipped += 1
+            written, skipped = _write_kpi_rows(db, company_id, name, kpi_rows)
 
             stats["companies_processed"] += 1
             stats["rows_written"]  += written

@@ -519,6 +519,40 @@ async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
     return {"status": "triggered", "job": "_cron_edgar_kpi"}
 
 
+@app.post("/internal/edgar-kpi/enrich/{company_name}")
+async def trigger_edgar_kpi_ondemand(company_name: str, background_tasks: BackgroundTasks):
+    """
+    EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für eine einzelne Company (Admin/Reserve).
+
+    Der automatische Cold-Path-Trigger sitzt in company_detail.py (Fire-and-Forget beim
+    Cold-Load frischer US-Companies). Dieser Endpoint ist die manuelle Reserve für
+    Testing / Nach-Enrichment einzelner Companies außerhalb des 05:15-Crons.
+
+    Name-basiert (analog /internal/bafin/enrich/{company_name}) — löst company_id +
+    Ticker selbst aus der DB auf, damit der Endpoint per Company-Name aufrufbar bleibt.
+    """
+    async def _run():
+        try:
+            from src.integrations.supabase import fetch_company_by_name
+            from src.services.edgar_kpi import enrich_one_company
+
+            co = fetch_company_by_name(company_name)
+            if not co:
+                logger.warning("EDGAR-OD-01 Endpoint: Company '%s' nicht in DB", company_name)
+                return
+            ticker = co.get("ticker_yf") or co.get("ticker") or None
+            result = await enrich_one_company(co["id"], co.get("name", company_name), ticker)
+            logger.info(
+                "EDGAR-OD-01 Endpoint: '%s' — found=%s, %d rows written",
+                company_name, result.get("found"), result.get("rows_written", 0),
+            )
+        except Exception as e:
+            logger.exception("EDGAR-OD-01 Endpoint FEHLER für '%s': %s", company_name, e)
+
+    background_tasks.add_task(_run)
+    return {"status": "triggered", "company": company_name, "job": "edgar_kpi_ondemand"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.7.0"}
