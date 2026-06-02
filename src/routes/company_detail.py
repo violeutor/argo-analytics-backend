@@ -1761,8 +1761,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # Cold-Load → BAYN statt BAYN.DE → 404 → kein Preis → Rating-Garbage. Erst der warme
     # Re-Load aus der DB griffe sonst. Die obige Branch deckt nur den Ticker-fehlt-Fall ab.
     elif enrichment.exchange and company.get("ticker"):
-        if not company.get("exchange"):
-            company["exchange"] = enrichment.exchange
+        # company["exchange"] hier NICHT setzen — der Persist-Block unten (is_listed)
+        # schreibt das aufgelöste Exchange in die DB; sein Guard prüft `not company.get("exchange")`.
+        # Ein vorzeitiger In-Memory-Write würde genau diesen Persist unterdrücken (S45-Folgebefund).
+        # Der Proxy-Rebuild braucht company["exchange"] nicht — er nutzt enrichment.exchange direkt.
         if proxy and "·" not in proxy and "." not in proxy:
             proxy = f"{proxy} · {enrichment.exchange}".strip(" ·")
             logger.info(
@@ -1888,6 +1890,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 upsert_payload["ticker"] = enrichment.ticker
             if enrichment.exchange and not company.get("exchange"):
                 upsert_payload["exchange"] = enrichment.exchange
+                company["exchange"]        = enrichment.exchange   # in-memory spiegeln (analog category)
             # EN-11: ISIN-First — nur schreiben wenn noch nicht vorhanden
             if enrichment.isin and not company.get("isin"):
                 upsert_payload["isin"] = enrichment.isin
