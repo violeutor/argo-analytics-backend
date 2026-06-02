@@ -1464,6 +1464,43 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         exchange_raw = company.get("exchange", "")
         proxy = f"{ticker_raw} · {exchange_raw}".strip(" ·") if exchange_raw else ticker_raw
 
+    # ── PHASE-A-TIMEOUT-01 (Option C): Exchange-Pre-Resolve VOR dem Enrichment ──
+    # Problem: Die OpenFIGI-Exchange-Resolution lief bisher INNERHALB von
+    # enrich_company(fast_only=True), das vom 4s-Timeout-Wrapper umschlossen ist.
+    # Bei langsamer Identitätskette (Wikipedia/Wikidata-Varianz) reißt der Timeout
+    # BEVOR result.exchange gesetzt ist → kein Exchange-Persist, kein Yahoo-Suffix,
+    # kein Preis auf dem ERSTEN Cold-Load (self-healing erst beim Reload).
+    # Lösung: Wenn composite_figi vorliegt (DISAMBIG-Flow, Normalfall für Listed)
+    # und noch kein echtes Exchange in der DB steht, lösen wir HIER auf — außerhalb
+    # des 4s-Budgets, mit eigenem 3s-Timeout — und persistieren sofort. Damit ist
+    # exchange=GY in DB + company-Dict, BEVOR _safe_enrichment startet. Der
+    # OpenFIGI-Block in enrichment.py (Guard `not result.exchange`) wird dann
+    # übersprungen, und der Preis kommt schon beim Erstaufruf.
+    _pre_cfigi = company.get("composite_figi") or composite_figi
+    _db_exch   = company.get("exchange")
+    if (is_listed and _pre_cfigi and _cid
+            and (not _db_exch or _db_exch == "QT")):
+        try:
+            from src.services.openfigi_resolver import resolve_exchange_from_composite
+            _pre_exch = await asyncio.wait_for(
+                resolve_exchange_from_composite(_pre_cfigi),
+                timeout=3.0,
+            )
+            if _pre_exch and _pre_exch != "QT":
+                company["exchange"] = _pre_exch
+                upsert_company_enrichment(_cid, {"exchange": _pre_exch})
+                # proxy sofort mit Suffix-fähigem Exchange neu bauen
+                if company.get("ticker"):
+                    proxy = f"{company['ticker']} · {_pre_exch}".strip(" ·")
+                logger.info(
+                    "PHASE-A-TIMEOUT-01: Exchange pre-resolved für %s → %s (vor Enrichment, persistiert)",
+                    company_name, _pre_exch,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("PHASE-A-TIMEOUT-01: Exchange pre-resolve timeout für %s", company_name)
+        except Exception as _e:
+            logger.warning("PHASE-A-TIMEOUT-01: Exchange pre-resolve failed für %s: %s", company_name, _e)
+
     # EN-06 on-demand Write-back: proxy_ticker gesetzt aber ticker/exchange fehlen in DB.
     # Tritt auf wenn Wikipedia-Infobox den Ticker noch nicht hat (frisch gelistete Companies).
     # proxy_ticker "FRVO · Nasdaq" → ticker="FRVO", exchange="Nasdaq" → einmalig in DB schreiben.
