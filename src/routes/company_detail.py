@@ -507,6 +507,15 @@ _EXCHANGE_SUFFIX: dict[str, str] = {
     "bmv": ".MX", "milan": ".MI",
     "tsx": ".TO", "asx": ".AX",
     "hkex": ".HK", "tokyo": ".T",
+    # Bloomberg exchCodes (OpenFIGI Exchange-Resolution, S44/S45): der Resolver liefert
+    # den exchCode (GY/LN/FP), NICHT den Display-Namen. Ohne diese Keys greift die
+    # Suffix-Auflösung für aufgelöste Exchanges nicht → "BAYN · GY" → kein Suffix → 404.
+    # US-Codes (UN/UQ) bewusst weggelassen — Bare-Symbol ohne Suffix ist dort korrekt.
+    "gy": ".DE", "gf": ".F",
+    "ln": ".L", "fp": ".PA",
+    "sm": ".MC", "im": ".MI",
+    "av": ".VI", "sw": ".SW",
+    "ss": ".ST", "na": ".AS",
 }
 
 # Yahoo exchangeName → lesbarer Display-Name

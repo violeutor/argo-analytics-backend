@@ -69,6 +69,7 @@ class FigiCandidate:
     security_type: str | None = None
     isin: str | None = None
     composite_figi: str | None = None
+    share_class_figi: str | None = None   # universeller Cross-Venue-Key (S45 Exchange-Resolution)
 
     @property
     def is_equity(self) -> bool:
@@ -196,6 +197,7 @@ def _parse_result(item: dict) -> Optional[FigiCandidate]:
             security_type=item.get("securityType"),
             isin=item.get("isin"),              # OpenFIGI liefert ISIN direkt
             composite_figi=item.get("compositeFIGI"),
+            share_class_figi=item.get("shareClassFIGI"),
         )
     except Exception as exc:
         logger.debug("OpenFIGI parse failed: %s", exc)
@@ -300,14 +302,25 @@ async def resolve_exchange_from_composite(
     client: Optional[httpx.AsyncClient] = None,
 ) -> str | None:
     """
-    Zweiter OpenFIGI-Call: compositeFIGI → echtes Primär-Exchange (z.B. "GY" für XETRA).
+    compositeFIGI → echtes Primär-Exchange (z.B. "GY" für XETRA).
 
-    OpenFIGI /v3/search liefert für DE-Konzerne den Bloomberg-Global-Composite (QT),
-    nicht das echte Handelslisting. Dieser Call holt via /v3/mapping alle Listings
-    für denselben compositeFIGI und wählt das beste (höchster _EXCHANGE_RANK).
+    WARUM ZWEI HOPS (Befund Session 45):
+    OpenFIGI /v3/search liefert für DE/EU-Konzerne als Top-Kandidat den Bloomberg-
+    Global-Composite (exchCode "QT"). Dessen compositeFIGI ist NICHT der nationale
+    Composite — und `COMPOSITE_ID_BB_GLOBAL` verknüpft per Definition nur Venues
+    INNERHALB desselben Landes-Composites. Vom QT-Global aus erreicht man GY=XETRA
+    also nie (Sackgasse — der alte Ein-Hop-Pfad gab immer None zurück).
 
-    Wird in Phase A parallel gestartet, muss vor Phase B completed sein — damit
-    Yahoo den korrekten Exchange-Suffix (.DE, .L, .PA) bekommt.
+    Korrekter Pfad über die shareClassFIGI-Ebene:
+      Hop 1: mapping(COMPOSITE_ID_BB_GLOBAL, composite_figi) → liest shareClassFIGI
+             (jedes Equity-FIGI trägt die universelle Share-Class-ID).
+      Hop 2: mapping(ID_BB_GLOBAL_SHARE_CLASS_LEVEL, shareClassFIGI) → ALLE Venue-
+             Listings derselben Aktiengattung über alle Börsen — inkl. GY=XETRA,
+             das in der /v3/search-Top-10 fehlt.
+      → bestes echtes Venue via _EXCHANGE_RANK (QT excluded).
+
+    Läuft in Phase A (vor fast_only return), muss vor Phase B completed sein — damit
+    Yahoo in company_detail.py den korrekten Suffix (.DE/.L/.PA) bekommt.
 
     Gibt None zurück bei Fehler oder wenn kein bekannter Primär-Exchange gefunden.
     """
@@ -322,45 +335,61 @@ async def resolve_exchange_from_composite(
     if _OPENFIGI_API_KEY:
         headers["X-OPENFIGI-APIKEY"] = _OPENFIGI_API_KEY
 
-    try:
+    async def _map(id_type: str, id_value: str) -> list[dict]:
         resp = await client.post(
             f"{OPENFIGI_BASE}/mapping",
-            json=[{"idType": "COMPOSITE_ID_BB_GLOBAL", "idValue": composite_figi}],
+            json=[{"idType": id_type, "idValue": id_value}],
             headers=headers,
             timeout=_TIMEOUT,
         )
         if resp.status_code != 200:
             logger.warning(
-                "resolve_exchange_from_composite HTTP %s für compositeFIGI=%s",
-                resp.status_code, composite_figi,
+                "resolve_exchange_from_composite HTTP %s (%s=%s)",
+                resp.status_code, id_type, id_value,
+            )
+            return []
+        out: list[dict] = []
+        for batch in resp.json():
+            out.extend(batch.get("data") or [])
+        return out
+
+    try:
+        # Hop 1: Composite → shareClassFIGI
+        comp_items = await _map("COMPOSITE_ID_BB_GLOBAL", composite_figi)
+        share_class = next(
+            (it.get("shareClassFIGI") for it in comp_items if it.get("shareClassFIGI")),
+            None,
+        )
+        if not share_class:
+            logger.debug(
+                "resolve_exchange_from_composite: keine shareClassFIGI für compositeFIGI=%s",
+                composite_figi,
             )
             return None
 
-        data = resp.json()
-        # /v3/mapping gibt eine Liste von Batches zurück — wir haben genau einen Request.
-        items = []
-        for batch in data:
-            items.extend(batch.get("data") or [])
+        # Hop 2: shareClassFIGI → alle Venue-Listings der Aktiengattung
+        venue_items = await _map("ID_BB_GLOBAL_SHARE_CLASS_LEVEL", share_class)
 
         best_exchange: str | None = None
         best_rank = -1
-        for item in items:
+        for item in venue_items:
             exch = item.get("exchCode") or ""
+            if exch == "QT":   # Composite-Pseudo-Code — nie ein echtes Venue
+                continue
             rank = _EXCHANGE_RANK.get(exch, -1)
-            # Nur echte Handelsplätze — Composite-Codes (QT) explizit ausschließen.
-            if rank > best_rank and exch != "QT":
+            if rank > best_rank:
                 best_rank = rank
                 best_exchange = exch
 
         if best_exchange:
             logger.info(
-                "resolve_exchange_from_composite: compositeFIGI=%s → exchange=%s",
-                composite_figi, best_exchange,
+                "resolve_exchange_from_composite: compositeFIGI=%s → shareClass=%s → exchange=%s",
+                composite_figi, share_class, best_exchange,
             )
         else:
             logger.debug(
-                "resolve_exchange_from_composite: kein Primär-Exchange für compositeFIGI=%s",
-                composite_figi,
+                "resolve_exchange_from_composite: kein Primär-Exchange (shareClass=%s, %d venues)",
+                share_class, len(venue_items),
             )
         return best_exchange
 
@@ -417,8 +446,8 @@ async def resolve_entity(
         logger.info("OpenFIGI raw: %d equity + %d drs = %d total",
                     len(equity), len(unique_drs), len(raw_all))
         for c in raw_all:
-            logger.info("  FIGI candidate: name=%r ticker=%r exchange=%r composite=%r",
-                        c.name, c.ticker, c.exchange, c.composite_figi)
+            logger.info("  FIGI candidate: name=%r ticker=%r exchange=%r composite=%r shareClass=%r",
+                        c.name, c.ticker, c.exchange, c.composite_figi, c.share_class_figi)
         deduped = _deduplicate(raw_all)
         logger.info("OpenFIGI after dedup: %d candidates", len(deduped))
         all_candidates = _sort_candidates(deduped)
