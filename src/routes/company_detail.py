@@ -1502,6 +1502,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         exchange_raw = company.get("exchange", "")
         proxy = f"{ticker_raw} · {exchange_raw}".strip(" ·") if exchange_raw else ticker_raw
 
+    # _cid hier initialisieren — wird sowohl im Pre-Resolve-Block als auch danach benötigt.
+    # Bei frisch angelegten Companies ist company["id"] zu diesem Zeitpunkt bereits gesetzt
+    # (INSERT 201 erfolgt vor diesem Punkt). None-Fallback schützt gegen Race.
+    _cid = company.get("id")
+
     # ── PHASE-A-TIMEOUT-01 (Option C): Exchange-Pre-Resolve VOR dem Enrichment ──
     # Problem: Die OpenFIGI-Exchange-Resolution lief bisher INNERHALB von
     # enrich_company(fast_only=True), das vom 4s-Timeout-Wrapper umschlossen ist.
@@ -1542,7 +1547,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # EN-06 on-demand Write-back: proxy_ticker gesetzt aber ticker/exchange fehlen in DB.
     # Tritt auf wenn Wikipedia-Infobox den Ticker noch nicht hat (frisch gelistete Companies).
     # proxy_ticker "FRVO · Nasdaq" → ticker="FRVO", exchange="Nasdaq" → einmalig in DB schreiben.
-    _cid = company.get("id")
     if is_listed and proxy and not company.get("ticker") and _cid:
         _proxy_parts = [p.strip() for p in proxy.split("·")]
         _proxy_sym   = _proxy_parts[0] if _proxy_parts else None
