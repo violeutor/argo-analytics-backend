@@ -906,6 +906,33 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
     return out
 
 
+def _resolve_yf_symbol(ticker: str | None) -> str | None:
+    """
+    Leitet aus einem Ticker-String den yfinance-Symbol mit Exchange-Suffix ab.
+    Single source of truth (BETA-REVIEW-01) — sowohl _fetch_beta_from_bridge (Abruf)
+    als auch der Ad-hoc-Enrich-Push nutzen diese Funktion, damit Push-Key = Abruf-Key.
+
+    Akzeptiert:
+      "SIE · Frankfurt"  → "SIE.DE"   (Display-Name oder exchCode via _EXCHANGE_SUFFIX)
+      "BAYN · GY"        → "BAYN.DE"  (OpenFIGI exchCode)
+      "BAYN.DE"          → "BAYN.DE"  (bereits aufgelöst, unverändert)
+      "AAPL"             → "AAPL"     (US, kein Suffix)
+    Gibt None zurück wenn kein Symbol extrahierbar.
+    """
+    if not ticker:
+        return None
+    _parts = ticker.split("·")
+    symbol = _parts[0].split("→")[-1].strip().upper()
+    if not symbol or symbol == "—":
+        return None
+    if "." not in symbol and len(_parts) > 1:
+        _exch = _parts[1].strip().lower()
+        _sfx  = _EXCHANGE_SUFFIX.get(_exch, "")
+        if _sfx:
+            symbol = symbol + _sfx
+    return symbol
+
+
 async def _fetch_beta_from_bridge(
     ticker: str | None,
     category: str | None,
@@ -927,15 +954,10 @@ async def _fetch_beta_from_bridge(
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             if is_listed and ticker:
-                # BUG-37: Exchange-Suffix analog zu _fetch_yahoo auflösen
-                # ticker kann "SIE · Frankfurt", "SIE.DE" oder "SIE" sein
-                _parts = ticker.split("·")
-                symbol = _parts[0].split("→")[-1].strip().upper()
-                if "." not in symbol and len(_parts) > 1:
-                    _exch = _parts[1].strip().lower()
-                    _sfx  = _EXCHANGE_SUFFIX.get(_exch, "")
-                    if _sfx:
-                        symbol = symbol + _sfx
+                # BETA-REVIEW-01: yf-Symbol via gemeinsamen Helper (= Push-Key)
+                symbol = _resolve_yf_symbol(ticker)
+                if not symbol:
+                    return {}
                 resp = await client.get(f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/{symbol}")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -974,6 +996,51 @@ async def _fetch_beta_from_bridge(
         logger.debug("_fetch_beta_from_bridge failed: %s", e)
 
     return {}
+
+
+async def _trigger_beta_enrich_on_bridge(
+    ticker: str | None,
+    exchange: str | None,
+) -> None:
+    """
+    BETA-REVIEW-01: Fire-and-Forget Ad-hoc Beta-Enrich-Push an die Bridge.
+
+    Aufgerufen beim Cold-Load eines listed Company, wenn beta_cache leer war (404).
+    Schickt den FERTIG aufgelösten yf-Ticker an POST /yahoo/ticker/enrich — die
+    Bridge startet den teuren yfinance-Pfad als eigenen BackgroundTask. Das Backend
+    blockiert NICHT (kurzer Timeout, Fehler werden geschluckt). Beim nächsten Poll
+    des Frontends (GET /yahoo/ticker/{yf_ticker}) liegt das Beta dann vor.
+
+    Push-Key = _resolve_yf_symbol(ticker) = exakt der Key unter dem
+    _fetch_beta_from_bridge später abfragt → kein Mismatch möglich.
+    """
+    if not settings.ba_bridge_url:
+        return
+    symbol = _resolve_yf_symbol(ticker)
+    if not symbol:
+        return
+
+    _raw = (ticker or "").split("·")[0].split("→")[-1].strip().upper()
+    headers = {"X-API-Key": settings.ba_bridge_api_key}
+    # Kurzer Timeout — wir warten NICHT auf die Berechnung, nur auf das 202.
+    timeout = httpx.Timeout(3.0, connect=2.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            resp = await client.post(
+                f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/enrich",
+                json={
+                    "yf_ticker":  symbol,
+                    "exchange":   exchange or "",
+                    "raw_ticker": _raw,
+                },
+            )
+        logger.info(
+            "BETA-REVIEW-01: Beta-Enrich an Bridge gepusht für %s (HTTP %s)",
+            symbol, resp.status_code,
+        )
+    except Exception as e:
+        # Fire-and-Forget — Bridge-Ausfall darf den Cold-Load nicht beeinträchtigen
+        logger.debug("_trigger_beta_enrich_on_bridge failed für %s: %s", symbol, e)
 
 
 def _build_fundamentals(
@@ -2179,9 +2246,19 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         is_listed=is_listed,
     )
 
+    # BETA-REVIEW-01: Bridge hatte kein echtes Market-Beta (beta_cache leer) und
+    # Company ist listed → Ad-hoc-Enrich an Bridge pushen (Fire-and-Forget). Die
+    # Bridge berechnet das echte 252-Tage-Beta asynchron; beim nächsten Frontend-Poll
+    # liegt es vor. Der Yahoo-Fallback unten liefert sofort einen Anzeigewert.
+    if is_listed and beta.get("beta_source") != "market" and _beta_ticker_raw:
+        await _trigger_beta_enrich_on_bridge(
+            ticker=_beta_ticker_raw,
+            exchange=_beta_exchange,
+        )
+
     # yfinance Beta-Fallback: wenn Bridge keinen Cache hat (404) und Company listed
     # yahoo["yf_beta"] = Yahoos pre-calculated trailing-12M Beta vs. S&P 500
-    # Mittelfristig: Bridge seeded proaktiv Kurse für alle listed Argo-Companies
+    # Sofort-Anzeigewert bis der Bridge-Ad-hoc-Enrich (oben) das echte Beta liefert.
     if not beta.get("beta_1y") and is_listed and yahoo and yahoo.get("yf_beta"):
         beta = {
             "beta_1y":                    yahoo["yf_beta"],
