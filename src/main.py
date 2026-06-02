@@ -553,6 +553,39 @@ async def trigger_edgar_kpi_ondemand(company_name: str, background_tasks: Backgr
     return {"status": "triggered", "company": company_name, "job": "edgar_kpi_ondemand"}
 
 
+@app.post("/internal/funding/enrich/{company_name}")
+async def trigger_funding_ondemand(company_name: str, background_tasks: BackgroundTasks):
+    """
+    FUNDING-OD-01: On-Demand Funding-Enrichment für eine einzelne Company (Admin/Reserve).
+    Analog /internal/bafin/enrich/{company_name}. Der automatische Cold-Path-Trigger
+    sitzt in company_detail.py. Dieser Endpoint ist die manuelle Reserve für Testing.
+    """
+    async def _run():
+        try:
+            from src.integrations.supabase import fetch_company_by_name
+            from src.services.funding_enrichment import enrich_one_company_funding
+
+            co = fetch_company_by_name(company_name)
+            if not co:
+                logger.warning("FUNDING-OD-01 Endpoint: Company '%s' nicht in DB", company_name)
+                return
+            stats = await enrich_one_company_funding(
+                company_id=co["id"],
+                company_name=co.get("name", company_name),
+                ticker=co.get("ticker"),
+                region=co.get("region"),
+            )
+            logger.info(
+                "FUNDING-OD-01 Endpoint: '%s' — %d Runden geschrieben",
+                company_name, stats.get("rounds_written", 0),
+            )
+        except Exception as e:
+            logger.exception("FUNDING-OD-01 Endpoint FEHLER für '%s': %s", company_name, e)
+
+    background_tasks.add_task(_run)
+    return {"status": "triggered", "company": company_name, "job": "funding_ondemand"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.7.0"}

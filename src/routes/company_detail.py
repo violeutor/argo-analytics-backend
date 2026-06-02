@@ -2721,6 +2721,27 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             "Ownership enrichment queued für %s (is_listed=%s)", company_name, is_listed
         )
 
+    # FUNDING-OD-01: On-Demand Funding-Enrichment für frische private Companies.
+    # Gate: not is_listed + db_rounds leer (hier bereits geladen, kein Extra-DB-Read)
+    # + company_id bekannt. Idempotent via UNIQUE(company_id, date, type).
+    # EU-Private eingeschlossen: TechCrunch + Google News funktionieren global.
+    # BackgroundTask: TechCrunch-Feed-Download + EDGAR Form D dauern mehrere Sekunden.
+    if not is_listed and _cid and not db_rounds:
+        async def _funding_enrichment_bg() -> None:
+            try:
+                from src.services.funding_enrichment import enrich_one_company_funding
+                await enrich_one_company_funding(
+                    company_id=_cid,
+                    company_name=company_name,
+                    ticker=company.get("ticker"),
+                    region=company.get("region"),
+                )
+            except Exception as e:
+                logger.debug("FUNDING-OD-01: BackgroundTask failed für %s: %s", company_name, e)
+
+        background_tasks.add_task(_funding_enrichment_bg)
+        logger.info("FUNDING-OD-01: Funding-Enrichment queued (BackgroundTask) für %s", company_name)
+
     # 9. Scoring — R-23: company-spezifische Käufer (kein Fallback auf globale Seed-Buyers)
     potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []
     from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company

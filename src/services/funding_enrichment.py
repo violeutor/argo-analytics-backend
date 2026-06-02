@@ -492,6 +492,48 @@ async def run_funding_enrichment(
     return stats
 
 
+async def enrich_one_company_funding(
+    company_id: str,
+    company_name: str,
+    ticker: str | None = None,
+    region: str | None = None,
+) -> dict:
+    """
+    FUNDING-OD-01: On-Demand Funding-Enrichment für eine EINZELNE Company.
+
+    Schließt die Cold-Path-Lücke: funding_rounds wurde bisher NUR vom 04:30-Cron
+    befüllt. Eine frische private Company hatte beim ersten Load leere Runden →
+    kein FundingMomentum-Score, kein Stage-Badge, keine Funding-History.
+
+    Thin Wrapper um run_funding_enrichment — übergibt die eine Company als Liste,
+    damit die gesamte Pipeline-Logik (EDGAR Form D → TechCrunch → Google News →
+    Signals) unberührt bleibt. Kein Code-Duplikat, kein Drift.
+
+    Gate: company_id + company_name Pflicht. Idempotent: upsert_funding_round
+    nutzt UNIQUE(company_id, date, type) → Re-Trigger schreibt nichts Doppeltes.
+    Caller-Gate in company_detail.py: feuert nur wenn db_rounds leer (bereits geladen).
+    """
+    if not company_id or not company_name:
+        return {"rounds_written": 0, "rounds_skipped": 0, "companies_processed": 0}
+
+    company_dict = {
+        "id":     company_id,
+        "name":   company_name,
+        "ticker": ticker,
+        "region": region or "",
+    }
+    try:
+        stats = await run_funding_enrichment(companies=[company_dict], days_since_last=0)
+        logger.info(
+            "FUNDING-OD-01: '%s' — %d Runden geschrieben, %d skip",
+            company_name, stats.get("rounds_written", 0), stats.get("rounds_skipped", 0),
+        )
+        return stats
+    except Exception as e:
+        logger.warning("FUNDING-OD-01: failed für '%s': %s", company_name, e)
+        return {"rounds_written": 0, "rounds_skipped": 0, "companies_processed": 0}
+
+
 def _rounds_from_signals(company_id: str, company_name: str) -> list[dict]:
     """
     B-05: Konvertiert funding_signals (aus signals-Tabelle) in funding_round-Dicts.
