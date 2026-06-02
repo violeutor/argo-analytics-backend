@@ -906,30 +906,6 @@ async def _fetch_yahoo(ticker: str | None) -> dict:
     return out
 
 
-async def _fetch_from_shadow(name: str) -> dict | None:
-    """
-    ARCH-01: Lookup in BA-Bridge Shadow-DB.
-    Gibt Shadow-Daten zurück wenn Company bekannt und angereichert.
-    Timeout 5s — blockiert One-Click nicht bei Bridge-Ausfall.
-    """
-    import httpx
-    from src.config import settings
-    bridge_url = getattr(settings, "ba_bridge_url", None)
-    if not bridge_url:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{bridge_url}/shadow/company/{name}")
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") not in ("not_found", None):
-                return data
-    except Exception as e:
-        logger.debug("_fetch_from_shadow failed für '%s': %s", name, e)
-    return None
-
-
-
 async def _fetch_beta_from_bridge(
     ticker: str | None,
     category: str | None,
@@ -1444,49 +1420,35 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         None,
     )
 
-    # 1b. One-Click: ARCH-01 Shadow-DB zuerst prüfen, dann Blank-Entry
+    # 1b. One-Click: Unknown company → Blank-Entry + async Enrichment
     if not company:
-        # Shadow-DB Lookup via BA-Bridge (max 5s Timeout — non-blocking)
-        shadow_data = await _fetch_from_shadow(name)
-
-        if shadow_data and shadow_data.get("status") == "done":
-            logger.info("Shadow-DB hit für '%s' — promote to Supabase", name)
-            from src.integrations.supabase import promote_shadow_to_supabase
-            company = promote_shadow_to_supabase(shadow_data)
-            if company:
-                warnings.append(f"'{name}' aus Shadow-DB geladen (Bundesanzeiger-Daten verfügbar).")
-
-        if not company:
-            # Normaler Flow: Blank-Entry + async Enrichment
-            logger.info("Unknown company '%s' — creating DB entry + enriching", name)
-            try:
-                db = get_supabase()
-                # DISAMBIG-01: kam die ISIN aus /resolve mit, schreiben wir sie direkt
-                # in den Blank-Entry → Identität von Anfang an sauber, ISIN-First greift
-                # sofort (is_listed-Guard, BaFin/EDGAR-Pfad) statt erst nach EN-11.
-                _insert = {
-                    "name": name,
-                    "investment_path": "Beobachten",
-                    "enrichment_status": "pending",
-                }
-                if isin:
-                    _insert["isin"] = isin
-                if ticker:
-                    _insert["ticker"] = ticker
-                if exchange:
-                    _insert["exchange"] = exchange
-                # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
-                # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
-                # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
-                # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
-                if composite_figi:
-                    _insert["composite_figi"] = composite_figi
-                result = db.table("companies").insert(_insert).execute()
-                company = result.data[0] if result.data else {"name": name}
-                warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
-            except Exception as e:
-                logger.warning("Could not create company '%s': %s — %s", name, type(e).__name__, e)
-                raise HTTPException(status_code=404, detail=f"Company '{name}' not found and could not be created: {e}")
+        logger.info("Unknown company '%s' — creating DB entry + enriching", name)
+        try:
+            db = get_supabase()
+            # DISAMBIG-01: kam die ISIN aus /resolve mit, schreiben wir sie direkt
+            # in den Blank-Entry → Identität von Anfang an sauber, ISIN-First greift
+            # sofort (is_listed-Guard, BaFin/EDGAR-Pfad) statt erst nach EN-11.
+            _insert = {
+                "name": name,
+                "investment_path": "Beobachten",
+                "enrichment_status": "pending",
+            }
+            if isin:
+                _insert["isin"] = isin
+            if ticker:
+                _insert["ticker"] = ticker
+            if exchange:
+                _insert["exchange"] = exchange
+            # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
+            # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
+            if composite_figi:
+                _insert["composite_figi"] = composite_figi
+            result = db.table("companies").insert(_insert).execute()
+            company = result.data[0] if result.data else {"name": name}
+            warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
+        except Exception as e:
+            logger.warning("Could not create company '%s': %s — %s", name, type(e).__name__, e)
+            raise HTTPException(status_code=404, detail=f"Company '{name}' not found and could not be created: {e}")
 
     company_name = company["name"]
 
