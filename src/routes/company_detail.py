@@ -60,6 +60,44 @@ from src.services.openfigi_resolver import resolve_entity, FigiCandidate
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["company"])
 
+# R10: verwaiste running-Locks nach dieser Zeit neu triggerbar (Crash/Neustart-Schutz)
+_ENRICHMENT_LOCK_TTL_S = 600   # 10 Minuten
+
+
+def _fetch_live_enrichment_status(company_id: str) -> tuple[str | None, bool]:
+    """R10: frischen enrichment_status + Stale-Flag direkt aus der DB lesen.
+
+    Returns (status, is_stale_running). `is_stale_running` ist True wenn der Status
+    "running" ist, der Lock aber älter als ENRICHMENT_LOCK_TTL ist (verwaist durch
+    Crash/Neustart) — dann darf neu getriggert werden trotz running.
+
+    Der `company`-Dict im Request stammt aus einem fetch_companies(500)-Snapshot
+    vom Seitenanfang und kann veraltet sein; ein paralleler Codepfad (/market) kann
+    den Status zwischenzeitlich gesetzt haben — dieser frische Read ist der Guard
+    gegen doppeltes Enrichment (→ MD-B01-DDG-202-Storm).
+    """
+    try:
+        r = (get_supabase().table("companies")
+             .select("enrichment_status, enrichment_started_at")
+             .eq("id", company_id).limit(1).execute())
+        if not r.data:
+            return None, False
+        row = r.data[0]
+        status = row.get("enrichment_status")
+        is_stale = False
+        if status == "running" and row.get("enrichment_started_at"):
+            from datetime import datetime, timezone
+            try:
+                started = datetime.fromisoformat(
+                    str(row["enrichment_started_at"]).replace("Z", "+00:00"))
+                age_s = (datetime.now(timezone.utc) - started).total_seconds()
+                is_stale = age_s > _ENRICHMENT_LOCK_TTL_S
+            except Exception:
+                is_stale = True   # unparsebarer Timestamp → als verwaist behandeln
+        return status, is_stale
+    except Exception:
+        return None, False
+
 
 # ── Response models ───────────────────────────────────────────────────────────
 
@@ -1581,45 +1619,57 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     )
 
     if company_id and not _market_data_valid:
-        async def _market_enrichment_bg():
-            try:
-                set_enrichment_status(company_id, "running")
-                async_result = await enrich_market_data(
-                    company_id=company_id,
-                    company_name=company_name,
-                    category=company.get("category"),
-                    sector_tag=None,
-                    tam_usd_bn=tam.get("tam_usd_bn"),
-                    tech_readiness=_tr_ref[0],   # gesetzt nach Scoring-Block
-                )
-                all_companies = fetch_companies(limit=500)
-                all_rounds = fetch_all_funding_rounds()
-                sync_result = enrich_market_data_sync_wrapper(
-                    company_id=company_id,
-                    company_name=company_name,
-                    category=company.get("category"),
-                    sector_tag=None,
-                    tam_usd_bn=tam.get("tam_usd_bn"),
-                    all_companies=all_companies,
-                    all_funding_rounds=all_rounds,
-                    async_result=async_result,
-                    peers_context=company.get("peers_context"),  # R-22
-                    is_listed=is_listed,                         # BUG-51: mature statt early für listed
-                )
-                # _competition_signals ist internes Übergabe-Feld — nicht in DB schreiben
-                upsert_payload = {
-                    **{k: v for k, v in async_result.items() if k != "_competition_signals"},
-                    **sync_result,
-                }
-                upsert_market_data(company_id, upsert_payload)
-                set_enrichment_status(company_id, "done")
-                logger.info("Market enrichment done for %s", company_name)
-            except Exception as e:
-                set_enrichment_status(company_id, "error")
-                logger.exception("Market enrichment TRACEBACK for %s", company_name)
+        # R10 (Teil A): denselben running-Guard wie /market — verhindert dass
+        # /company und /market parallel dasselbe Enrichment für eine Company queuen
+        # (doppelte MD-B01-DDG-Calls → 202-Storm). Frischer DB-Read, kein Snapshot.
+        _live_status, _lock_stale = _fetch_live_enrichment_status(company_id)
+        if _live_status == "running" and not _lock_stale:
+            logger.info("R10: Market enrichment skip für %s — läuft bereits (status=running)", company_name)
+        else:
+            if _live_status == "running" and _lock_stale:
+                logger.warning("R10: verwaister running-Lock für %s (>%ds) — neu getriggert", company_name, _ENRICHMENT_LOCK_TTL_S)
+            # R10 (Teil B): Lock VOR add_task setzen, nicht erst im Task — schließt das
+            # Race-Fenster zwischen "queued" und "running".
+            set_enrichment_status(company_id, "running")
 
-        background_tasks.add_task(_market_enrichment_bg)
-        logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
+            async def _market_enrichment_bg():
+                try:
+                    async_result = await enrich_market_data(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        sector_tag=None,
+                        tam_usd_bn=tam.get("tam_usd_bn"),
+                        tech_readiness=_tr_ref[0],   # gesetzt nach Scoring-Block
+                    )
+                    all_companies = fetch_companies(limit=500)
+                    all_rounds = fetch_all_funding_rounds()
+                    sync_result = enrich_market_data_sync_wrapper(
+                        company_id=company_id,
+                        company_name=company_name,
+                        category=company.get("category"),
+                        sector_tag=None,
+                        tam_usd_bn=tam.get("tam_usd_bn"),
+                        all_companies=all_companies,
+                        all_funding_rounds=all_rounds,
+                        async_result=async_result,
+                        peers_context=company.get("peers_context"),  # R-22
+                        is_listed=is_listed,                         # BUG-51: mature statt early für listed
+                    )
+                    # _competition_signals ist internes Übergabe-Feld — nicht in DB schreiben
+                    upsert_payload = {
+                        **{k: v for k, v in async_result.items() if k != "_competition_signals"},
+                        **sync_result,
+                    }
+                    upsert_market_data(company_id, upsert_payload)
+                    set_enrichment_status(company_id, "done")
+                    logger.info("Market enrichment done for %s", company_name)
+                except Exception as e:
+                    set_enrichment_status(company_id, "error")
+                    logger.exception("Market enrichment TRACEBACK for %s", company_name)
+
+            background_tasks.add_task(_market_enrichment_bg)
+            logger.info("Market enrichment queued (BackgroundTasks) for %s", company_name)
 
     else:
         # Daten sind frisch — gezielte Einzel-Patches für fehlende Felder

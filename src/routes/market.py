@@ -21,6 +21,7 @@ from src.integrations.supabase import (
     fetch_all_funding_rounds,
     upsert_market_data,
     set_enrichment_status,
+    get_supabase,
 )
 from src.services.market_data_enrichment import (
     enrich_market_data,
@@ -28,6 +29,39 @@ from src.services.market_data_enrichment import (
 )
 
 logger = logging.getLogger(__name__)
+
+# R10: verwaiste running-Locks nach dieser Zeit neu triggerbar (Crash/Neustart-Schutz)
+_ENRICHMENT_LOCK_TTL_S = 600   # 10 Minuten
+
+
+def _fetch_live_enrichment_status(company_id: str) -> tuple[str | None, bool]:
+    """R10: frischen enrichment_status + Stale-Flag direkt aus der DB lesen.
+
+    Returns (status, is_stale_running). Nötig weil der company-Snapshot aus
+    fetch_companies(500) am Seitenanfang veraltet sein kann — ein paralleler
+    Request (z.B. /company) kann den Status zwischenzeitlich auf "running" gesetzt
+    haben. is_stale_running=True wenn der Lock älter als TTL ist (verwaist).
+    """
+    try:
+        r = (get_supabase().table("companies")
+             .select("enrichment_status, enrichment_started_at")
+             .eq("id", company_id).limit(1).execute())
+        if not r.data:
+            return None, False
+        row = r.data[0]
+        status = row.get("enrichment_status")
+        is_stale = False
+        if status == "running" and row.get("enrichment_started_at"):
+            from datetime import datetime, timezone
+            try:
+                started = datetime.fromisoformat(
+                    str(row["enrichment_started_at"]).replace("Z", "+00:00"))
+                is_stale = (datetime.now(timezone.utc) - started).total_seconds() > _ENRICHMENT_LOCK_TTL_S
+            except Exception:
+                is_stale = True
+        return status, is_stale
+    except Exception:
+        return None, False
 router = APIRouter(prefix="/api/v1", tags=["market"])
 
 
@@ -172,13 +206,23 @@ async def get_company_market(name: str, background_tasks: BackgroundTasks) -> Ma
         return _build_response(market_row, status="ready")
 
     # 4. Noch nicht angereichert oder unvollständig → Background-Task anstoßen
-    if company_id and enrichment_status not in ("running",):
+    # R10: frischen Status + Stale-Flag aus DB lesen (nicht den veralteten Snapshot
+    # aus fetch_companies am Seitenanfang) — company_detail.py kann zwischenzeitlich
+    # "running" gesetzt haben. Verwaiste Locks (>TTL) werden neu getriggert.
+    _live_status, _lock_stale = _fetch_live_enrichment_status(company_id) if company_id else (None, False)
+    _is_running = (_live_status == "running") and not _lock_stale
+    if company_id and not _is_running:
+        if _live_status == "running" and _lock_stale:
+            logger.warning("R10: verwaister running-Lock für %s (>%ds) — neu getriggert (market route)", company_name, _ENRICHMENT_LOCK_TTL_S)
+        # R10 (Teil B): Lock VOR dem add_task setzen, nicht erst im Task. Schließt das
+        # Race-Fenster zwischen "queued" und "running" — ein zweiter Request (anderer
+        # Codepfad, z.B. /company) sieht dann bereits "running" und triggert nicht erneut.
+        set_enrichment_status(company_id, "running")
         tam_cached = fetch_tam_cache(company_id)
         tam_usd_bn = float(tam_cached["tam_2035_usd_bn"]) if tam_cached and tam_cached.get("tam_2035_usd_bn") else None
 
         async def _market_enrichment_bg():
             try:
-                set_enrichment_status(company_id, "running")
                 async_result = await enrich_market_data(
                     company_id=company_id,
                     company_name=company_name,

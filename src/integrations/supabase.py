@@ -307,10 +307,18 @@ def upsert_market_data(company_id: str, data: dict) -> None:
 
 
 def set_enrichment_status(company_id: str, status: str) -> None:
-    """Setzt companies.enrichment_status — pending | running | done | error."""
+    """Setzt companies.enrichment_status — pending | running | done | error.
+
+    R10: Bei status="running" wird zusätzlich enrichment_started_at gesetzt —
+    erlaubt verwaiste Locks zu erkennen (Crash während Enrichment → Status bleibt
+    running, aber der Timestamp altert → Guard kann nach Schwelle neu triggern)."""
     db = get_supabase()
     try:
-        db.table("companies").update({"enrichment_status": status}).eq("id", company_id).execute()
+        payload: dict = {"enrichment_status": status}
+        if status == "running":
+            from datetime import datetime, timezone
+            payload["enrichment_started_at"] = datetime.now(timezone.utc).isoformat()
+        db.table("companies").update(payload).eq("id", company_id).execute()
         logger.debug("enrichment_status %s → %s", company_id, status)
     except Exception as e:
         logger.warning("set_enrichment_status FAILED for %s: %s", company_id, e)
