@@ -621,7 +621,14 @@ async def _fetch_twelve_data(symbol: str, exchange_key: str | None) -> dict:
 
 
 async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
-    """Yahoo Chart-API — nur Preis + MarktCap, kein Auth nötig."""
+    """Yahoo Chart-API — Preis + MarktCap, kein Auth nötig.
+
+    Zwei-Stufen-Strategie:
+      1. /v8/finance/chart  → Preis + meta.marketCap (zuverlässig für US; leer für viele EU)
+      2. /v10/finance/quoteSummary?modules=price → marketCap.raw (funktioniert für .DE/.L/.PA)
+         Nur wenn Schritt 1 keinen marketCap liefert.
+    """
+    out: dict = {}
     try:
         timeout = httpx.Timeout(6.0, connect=3.0)
         async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
@@ -630,7 +637,7 @@ async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
             )
         if cr.status_code == 200:
             meta = cr.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            return {
+            out = {
                 "price":         meta.get("regularMarketPrice"),
                 "market_cap_bn": (meta.get("marketCap") or 0) / 1e9 or None,
                 "currency":      meta.get("currency"),
@@ -638,7 +645,27 @@ async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
             }
     except Exception as e:
         logger.debug("Yahoo chart fallback failed for %s: %s", symbol, e)
-    return {}
+
+    # Schritt 2: quoteSummary für marketCap — speziell für EU-Listings (.DE, .L, .PA …)
+    # bei denen /v8/chart meta.marketCap leer lässt.
+    if out.get("price") and not out.get("market_cap_bn"):
+        try:
+            timeout = httpx.Timeout(6.0, connect=3.0)
+            async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                qs = await client.get(
+                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                    f"?modules=price"
+                )
+            if qs.status_code == 200:
+                price_mod = qs.json().get("quoteSummary", {}).get("result", [{}])[0].get("price", {})
+                raw_cap = price_mod.get("marketCap", {}).get("raw")
+                if raw_cap:
+                    out["market_cap_bn"] = raw_cap / 1e9
+                    logger.info("quoteSummary marketCap für %s: %.1fBn", symbol, out["market_cap_bn"])
+        except Exception as e:
+            logger.debug("quoteSummary marketCap fallback failed for %s: %s", symbol, e)
+
+    return out
 
 
 async def _fetch_yf_fundamentals(symbol: str) -> dict:
@@ -1715,7 +1742,16 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 "description":   full.description,
                 "website":       full.website,
             }
-            # upsert_company_enrichment filtert None — kein Overwrite mit leer
+            # Exchange / Ticker / compositeFIGI: nur schreiben wenn Phase A sie nicht
+            # persistieren konnte (z.B. Phase-A-Timeout oder pre-existing Ticker ohne Exchange).
+            # upsert_company_enrichment filtert None → kein Overwrite mit leer.
+            if full.exchange and not company.get("exchange"):
+                payload["exchange"] = full.exchange
+                logger.info("Phase B: exchange persistiert für %s → %s", company_name, full.exchange)
+            if full.ticker and not company.get("ticker"):
+                payload["ticker"] = full.ticker
+            if full.composite_figi and not company.get("composite_figi"):
+                payload["composite_figi"] = full.composite_figi
             upsert_company_enrichment(company_id, payload)
             logger.info("Phase B Enrichment persisted für %s", company_name)
         except Exception as e:
