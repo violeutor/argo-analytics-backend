@@ -1868,7 +1868,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 upsert_payload["isin"] = enrichment.isin
             # DISAMBIG-01: compositeFIGI persistieren — wird für Exchange-Resolution
             # in Phase A bei nachfolgenden Loads verwendet (Rolling Refresh holt Exchange nach).
-            _cfigi = enrichment.composite_figi or company_record.get("composite_figi") if enrichment else None
+            _cfigi = enrichment.composite_figi or company.get("composite_figi") if enrichment else None
             if _cfigi and not company.get("composite_figi"):
                 upsert_payload["composite_figi"] = _cfigi
         # category / industry — erst Tag-Inferenz (aus enrichment), dann Claude-Fallback
