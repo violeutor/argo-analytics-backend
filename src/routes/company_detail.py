@@ -1754,6 +1754,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         is_listed = True
         logger.info("Option2: Ticker aus Phase A nachgezogen für %s → %s", company_name, enrichment.ticker)
 
+    # S45 BAYN.DE-Fix: Exchange aus Phase A nachziehen, AUCH wenn der Ticker schon
+    # existierte (URL-Param/DB). Die OpenFIGI Exchange-Resolution setzt result.exchange
+    # (z.B. GY) erst WÄHREND Phase A — der proxy wurde aber davor (mit exchange=None) als
+    # Bare-Ticker gebaut. Ohne diesen Rebuild fehlt der Yahoo-Suffix auf dem ERSTEN
+    # Cold-Load → BAYN statt BAYN.DE → 404 → kein Preis → Rating-Garbage. Erst der warme
+    # Re-Load aus der DB griffe sonst. Die obige Branch deckt nur den Ticker-fehlt-Fall ab.
+    elif enrichment.exchange and company.get("ticker"):
+        if not company.get("exchange"):
+            company["exchange"] = enrichment.exchange
+        if proxy and "·" not in proxy and "." not in proxy:
+            proxy = f"{proxy} · {enrichment.exchange}".strip(" ·")
+            logger.info(
+                "S45: proxy mit aufgelöstem Exchange nachgezogen für %s → %s",
+                company_name, proxy,
+            )
+
     # BUG-36: Yahoo auch aufrufen wenn proxy gesetzt und Ticker erkennbar,
     # auch wenn is_listed noch False (z.B. De-SPAC in progress, ticker bereits handelbar).
     _yahoo_ticker = proxy if is_listed else (proxy if proxy and proxy != "—" else None)
