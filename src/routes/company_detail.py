@@ -646,24 +646,25 @@ async def _fetch_yahoo_price_fallback(symbol: str) -> dict:
     except Exception as e:
         logger.debug("Yahoo chart fallback failed for %s: %s", symbol, e)
 
-    # Schritt 2: quoteSummary für marketCap — speziell für EU-Listings (.DE, .L, .PA …)
+    # Schritt 2: /v7/finance/quote für marketCap — speziell für EU-Listings (.DE, .L, .PA …)
     # bei denen /v8/chart meta.marketCap leer lässt.
+    # /v10/quoteSummary liefert 401 (Yahoo Auth-Wall seit 2025), /v7/quote noch nicht.
     if out.get("price") and not out.get("market_cap_bn"):
         try:
             timeout = httpx.Timeout(6.0, connect=3.0)
             async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as client:
-                qs = await client.get(
-                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                    f"?modules=price"
+                qr = await client.get(
+                    f"https://query1.finance.yahoo.com/v7/finance/quote"
+                    f"?symbols={symbol}&fields=marketCap"
                 )
-            if qs.status_code == 200:
-                price_mod = qs.json().get("quoteSummary", {}).get("result", [{}])[0].get("price", {})
-                raw_cap = price_mod.get("marketCap", {}).get("raw")
+            if qr.status_code == 200:
+                result = qr.json().get("quoteResponse", {}).get("result", [{}])
+                raw_cap = result[0].get("marketCap") if result else None
                 if raw_cap:
                     out["market_cap_bn"] = raw_cap / 1e9
-                    logger.info("quoteSummary marketCap für %s: %.1fBn", symbol, out["market_cap_bn"])
+                    logger.info("v7/quote marketCap für %s: %.1fBn", symbol, out["market_cap_bn"])
         except Exception as e:
-            logger.debug("quoteSummary marketCap fallback failed for %s: %s", symbol, e)
+            logger.debug("v7/quote marketCap fallback failed for %s: %s", symbol, e)
 
     return out
 
