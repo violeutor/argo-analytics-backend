@@ -187,6 +187,8 @@ def _parse_betas(raw: bytes) -> pd.DataFrame:
         )
 
     log.info(f"Spalten im Excel: {list(df.columns)}")
+    # Debug: erste Datenzeile ausgeben um echte Werte zu sehen
+    log.info(f"Erste Zeile: {df.iloc[0].tolist()}")
 
     # Spaltennamen flexibel matchen
     col_sector    = _find_col(df, ["Industry Name", "Industry", "Sector"])
