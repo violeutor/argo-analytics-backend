@@ -32,7 +32,15 @@ from datetime import datetime, timezone
 import httpx
 import pandas as pd
 
-from src.integrations.supabase import get_supabase
+import os
+from supabase import create_client as _create_client
+
+def get_supabase():
+    url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY") or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL und SUPABASE_SERVICE_KEY müssen als Env-Vars gesetzt sein.")
+    return _create_client(url, key)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
