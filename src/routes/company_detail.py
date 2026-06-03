@@ -968,7 +968,7 @@ def _fetch_damodaran_sector_beta(sector: str | None) -> dict:
             .data or []
         )
         if not rows:
-            logger.debug("Damodaran: kein Mapping für Sektor '%s'", sector)
+            logger.warning("Damodaran sector_beta: kein Mapping für Sektor='%s' — industry-Feld prüfen", sector)
             return {}
         row = rows[0]
         # levered bevorzugt (Vergleichbarkeit), unlevered als Fallback wenn levered NULL
@@ -979,6 +979,13 @@ def _fetch_damodaran_sector_beta(sector: str | None) -> dict:
         label = row.get("sector") or ""
         if de is not None:
             label = f"{label} · D/E {float(de):.2f}"
+        logger.info(
+            "Damodaran sector_beta: Sektor='%s' → Damodaran='%s' β=%.2f (D/E=%s)",
+            sector,
+            row.get("sector", "?"),
+            float(sector_beta) if sector_beta is not None else 0.0,
+            f"{float(de):.2f}" if de is not None else "n/a",
+        )
         return {
             "sector_beta":        float(sector_beta) if sector_beta is not None else None,
             "sector_beta_label":  label,
@@ -986,7 +993,7 @@ def _fetch_damodaran_sector_beta(sector: str | None) -> dict:
             "sector_beta_year":   row.get("updated_year"),
         }
     except Exception as e:
-        logger.debug("_fetch_damodaran_sector_beta failed: %s", e)
+        logger.warning("_fetch_damodaran_sector_beta failed für Sektor='%s': %s", sector, e)
         return {}
 
 
