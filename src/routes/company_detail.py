@@ -3243,3 +3243,39 @@ async def get_company_scores(name: str):
         "market_score":    cached.get("market_score"),
         "rating":          cached.get("rating"),
     }
+
+
+@router.get("/internal/test/yahoo-historical")
+async def test_yahoo_historical(ticker: str = "BAYN.DE"):
+    """
+    BETA-SOURCE-01: Temporärer Test — Yahoo /v8/chart mit range=1y direkt via httpx.
+    Prüft ob der Chart-Endpoint (kein yfinance, kein Key) historische Jahres-
+    daten von Renders IP liefert. Für Beta-Berechnung DE/EU listed Companies.
+    Aufruf: GET /api/v1/internal/test/yahoo-historical?ticker=BAYN.DE
+    Aufruf: GET /api/v1/internal/test/yahoo-historical?ticker=^GDAXI
+    """
+    import httpx
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ArgoAnalytics/1.0)"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return {"status": resp.status_code, "ticker": ticker, "detail": resp.text[:200]}
+            data = resp.json()
+            chart = data.get("chart", {}).get("result", [{}])[0]
+            timestamps = chart.get("timestamp", [])
+            closes = (chart.get("indicators", {})
+                          .get("adjclose", [{}])[0]
+                          .get("adjclose", []))
+            return {
+                "status": 200,
+                "ticker": ticker,
+                "trading_days": len(timestamps),
+                "first_date": timestamps[0] if timestamps else None,
+                "last_date": timestamps[-1] if timestamps else None,
+                "sample_closes": closes[:3] if closes else [],
+                "sufficient_for_beta": len(timestamps) >= 200,
+            }
+    except Exception as e:
+        return {"status": "error", "ticker": ticker, "detail": str(e)}
