@@ -55,74 +55,35 @@ logging.basicConfig(
 DAMODARAN_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 
 # ---------------------------------------------------------------------------
-# Mapping: Argo-Kategorie → Damodaran-Sektor
+# Mapping: Argo-SEKTOR → Damodaran-Sektor  (Taxonomy v1.0, 14 Sektoren)
 #
-# Quelle: Damodaran Industry List (Januar 2025)
-# Regel: unlevered_beta bevorzugt — leverage-bereinigt, da private
-#        Company-Kapitalstruktur unbekannt.
+# Session 49: von Kategorie-Ebene (68 Einträge, brüchig) auf Sektor-Ebene
+# umgestellt. Damodaran ist selbst Sektor-Ebene → ein Match je Argo-Sektor reicht.
+# Robuster + wartungsarm: Company.industry (= Argo-Sektor) ist stabiler als die
+# Feinkategorie, und der Lookup wird ein klarer Match statt ILIKE-Gefummel.
+#
+# WICHTIG: Die Damodaran-Sektornamen müssen EXAKT mit der betas.xls übereinstimmen
+# (z.B. "Farming/Agriculture" OHNE Leerzeichen, "Aerospace/Defense" mit Slash).
+# Die Validierung in run() meldet im Dry-Run jeden Namen, der nicht in der Datei
+# gefunden wurde — dort Tippfehler korrigieren.
+#
+# Mehrere Argo-Sektoren dürfen auf denselben Damodaran-Sektor mappen.
 # ---------------------------------------------------------------------------
 ARGO_TO_DAMODARAN: dict[str, str] = {
-    # Carbon Removal / CDR
-    "Carbon Removal (DAC)":         "Chemical (Basic)",
-    "Biomass CDR":                  "Environmental & Waste Services",
-    "Mineralization":               "Chemical (Basic)",
-    "Ocean CDR":                    "Environmental & Waste Services",
-    "Modular Capture":              "Chemical (Basic)",
-    "Mobile Capture":               "Chemical (Basic)",
-    "Industrial Capture":           "Chemical (Basic)",
-    "Electrochemical Capture":      "Chemical (Diversified)",
-
-    # CO₂-Utilisation
-    "CO₂-to-Chemicals":             "Chemical (Diversified)",
-    "CO₂-to-Fuels":                 "Chemical (Diversified)",
-    "CO₂-to-Fuels / SAF":          "Chemical (Diversified)",
-
-    # Materials / Cement
-    "Low-Carbon Concrete":          "Building Materials",
-    "Low-Carbon Cement":            "Building Materials",
-    "Electrified Cement":           "Building Materials",
-    "Sustainable Materials":        "Chemical (Diversified)",
-
-    # Energy / Storage
-    "Geothermal / EGS":             "Power",
-    "Long-Duration Storage":        "Power",
-    "Distributed Battery / Grid":   "Power",
-    "Distributed Power Infrastructure": "Power",
-    "Solid-State Battery":          "Electronics (General)",
-    "Battery Innovation":           "Electronics (General)",
-    "Circular Battery Materials":   "Metals & Mining",
-    "Circular Battery / Second-Life BESS": "Electronics (General)",
-
-    # Hydrogen
-    "Hydrogen":                     "Chemical (Basic)",
-
-    # Grid / Software
-    "AI × Grid Software":           "Software (System & Application)",
-    "AI × Water / Cooling":         "Software (System & Application)",
-    "Datacenter Cooling / HVAC":    "Electronics (General)",
-
-    # Agriculture / Food
-    "Agritech":                     "Farming / Agriculture",
-    "Agritech SaaS":                "Software (System & Application)",
-    "Vertical Farming":             "Farming / Agriculture",
-    "Soil Carbon":                  "Farming / Agriculture",
-    "Agroforestry":                 "Farming / Agriculture",
-    "Carbon Credits":               "Environmental & Waste Services",
-    "Bioengineering":               "Biotechnology",
-    "Biotech":                      "Biotechnology",
-
-    # Climate Risk / SaaS
-    "Climate-Risk / Satelliten":    "Software (System & Application)",
-    "Climate-Risk SaaS":            "Software (System & Application)",
-    "Climate Adaptation / AI":      "Software (System & Application)",
-    "Bio-based Chemicals":          "Chemical (Basic)",
-
-    # Irrigation / Water
-    "Irrigation":                   "Farming / Agriculture",
-    "Solar Irrigation":             "Power",
-
-    # Waste / Energy
-    "Waste-to-Energy":              "Environmental & Waste Services",
+    "Energy & Power":             "Green & Renewable Energy",
+    "Mobility & Transport":       "Auto & Truck",
+    "Carbon & Climate":           "Environmental & Waste Services",
+    "Industrial & Manufacturing": "Machinery",
+    "Materials & Chemicals":      "Chemical (Specialty)",
+    "Agriculture & Food":         "Farming/Agriculture",
+    "Built Environment":          "Engineering/Construction",
+    "Life Sciences & Health":     "Drugs (Pharmaceutical)",
+    "Digital Infrastructure":     "Software (System & Application)",
+    "Financial Services":         "Financial Svcs. (Non-bank & Insurance)",
+    "Consumer & Commerce":        "Retail (Online)",
+    "Space & Defense":            "Aerospace/Defense",
+    "Water & Circular Economy":   "Environmental & Waste Services",
+    "Mining & Resources":         "Metals & Mining",
 }
 
 # ---------------------------------------------------------------------------
@@ -246,8 +207,10 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 def _build_argo_category_map(df: pd.DataFrame) -> dict[str, str]:
     """
-    Invertiert ARGO_TO_DAMODARAN: Damodaran-Sektor → alle Argo-Kategorien (kommagetrennt).
-    Für den DB-Eintrag: argo_category enthält alle mappenden Argo-Kategorien.
+    Invertiert ARGO_TO_DAMODARAN: Damodaran-Sektor → alle mappenden Argo-Sektoren
+    (kommagetrennt). Für den DB-Eintrag: argo_category enthält die Argo-Sektornamen
+    (Spaltenname historisch 'argo_category', hält jetzt aber Sektoren — Sektor-Ebene
+    seit Session 49). Der Backend-Lookup matcht company.industry dagegen.
     """
     mapping: dict[str, list[str]] = {}
     for argo_cat, dam_sector in ARGO_TO_DAMODARAN.items():
@@ -261,6 +224,24 @@ def run(dry_run: bool = False) -> None:
     # Download + Parse
     raw = _download_excel(DAMODARAN_URL)
     df  = _parse_betas(raw)
+
+    # ── Mapping-Validierung ────────────────────────────────────────────────
+    # Prüft, welche Damodaran-Sektornamen aus ARGO_TO_DAMODARAN NICHT in der
+    # Datei existieren (Tippfehler → stiller Miss, kein Beta für den Argo-Sektor).
+    file_sectors    = set(df["sector"].tolist())
+    mapped_sectors  = set(ARGO_TO_DAMODARAN.values())
+    matched_sectors = sorted(mapped_sectors & file_sectors)
+    missing_sectors = sorted(mapped_sectors - file_sectors)
+    log.info(
+        "MAPPING-VALIDIERUNG: %d/%d Damodaran-Sektoren in der Datei gefunden",
+        len(matched_sectors), len(mapped_sectors),
+    )
+    if missing_sectors:
+        log.warning("NICHT gefunden — diese Argo-Sektoren bekommen KEIN Beta:")
+        for dam in missing_sectors:
+            argo = [a for a, d in ARGO_TO_DAMODARAN.items() if d == dam]
+            log.warning("  '%s'  ←  %s", dam, ", ".join(argo))
+        log.warning("→ Exakten Damodaran-Namen in ARGO_TO_DAMODARAN korrigieren.")
 
     argo_map = _build_argo_category_map(df)
 

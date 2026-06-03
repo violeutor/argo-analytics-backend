@@ -940,32 +940,35 @@ def _resolve_yf_symbol(ticker: str | None) -> str | None:
     return symbol
 
 
-def _fetch_damodaran_sector_beta(category: str | None) -> dict:
+def _fetch_damodaran_sector_beta(sector: str | None) -> dict:
     """
     YH-04 (Session 49): Damodaran Branchen-Beta direkt aus Supabase (damodaran_beta).
     Kein Bridge-Hop mehr — statische Referenzdaten liegen in Supabase neben market_data.
 
-    Lookup per argo_category ILIKE (eine Zeile kann mehrere kommagetrennte
-    Argo-Kategorien enthalten). Gibt levered_beta als Sektor-Referenz zurück —
-    levered (mit Branchen-Ø-D/E), damit es mit dem company-spezifischen Markt-Beta
-    (ebenfalls levered) vergleichbar ist.
+    Lookup per argo_category ILIKE gegen den Argo-SEKTOR (= company.industry, eine
+    der 14 Taxonomy-Sektoren). Die argo_category-Spalte hält seit S49 Sektornamen,
+    nicht mehr Feinkategorien (Sektor-Ebene-Mapping, robuster). Eine Zeile kann
+    mehrere kommagetrennte Argo-Sektoren enthalten → ILIKE-Substring.
 
-    Gibt {} zurück wenn keine Kategorie oder kein Mapping.
+    Gibt levered_beta als Sektor-Referenz zurück — levered (mit Branchen-Ø-D/E),
+    damit es mit dem company-spezifischen Markt-Beta (ebenfalls levered) vergleichbar ist.
+
+    Gibt {} zurück wenn kein Sektor oder kein Mapping.
     """
-    if not category:
+    if not sector:
         return {}
     try:
         db = get_supabase()
         rows = (
             db.table("damodaran_beta")
             .select("sector, levered_beta, unlevered_beta, d_e_ratio, updated_year")
-            .ilike("argo_category", f"%{category}%")
+            .ilike("argo_category", f"%{sector}%")
             .limit(1)
             .execute()
             .data or []
         )
         if not rows:
-            logger.debug("Damodaran: kein Mapping für Kategorie '%s'", category)
+            logger.debug("Damodaran: kein Mapping für Sektor '%s'", sector)
             return {}
         row = rows[0]
         # levered bevorzugt (Vergleichbarkeit), unlevered als Fallback wenn levered NULL
@@ -991,6 +994,7 @@ async def _fetch_beta_from_bridge(
     ticker: str | None,
     category: str | None,
     is_listed: bool,
+    sector: str | None = None,
 ) -> dict:
     """
     YH-06 (Session 49 umgebaut) — Beta hat ZWEI getrennte Konzepte:
@@ -1007,12 +1011,16 @@ async def _fetch_beta_from_bridge(
     Damodaran wird IMMER geholt (listed wie private) — für den Market-Tab-Tile UND
     als Fallback. Markt-Beta nur zusätzlich wenn listed+ticker.
 
+    Hinweis: `category` ist seit S49 ungenutzt (Damodaran-Lookup läuft jetzt über
+    `sector` = Argo-Industry, nicht mehr Feinkategorie). Param bleibt für
+    Signatur-Kompatibilität (proxy-Call-Site übergibt category=None).
+
     Gibt leeres dict zurück bei totalem Fehlschlag — kein Hard-Fail.
     """
     out: dict = {}
 
     # (2) Sektor-Beta IMMER aus Supabase (sync, ~20ms, kein externer Call).
-    out.update(_fetch_damodaran_sector_beta(category))
+    out.update(_fetch_damodaran_sector_beta(sector))
 
     # (1) company-Beta: Markt-Beta von der Bridge, nur wenn listed+ticker.
     market_beta: dict = {}
@@ -2406,6 +2414,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         ticker=_beta_ticker_raw,
         category=company.get("category") or getattr(enrichment, "category", None),
         is_listed=is_listed,
+        sector=company.get("industry") or getattr(enrichment, "industry", None),
     )
 
     # BETA-REVIEW-01: Bridge hatte kein echtes Market-Beta (beta_cache leer) und
