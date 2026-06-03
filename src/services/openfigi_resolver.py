@@ -182,6 +182,20 @@ def _normalize_legal_name(bloomberg_name: str | None, fallback: str = "") -> str
     return result or fallback
 
 
+# RESOLVE-PRIMARY-01: Bloomberg-Platzhalter-Ticker für private/pre-IPO Entities.
+# Bloomberg vergibt für nicht (öffentlich) handelbare Entities Pseudo-Ticker im Muster
+# <6+ Ziffern><1 Buchstabe>, z.B. "1531142D" (Northvolt AB an SS). Das sind KEINE
+# echten Listings — sie haben keinen Yahoo/TwelveData-Kurs und dürfen is_listed nicht
+# auf True setzen, sonst läuft eine private Company fälschlich durch den Listed-Pfad
+# (kein Funding-Enrichment, Phantom-Preis-Lookups → 404).
+_PHANTOM_TICKER_RE = re.compile(r"^\d{6,}[A-Z]$")
+
+
+def _is_phantom_ticker(ticker: str | None) -> bool:
+    """True wenn der Ticker ein Bloomberg-Platzhalter ist (private/pre-IPO Entity)."""
+    return bool(ticker and _PHANTOM_TICKER_RE.match(ticker.strip()))
+
+
 def _parse_result(item: dict) -> Optional[FigiCandidate]:
     """Einzelnes OpenFIGI-Result-Item → FigiCandidate."""
     try:
@@ -189,10 +203,18 @@ def _parse_result(item: dict) -> Optional[FigiCandidate]:
         name = item.get("name")
         if not figi or not name:
             return None
+        ticker = item.get("ticker")
+        # RESOLVE-PRIMARY-01: Platzhalter-Ticker verwerfen — keine echte Notierung.
+        if _is_phantom_ticker(ticker):
+            logger.info(
+                "OpenFIGI: Platzhalter-Ticker %r für %r verworfen (private/pre-IPO Entity)",
+                ticker, name,
+            )
+            return None
         return FigiCandidate(
             figi=figi,
             name=name,
-            ticker=item.get("ticker"),
+            ticker=ticker,
             exchange=item.get("exchCode"),
             security_type=item.get("securityType"),
             isin=item.get("isin"),              # OpenFIGI liefert ISIN direkt
@@ -242,28 +264,58 @@ async def _search_figi(
 
 
 # Exchange-Priorität: höherer Rank = bevorzugte Primärlistung.
+# RESOLVE-PRIMARY-01 (Option A): Liquiditäts-/Heimatbörsen-Rang statt Geo-Rang.
+# Vorher stand GY (XETRA) auf 100 über US-Börsen (85) — das machte aus JEDER Company
+# mit XETRA-Zweitnotiz eine deutsche (NVIDIA → NVD/GY statt NVDA/UQ). Der Rang war
+# für DE-Primärnotierungen (Bayer) gebaut, wirkte aber global.
+# Neue Logik: Heimatbörsen aller Hauptmärkte sind gleichrangig (100). Die Trennung
+# "US-Company mit DE-Zweitnotiz" vs. "echte DE-Company" leistet NICHT der Geo-Rang,
+# sondern der DR/ADR-Filter in _sort_candidates: Bayer hat an US-Börsen nur eine ADR
+# (Depositary Receipt, depriorisiert) → GY-Common-Stock gewinnt. NVIDIA hat an UQ ein
+# echtes Common-Stock-Listing (NVDA) → gewinnt gegen die NVD/GY-Zweitnotiz.
+# QT (Bloomberg Global Composite) bleibt mittig — kanonischer Ticker, aber kein Venue;
+# resolve_exchange_from_composite löst QT über shareClass in echte Venues auf.
 _EXCHANGE_RANK: dict[str, int] = {
-    "GY": 100,   # XETRA (DE Primär)
-    "QT": 95,    # Bloomberg Global Composite — kanonischer Ticker (BAYN, AAPL etc.)
-    "GF": 90,    # Frankfurt
-    "UN": 85,    # NYSE
-    "UQ": 85,    # NASDAQ
-    "LN": 80,    # London
-    "FP": 75,    # Paris (Euronext)
-    "SM": 70,    # Madrid
-    "IM": 70,    # Milano
-    "AV": 65,    # Wien
-    "SW": 65,    # Zürich
-    "SS": 60,    # Stockholm
-    "NA": 60,    # Amsterdam
+    "UN": 100,   # NYSE          ┐
+    "UQ": 100,   # NASDAQ        │ US-Heimatbörsen
+    "UA": 100,   # NYSE American ┘
+    "GY": 100,   # XETRA (DE Heimat)
+    "LN": 100,   # London (UK Heimat)
+    "FP": 100,   # Paris / Euronext (FR Heimat)
+    "SM": 100,   # Madrid (ES Heimat)
+    "IM": 100,   # Milano (IT Heimat)
+    "SW": 100,   # Zürich / SIX (CH Heimat)
+    "SS": 100,   # Stockholm (SE Heimat)
+    "NA": 100,   # Amsterdam (NL Heimat)
+    "AV": 100,   # Wien (AT Heimat)
+    "GF": 80,    # Frankfurt (DE Sekundär neben XETRA)
+    "GM": 80,    # München (DE regional)
+    "QT": 50,    # Bloomberg Global Composite — kanonischer Ticker, kein echtes Venue
 }
+
+
+def _candidate_priority(c: FigiCandidate) -> tuple[int, int]:
+    """
+    RESOLVE-PRIMARY-01: Einheitlicher Prioritäts-Schlüssel für Dedup UND Sort.
+    Höher = besser. Zwei Stufen, damit bei rang-gleichen Heimatbörsen (alle 100)
+    der DR/ADR-Status entscheidet — NICHT alphabetisch/zufällig:
+      1. Common Stock vor Depositary Receipt (ADRs nie als Primär wählen).
+         Das ist der Mechanismus, der "US-Company mit DE-Zweitnotiz" von "DE-Company
+         mit US-ADR" trennt: NVIDIA hat US-Common-Stock (NVDA) → gewinnt; Bayer hat an
+         US-Börsen nur eine ADR (BAYRY, DR) → verliert gegen GY-Common-Stock (BAYN).
+      2. Exchange-Rank (Heimatbörsen 100, QT/regional niedriger).
+    """
+    is_common = 1 if c.security_type == "Common Stock" else 0
+    rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
+    return (is_common, rank)
 
 
 def _deduplicate(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     """
     Zwei Stufen:
     1. Nur bekannte Primär-Exchanges behalten (filtert EO/E1/EB/XE/XU/XA/QT/PO etc.)
-    2. Pro normalisiertem Namen den besten verbleibenden Exchange-Eintrag behalten.
+    2. Pro normalisiertem Namen den besten verbleibenden Eintrag behalten — nach
+       _candidate_priority (Common Stock > DR, dann Exchange-Rank).
 
     Hintergrund: OpenFIGI gibt für "Bayer AG" 10 Einträge mit verschiedenen
     compositeFIGIs zurück — jedes Exchange-Listing hat eine eigene Bloomberg-ID.
@@ -274,26 +326,21 @@ def _deduplicate(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     # Wenn keine bekannten Exchanges: alle behalten (Fallback, verhindert leeres Modal).
     pool = known if known else cands
 
-    # Stufe 2: pro normalisiertem Namen besten Exchange-Rank behalten.
+    # Stufe 2: pro normalisiertem Namen besten Kandidaten behalten (DR-bewusst).
     best: dict[str, FigiCandidate] = {}
     for c in pool:
         key = _norm(c.name)
-        rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
-        if key not in best or rank > _EXCHANGE_RANK.get(best[key].exchange or "", 0):
+        if key not in best or _candidate_priority(c) > _candidate_priority(best[key]):
             best[key] = c
     return list(best.values())
 
 
 def _sort_candidates(cands: list[FigiCandidate]) -> list[FigiCandidate]:
     """
-    Sortierung nach Exchange-Priorität: DE-Primärlistung zuerst.
-    ADRs/GDRs nach hinten (gleiche Konzernmutter, anderer Market).
+    Sortierung nach _candidate_priority (Common Stock > DR, dann Exchange-Rank),
+    absteigend; Name als stabiler Tiebreaker. Konsistent mit _deduplicate.
     """
-    def key(c: FigiCandidate):
-        is_dr = c.security_type == "Depositary Receipt"
-        rank = _EXCHANGE_RANK.get(c.exchange or "", 0)
-        return (int(is_dr), -rank, c.name)
-    return sorted(cands, key=key)
+    return sorted(cands, key=lambda c: (-_candidate_priority(c)[0], -_candidate_priority(c)[1], c.name))
 
 
 async def resolve_exchange_from_composite(
