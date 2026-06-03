@@ -158,15 +158,25 @@ def _parse_betas(raw: bytes) -> pd.DataFrame:
 
     Spaltennamen variieren leicht je Jahrgang — daher flexible Suche.
     """
-    all_sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=0)
+    # header=None: Damodaran hat oft Leerzeilen am Anfang, daher Header manuell finden.
+    all_sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=None)
     log.info(f"Sheets im Excel: {list(all_sheets.keys())}")
 
     df = None
-    for sheet_name, sheet_df in all_sheets.items():
-        sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
-        cols_lower = [c.lower() for c in sheet_df.columns]
-        if any("industry" in c or "sector" in c for c in cols_lower) and            any("unlevered" in c for c in cols_lower):
-            log.info(f"Datentabelle gefunden: Sheet '{sheet_name}'")
+    for sheet_name, sheet_raw in all_sheets.items():
+        # Header-Zeile: erste Zeile die "industry"/"sector" UND "unlevered" enthält
+        header_row = None
+        for i, row in sheet_raw.iterrows():
+            vals = [str(v).lower() for v in row.values]
+            if any("industry" in v or "sector" in v for v in vals) and \
+               any("unlevered" in v for v in vals):
+                header_row = i
+                break
+        if header_row is not None:
+            sheet_df = sheet_raw.iloc[header_row:].reset_index(drop=True)
+            sheet_df.columns = [str(c).strip() for c in sheet_df.iloc[0]]
+            sheet_df = sheet_df.iloc[1:].reset_index(drop=True)
+            log.info(f"Datentabelle gefunden: Sheet '{sheet_name}', Header-Zeile {header_row}")
             df = sheet_df
             break
 
