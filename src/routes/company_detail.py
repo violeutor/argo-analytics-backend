@@ -1103,13 +1103,13 @@ async def _trigger_edgar_kpi_ondemand(
     befüllt ([:50]-Lotterie). Eine frische US-Company bekam Fundamentals erst Tage
     später (oder bei >50 US-Companies nie garantiert) → bricht den One-Click-Anspruch.
 
-    Dreistufiges Gate (billig → teuer), Stufe 1+2 hier im Caller bereits geprüft:
+    Dreistufiges Gate (billig → teuer), alle drei im Caller geprüft:
       1. is_listed         (aus OpenFIGI, kostenlos — Caller-Guard)
       2. US-Heuristik      (_looks_us_listed, kostenlos — Caller-Guard)
-      3. kpi_timeseries-Read: schon edgar_xbrl-Rows? → dann NICHT erneut feuern.
-         Verhindert sinnlosen EDGAR-Roundtrip bei jedem Warm-Reload (EDGAR-freundlich,
-         10-req/s-Limit). Idempotenz wäre zwar durch upsert ohnehin gegeben, aber der
-         Read spart den ~1-2s-Task + den ~7MB tickers_map-Download komplett.
+      3. kpi_timeseries-Read: schon edgar_xbrl-Rows? → synchroner Pre-Check im Caller
+         VOR add_task (verhindert unnötige BackgroundTask-Starts bei Warm-Loads).
+         Der Read hier (Stufe 3 im Task) ist nur noch Sicherheitsnetz für Race-Conditions
+         (z.B. zwei parallele Cold-Loads derselben Company — sehr selten).
     """
     try:
         db = get_supabase()
@@ -2351,20 +2351,38 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         )
 
     # EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für frische US-Companies.
-    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier, Stufe 3 (DB-Read) im Trigger.
-    # BackgroundTask (nicht await): EDGAR-Fetch + tickers_map-Download dauern ~1-2s+,
-    # dürfen die Response nicht blockieren. Beim nächsten Frontend-Poll / Reload liegen
-    # die KPIs vor (analog Beta-Poller). Nicht-US-Listings (DE/EU) feuern gar nicht
-    # erst → fängt EDGAR-DE-CIK gleich mit ab.
+    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier; Stufe 3 (DB-Read) EBENFALLS
+    # hier als synchroner Pre-Check — verhindert, dass bei jedem Warm-Load ein
+    # BackgroundTask gestartet wird, der nur kurz reinläuft und sofort returniert.
+    # Der synchrone Read kostet ~20ms, spart aber den Task-Start + tickers_map-Download
+    # komplett. Nicht-US-Listings (DE/EU) feuern gar nicht erst → EDGAR-DE-CIK gleich mit.
     if is_listed and _cid and _looks_us_listed(_beta_ticker_raw, _beta_exchange):
-        background_tasks.add_task(
-            _trigger_edgar_kpi_ondemand,
-            _cid,
-            company_name,
-            (_beta_ticker_raw or "").split("·")[0].strip() or None,
-            _beta_exchange,
-        )
-        logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
+        try:
+            _db = get_supabase()
+            _edgar_existing = (
+                _db.table("kpi_timeseries")
+                .select("id")
+                .eq("company_id", _cid)
+                .eq("source", "edgar_xbrl")
+                .limit(1)
+                .execute()
+                .data or []
+            )
+        except Exception:
+            _edgar_existing = []  # Im Zweifel queuen (EDGAR-Call ist idempotent)
+
+        if not _edgar_existing:
+            _edgar_ticker = (_beta_ticker_raw or "").split("·")[0].strip() or None
+            background_tasks.add_task(
+                _trigger_edgar_kpi_ondemand,
+                _cid,
+                company_name,
+                _edgar_ticker,
+                _beta_exchange,
+            )
+            logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
+        else:
+            logger.debug("EDGAR-OD-01: %s hat bereits edgar_xbrl-Rows — kein Re-Trigger", company_name)
 
     # yfinance Beta-Fallback: wenn Bridge keinen Cache hat (404) und Company listed
     # yahoo["yf_beta"] = Yahoos pre-calculated trailing-12M Beta vs. S&P 500
