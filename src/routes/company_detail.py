@@ -1029,32 +1029,18 @@ async def _fetch_beta_from_bridge(
     # (2) Sektor-Beta IMMER aus Supabase (sync, ~20ms, kein externer Call).
     out.update(_fetch_damodaran_sector_beta(sector))
 
-    # (1) company-Beta: Markt-Beta von der Bridge, nur wenn listed+ticker.
+    # (1) company-Beta: Backend-native Berechnung (S50 — ersetzt Bridge-yfinance).
+    # Yahoo /v8/chart (DE/EU + Benchmarks, kein Key, von Render bestätigt) +
+    # Twelve Data /time_series (US-Fallback, Token-Auth). Supabase beta_cache (24h TTL).
     market_beta: dict = {}
-    if is_listed and ticker and settings.ba_bridge_url:
-        headers = {"X-API-Key": settings.ba_bridge_api_key}
-        timeout = httpx.Timeout(5.0, connect=2.0)
+    if is_listed and ticker:
         try:
+            from src.services.beta_calculator import fetch_beta
             symbol = _resolve_yf_symbol(ticker)
             if symbol:
-                async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                    resp = await client.get(f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/{symbol}")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        market_beta = {
-                            "beta_1y":                    data.get("beta_1y"),
-                            "beta_3y":                    data.get("beta_3y"),
-                            "volatility_30d":             data.get("volatility_30d"),
-                            "beta_source":                "market",
-                            "beta_benchmark":             data.get("benchmark_ticker"),
-                            "beta_benchmark_is_fallback": data.get("benchmark_is_fallback", False),
-                            "beta_calculated_at":         data.get("calculated_at"),
-                            "beta_data_quality":          data.get("data_quality"),
-                        }
-                    else:
-                        logger.debug("Beta bridge miss for ticker=%s: HTTP %s", symbol, resp.status_code)
+                market_beta = await fetch_beta(symbol)
         except Exception as e:
-            logger.debug("_fetch_beta_from_bridge (market) failed: %s", e)
+            logger.debug("_fetch_beta_from_bridge (beta_calculator) failed: %s", e)
 
     if market_beta.get("beta_1y") is not None:
         # Echtes Markt-Beta vorhanden → das ist das company-Beta.
@@ -2424,15 +2410,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         sector=company.get("industry") or getattr(enrichment, "industry", None),
     )
 
-    # BETA-REVIEW-01: Bridge hatte kein echtes Market-Beta (beta_cache leer) und
-    # Company ist listed → Ad-hoc-Enrich an Bridge pushen (Fire-and-Forget). Die
-    # Bridge berechnet das echte 252-Tage-Beta asynchron; beim nächsten Frontend-Poll
-    # liegt es vor. Der Yahoo-Fallback unten liefert sofort einen Anzeigewert.
-    if is_listed and beta.get("beta_source") != "market" and _beta_ticker_raw:
-        await _trigger_beta_enrich_on_bridge(
-            ticker=_beta_ticker_raw,
-            exchange=_beta_exchange,
-        )
+    # BETA-REVIEW-01 Bridge-Push: deaktiviert S50 — beta_calculator.fetch_beta()
+    # berechnet und cached Beta direkt im Backend (kein Bridge-Hop mehr nötig).
 
     # EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für frische US-Companies.
     # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) + 3 (edgar_xbrl-DB-Read) ALLE hier im
@@ -3245,37 +3224,5 @@ async def get_company_scores(name: str):
     }
 
 
-@router.get("/internal/test/yahoo-historical")
-async def test_yahoo_historical(ticker: str = "BAYN.DE"):
-    """
-    BETA-SOURCE-01: Temporärer Test — Yahoo /v8/chart mit range=1y direkt via httpx.
-    Prüft ob der Chart-Endpoint (kein yfinance, kein Key) historische Jahres-
-    daten von Renders IP liefert. Für Beta-Berechnung DE/EU listed Companies.
-    Aufruf: GET /api/v1/internal/test/yahoo-historical?ticker=BAYN.DE
-    Aufruf: GET /api/v1/internal/test/yahoo-historical?ticker=^GDAXI
-    """
-    import httpx
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ArgoAnalytics/1.0)"}
-    try:
-        async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                return {"status": resp.status_code, "ticker": ticker, "detail": resp.text[:200]}
-            data = resp.json()
-            chart = data.get("chart", {}).get("result", [{}])[0]
-            timestamps = chart.get("timestamp", [])
-            closes = (chart.get("indicators", {})
-                          .get("adjclose", [{}])[0]
-                          .get("adjclose", []))
-            return {
-                "status": 200,
-                "ticker": ticker,
-                "trading_days": len(timestamps),
-                "first_date": timestamps[0] if timestamps else None,
-                "last_date": timestamps[-1] if timestamps else None,
-                "sample_closes": closes[:3] if closes else [],
-                "sufficient_for_beta": len(timestamps) >= 200,
-            }
-    except Exception as e:
-        return {"status": "error", "ticker": ticker, "detail": str(e)}
+# BETA-SOURCE-01 Testendpoints (Stooq S50-1, Yahoo-Historical S50-2) entfernt —
+# beta_calculator.py übernimmt die Berechnung produktiv. BRIDGE-CLEANUP folgt.
