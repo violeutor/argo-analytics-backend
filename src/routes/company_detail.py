@@ -10,6 +10,7 @@ Changes vs v2.6:
 
 import logging
 import asyncio
+import time
 import httpx
 from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks
@@ -998,6 +999,13 @@ async def _fetch_beta_from_bridge(
     return {}
 
 
+# BETA-REVIEW-01 Folge: Backend-seitiger Push-Throttle gegen Wiederholungs-Pushes
+# desselben Symbols (Frontend-Beta-Poller lädt /company im Sekundentakt). Modul-weit,
+# pro Worker-Prozess. yf_symbol → letzter erfolgreicher Push (monotonic).
+_beta_push_cooldown: dict[str, float] = {}
+_BETA_PUSH_COOLDOWN_SEC = 90.0
+
+
 async def _trigger_beta_enrich_on_bridge(
     ticker: str | None,
     exchange: str | None,
@@ -1013,11 +1021,23 @@ async def _trigger_beta_enrich_on_bridge(
 
     Push-Key = _resolve_yf_symbol(ticker) = exakt der Key unter dem
     _fetch_beta_from_bridge später abfragt → kein Mismatch möglich.
+
+    Throttle (BETA-REVIEW-01 Folge): Der Frontend-Beta-Poller lädt /company im
+    Sekundentakt bis beta_source="market". Jeder Warm-Load würde sonst erneut pushen
+    (7 Pushes/47s beobachtet). _BETA_PUSH_COOLDOWN unterdrückt Wiederholungs-Pushes
+    desselben Symbols aus DIESEM Prozess — Höflichkeit gegenüber der Bridge (spart
+    Roundtrips). Der eigentliche yfinance-Schutz sitzt zusätzlich Bridge-seitig
+    (instanz-unabhängig), da Render mehrere Backend-Worker fahren kann.
     """
     if not settings.ba_bridge_url:
         return
     symbol = _resolve_yf_symbol(ticker)
     if not symbol:
+        return
+
+    _last = _beta_push_cooldown.get(symbol)
+    if _last is not None and (time.monotonic() - _last) < _BETA_PUSH_COOLDOWN_SEC:
+        logger.debug("BETA-REVIEW-01: Push-Throttle für %s — skip (Cooldown)", symbol)
         return
 
     _raw = (ticker or "").split("·")[0].split("→")[-1].strip().upper()
@@ -1034,6 +1054,7 @@ async def _trigger_beta_enrich_on_bridge(
                     "raw_ticker": _raw,
                 },
             )
+        _beta_push_cooldown[symbol] = time.monotonic()
         logger.info(
             "BETA-REVIEW-01: Beta-Enrich an Bridge gepusht für %s (HTTP %s)",
             symbol, resp.status_code,
