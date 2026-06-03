@@ -187,6 +187,12 @@ class FundamentalsData(BaseModel):
     beta_benchmark_is_fallback: bool = False
     beta_calculated_at: str | None = None   # ISO 8601 — für Frontend-Tooltip "Stand 19.05."
     beta_data_quality: str | None = None    # 'full' | 'partial'
+    beta_is_sector_fallback: bool = False   # True wenn company-Beta = Damodaran-Sektor-Beta (kein company-spezifischer Wert)
+    # Sektor-Beta (YH-04, Session 49) — eigenständiger Referenzwert, IMMER Damodaran.
+    # Koexistiert mit company-Beta: Market Tab zeigt beide nebeneinander.
+    sector_beta: float | None = None        # levered Branchen-Beta (Ø-D/E der Branche)
+    sector_beta_label: str | None = None    # z.B. "Power · D/E 0.74"
+    sector_beta_source: str | None = None   # 'damodaran'
     # FD-01 Routing — Herkunfts-Badge je Feld im Frontend
     fundamentals_source: str | None = None          # 'yahoo' | 'ba_bridge' | 'edgar' | 'none'
     fundamentals_source_secondary: str | None = None # z.B. 'ba_bridge' als Ergänzung zu Yahoo (listed DE)
@@ -934,69 +940,126 @@ def _resolve_yf_symbol(ticker: str | None) -> str | None:
     return symbol
 
 
+def _fetch_damodaran_sector_beta(category: str | None) -> dict:
+    """
+    YH-04 (Session 49): Damodaran Branchen-Beta direkt aus Supabase (damodaran_beta).
+    Kein Bridge-Hop mehr — statische Referenzdaten liegen in Supabase neben market_data.
+
+    Lookup per argo_category ILIKE (eine Zeile kann mehrere kommagetrennte
+    Argo-Kategorien enthalten). Gibt levered_beta als Sektor-Referenz zurück —
+    levered (mit Branchen-Ø-D/E), damit es mit dem company-spezifischen Markt-Beta
+    (ebenfalls levered) vergleichbar ist.
+
+    Gibt {} zurück wenn keine Kategorie oder kein Mapping.
+    """
+    if not category:
+        return {}
+    try:
+        db = get_supabase()
+        rows = (
+            db.table("damodaran_beta")
+            .select("sector, levered_beta, unlevered_beta, d_e_ratio, updated_year")
+            .ilike("argo_category", f"%{category}%")
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        if not rows:
+            logger.debug("Damodaran: kein Mapping für Kategorie '%s'", category)
+            return {}
+        row = rows[0]
+        # levered bevorzugt (Vergleichbarkeit), unlevered als Fallback wenn levered NULL
+        sector_beta = row.get("levered_beta")
+        if sector_beta is None:
+            sector_beta = row.get("unlevered_beta")
+        de = row.get("d_e_ratio")
+        label = row.get("sector") or ""
+        if de is not None:
+            label = f"{label} · D/E {float(de):.2f}"
+        return {
+            "sector_beta":        float(sector_beta) if sector_beta is not None else None,
+            "sector_beta_label":  label,
+            "sector_beta_source": "damodaran",
+            "sector_beta_year":   row.get("updated_year"),
+        }
+    except Exception as e:
+        logger.debug("_fetch_damodaran_sector_beta failed: %s", e)
+        return {}
+
+
 async def _fetch_beta_from_bridge(
     ticker: str | None,
     category: str | None,
     is_listed: bool,
 ) -> dict:
     """
-    YH-06 — Beta-Routing:
-        listed  → GET /yahoo/ticker/{ticker}           → beta_source='market'
-        private → GET /yahoo/ticker/_/damodaran        → beta_source='damodaran'
+    YH-06 (Session 49 umgebaut) — Beta hat ZWEI getrennte Konzepte:
 
-    Gibt leeres dict zurück bei Fehler / nicht gefunden — kein Hard-Fail.
+      1. company-Beta (beta_1y, beta_source, ...): das eigentliche Risikomaß.
+         - listed: 252-Tage Markt-Beta von der Bridge (yfinance)
+         - listed ohne Markt-Beta ODER private: Damodaran-Sektor-Beta als FALLBACK
+           (beta_source='damodaran')
+
+      2. Sektor-Beta (sector_beta, sector_beta_label): IMMER Damodaran, als
+         eigenständiger Referenzwert im Market Tab — koexistiert mit company-Beta.
+         Aus Supabase, kein Bridge-Hop.
+
+    Damodaran wird IMMER geholt (listed wie private) — für den Market-Tab-Tile UND
+    als Fallback. Markt-Beta nur zusätzlich wenn listed+ticker.
+
+    Gibt leeres dict zurück bei totalem Fehlschlag — kein Hard-Fail.
     """
-    if not settings.ba_bridge_url:
-        return {}
+    out: dict = {}
 
-    headers = {"X-API-Key": settings.ba_bridge_api_key}
-    timeout = httpx.Timeout(5.0, connect=2.0)
+    # (2) Sektor-Beta IMMER aus Supabase (sync, ~20ms, kein externer Call).
+    out.update(_fetch_damodaran_sector_beta(category))
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            if is_listed and ticker:
-                # BETA-REVIEW-01: yf-Symbol via gemeinsamen Helper (= Push-Key)
-                symbol = _resolve_yf_symbol(ticker)
-                if not symbol:
-                    return {}
-                resp = await client.get(f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/{symbol}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return {
-                        "beta_1y":                    data.get("beta_1y"),
-                        "beta_3y":                    data.get("beta_3y"),
-                        "volatility_30d":             data.get("volatility_30d"),
-                        "beta_source":                "market",
-                        "beta_benchmark":             data.get("benchmark_ticker"),
-                        "beta_benchmark_is_fallback": data.get("benchmark_is_fallback", False),
-                        "beta_calculated_at":         data.get("calculated_at"),
-                        "beta_data_quality":          data.get("data_quality"),
-                    }
-                logger.debug("Beta bridge miss for ticker=%s: HTTP %s", symbol, resp.status_code)
+    # (1) company-Beta: Markt-Beta von der Bridge, nur wenn listed+ticker.
+    market_beta: dict = {}
+    if is_listed and ticker and settings.ba_bridge_url:
+        headers = {"X-API-Key": settings.ba_bridge_api_key}
+        timeout = httpx.Timeout(5.0, connect=2.0)
+        try:
+            symbol = _resolve_yf_symbol(ticker)
+            if symbol:
+                async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+                    resp = await client.get(f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/{symbol}")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        market_beta = {
+                            "beta_1y":                    data.get("beta_1y"),
+                            "beta_3y":                    data.get("beta_3y"),
+                            "volatility_30d":             data.get("volatility_30d"),
+                            "beta_source":                "market",
+                            "beta_benchmark":             data.get("benchmark_ticker"),
+                            "beta_benchmark_is_fallback": data.get("benchmark_is_fallback", False),
+                            "beta_calculated_at":         data.get("calculated_at"),
+                            "beta_data_quality":          data.get("data_quality"),
+                        }
+                    else:
+                        logger.debug("Beta bridge miss for ticker=%s: HTTP %s", symbol, resp.status_code)
+        except Exception as e:
+            logger.debug("_fetch_beta_from_bridge (market) failed: %s", e)
 
-            elif not is_listed and category:
-                resp = await client.get(
-                    f"{settings.ba_bridge_url.rstrip('/')}/yahoo/ticker/_/damodaran",
-                    params={"category": category},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return {
-                        "beta_1y":                    data.get("unlevered_beta"),
-                        "beta_3y":                    None,
-                        "volatility_30d":             None,
-                        "beta_source":                "damodaran",
-                        "beta_benchmark":             f"Damodaran · {data.get('sector', '')}",
-                        "beta_benchmark_is_fallback": False,
-                        "beta_calculated_at":         None,
-                        "beta_data_quality":          "full",
-                    }
-                logger.debug("Damodaran miss for category=%s: HTTP %s", category, resp.status_code)
+    if market_beta.get("beta_1y") is not None:
+        # Echtes Markt-Beta vorhanden → das ist das company-Beta.
+        out.update(market_beta)
+    elif out.get("sector_beta") is not None:
+        # Kein Markt-Beta (private ODER listed mit yfinance-Ausfall) → Damodaran-Fallback.
+        # Frontend rendert beta_source='damodaran' bereits mit erklärtem Tooltip.
+        out.update({
+            "beta_1y":                    out["sector_beta"],
+            "beta_3y":                    None,
+            "volatility_30d":             None,
+            "beta_source":                "damodaran",
+            "beta_benchmark":             f"Damodaran · {out.get('sector_beta_label', '')}",
+            "beta_benchmark_is_fallback": False,
+            "beta_calculated_at":         None,
+            "beta_data_quality":          "full",
+            "beta_is_sector_fallback":    True,   # Frontend: "kein company-spezifischer Wert"
+        })
 
-    except Exception as e:
-        logger.debug("_fetch_beta_from_bridge failed: %s", e)
-
-    return {}
+    return out
 
 
 # BETA-REVIEW-01 Folge: Backend-seitiger Push-Throttle gegen Wiederholungs-Pushes
@@ -1103,13 +1166,13 @@ async def _trigger_edgar_kpi_ondemand(
     befüllt ([:50]-Lotterie). Eine frische US-Company bekam Fundamentals erst Tage
     später (oder bei >50 US-Companies nie garantiert) → bricht den One-Click-Anspruch.
 
-    Dreistufiges Gate (billig → teuer), alle drei im Caller geprüft:
+    Dreistufiges Gate (billig → teuer), Stufe 1+2 hier im Caller bereits geprüft:
       1. is_listed         (aus OpenFIGI, kostenlos — Caller-Guard)
       2. US-Heuristik      (_looks_us_listed, kostenlos — Caller-Guard)
-      3. kpi_timeseries-Read: schon edgar_xbrl-Rows? → synchroner Pre-Check im Caller
-         VOR add_task (verhindert unnötige BackgroundTask-Starts bei Warm-Loads).
-         Der Read hier (Stufe 3 im Task) ist nur noch Sicherheitsnetz für Race-Conditions
-         (z.B. zwei parallele Cold-Loads derselben Company — sehr selten).
+      3. kpi_timeseries-Read: schon edgar_xbrl-Rows? → dann NICHT erneut feuern.
+         Verhindert sinnlosen EDGAR-Roundtrip bei jedem Warm-Reload (EDGAR-freundlich,
+         10-req/s-Limit). Idempotenz wäre zwar durch upsert ohnehin gegeben, aber der
+         Read spart den ~1-2s-Task + den ~7MB tickers_map-Download komplett.
     """
     try:
         db = get_supabase()
@@ -1157,6 +1220,11 @@ def _build_fundamentals(
         fd.beta_benchmark_is_fallback = beta.get("beta_benchmark_is_fallback", False)
         fd.beta_calculated_at         = beta.get("beta_calculated_at")
         fd.beta_data_quality          = beta.get("beta_data_quality")
+        fd.beta_is_sector_fallback    = beta.get("beta_is_sector_fallback", False)
+        # Sektor-Beta (YH-04 S49) — eigenständiger Referenzwert, immer durchreichen
+        fd.sector_beta                = beta.get("sector_beta")
+        fd.sector_beta_label          = beta.get("sector_beta_label")
+        fd.sector_beta_source         = beta.get("sector_beta_source")
         # FD-01 Routing — Herkunfts-Badge
         fd.fundamentals_source           = fd_source.get("primary")
         fd.fundamentals_source_secondary = fd_source.get("secondary")
@@ -2351,44 +2419,29 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         )
 
     # EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für frische US-Companies.
-    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier; Stufe 3 (DB-Read) EBENFALLS
-    # hier als synchroner Pre-Check — verhindert, dass bei jedem Warm-Load ein
-    # BackgroundTask gestartet wird, der nur kurz reinläuft und sofort returniert.
-    # Der synchrone Read kostet ~20ms, spart aber den Task-Start + tickers_map-Download
-    # komplett. Nicht-US-Listings (DE/EU) feuern gar nicht erst → EDGAR-DE-CIK gleich mit.
+    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier, Stufe 3 (DB-Read) im Trigger.
+    # BackgroundTask (nicht await): EDGAR-Fetch + tickers_map-Download dauern ~1-2s+,
+    # dürfen die Response nicht blockieren. Beim nächsten Frontend-Poll / Reload liegen
+    # die KPIs vor (analog Beta-Poller). Nicht-US-Listings (DE/EU) feuern gar nicht
+    # erst → fängt EDGAR-DE-CIK gleich mit ab.
     if is_listed and _cid and _looks_us_listed(_beta_ticker_raw, _beta_exchange):
-        try:
-            _db = get_supabase()
-            _edgar_existing = (
-                _db.table("kpi_timeseries")
-                .select("id")
-                .eq("company_id", _cid)
-                .eq("source", "edgar_xbrl")
-                .limit(1)
-                .execute()
-                .data or []
-            )
-        except Exception:
-            _edgar_existing = []  # Im Zweifel queuen (EDGAR-Call ist idempotent)
+        background_tasks.add_task(
+            _trigger_edgar_kpi_ondemand,
+            _cid,
+            company_name,
+            (_beta_ticker_raw or "").split("·")[0].strip() or None,
+            _beta_exchange,
+        )
+        logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
 
-        if not _edgar_existing:
-            _edgar_ticker = (_beta_ticker_raw or "").split("·")[0].strip() or None
-            background_tasks.add_task(
-                _trigger_edgar_kpi_ondemand,
-                _cid,
-                company_name,
-                _edgar_ticker,
-                _beta_exchange,
-            )
-            logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
-        else:
-            logger.debug("EDGAR-OD-01: %s hat bereits edgar_xbrl-Rows — kein Re-Trigger", company_name)
-
-    # yfinance Beta-Fallback: wenn Bridge keinen Cache hat (404) und Company listed
-    # yahoo["yf_beta"] = Yahoos pre-calculated trailing-12M Beta vs. S&P 500
-    # Sofort-Anzeigewert bis der Bridge-Ad-hoc-Enrich (oben) das echte Beta liefert.
-    if not beta.get("beta_1y") and is_listed and yahoo and yahoo.get("yf_beta"):
-        beta = {
+    # yfinance Beta-Fallback: company-spezifisches Yahoo-Beta schlägt das
+    # Damodaran-Sektor-Beta (das _fetch_beta_from_bridge ggf. schon als Fallback in
+    # beta_1y gesetzt hat). Reihenfolge der company-Beta-Präferenz:
+    #   Markt (252T, Bridge)  >  Yahoo (trailing 12M)  >  Damodaran-Sektor (Fallback)
+    # WICHTIG: .update() statt Neuzuweisung — sonst gehen sector_beta-Felder verloren.
+    _has_market = beta.get("beta_source") == "market"
+    if not _has_market and is_listed and yahoo and yahoo.get("yf_beta"):
+        beta.update({
             "beta_1y":                    yahoo["yf_beta"],
             "beta_3y":                    None,
             "volatility_30d":             None,
@@ -2397,7 +2450,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             "beta_benchmark_is_fallback": False,
             "beta_calculated_at":         None,
             "beta_data_quality":          "partial",
-        }
+            "beta_is_sector_fallback":    False,
+        })
         logger.info("Beta Fallback yfinance für %s: β=%.2f", company_name, yahoo["yf_beta"])
 
     # DQ-04: Proxy Beta — Beta des Investment-Instruments (z.B. NEE, CRH) für Tab 1
