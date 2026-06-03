@@ -146,17 +146,35 @@ def _download_excel(url: str) -> bytes:
 
 def _parse_betas(raw: bytes) -> pd.DataFrame:
     """
-    Liest das Blatt 'Industry Averages' aus dem Damodaran-Excel.
+    Findet automatisch das richtige Sheet in Damodarans betas.xls.
+    Sheet 0 ist oft eine Einleitungsseite ('End Game') — daher alle Sheets
+    laden und das erste nehmen, das 'Industry Name' + 'Unlevered beta' enthält.
+
     Relevante Spalten:
         - Industry Name
         - Unlevered beta corrected for cash  (= unlevered_beta)
-        - HiLo Risk                           (= levered_beta, Proxy)
-        - D/E Ratio                           (= d_e_ratio)
+        - Beta / Average Beta                (= levered_beta, Branchen-Ø)
+        - D/E Ratio                          (= d_e_ratio)
 
     Spaltennamen variieren leicht je Jahrgang — daher flexible Suche.
     """
-    df = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=0)
-    df.columns = [str(c).strip() for c in df.columns]
+    all_sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=0)
+    log.info(f"Sheets im Excel: {list(all_sheets.keys())}")
+
+    df = None
+    for sheet_name, sheet_df in all_sheets.items():
+        sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
+        cols_lower = [c.lower() for c in sheet_df.columns]
+        if any("industry" in c or "sector" in c for c in cols_lower) and            any("unlevered" in c for c in cols_lower):
+            log.info(f"Datentabelle gefunden: Sheet '{sheet_name}'")
+            df = sheet_df
+            break
+
+    if df is None:
+        raise ValueError(
+            f"Kein Sheet mit Industry + Unlevered Beta gefunden. "
+            f"Sheets: {list(all_sheets.keys())}"
+        )
 
     log.info(f"Spalten im Excel: {list(df.columns)}")
 
