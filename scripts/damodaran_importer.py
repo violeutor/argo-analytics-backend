@@ -164,12 +164,15 @@ def _parse_betas(raw: bytes) -> pd.DataFrame:
 
     df = None
     for sheet_name, sheet_raw in all_sheets.items():
-        # Header-Zeile: erste Zeile die "industry"/"sector" UND "unlevered" enthält
+        # Header-Zeile: erste Zeile wo eine Zelle EXAKT (oder fast) "Industry Name"
+        # heißt UND eine andere Zelle mit "Unlevered" beginnt (kein Substring-Match
+        # auf langen Beschreibungstexten — Damodaran hat Einleitungszeilen oben).
         header_row = None
         for i, row in sheet_raw.iterrows():
-            vals = [str(v).lower() for v in row.values]
-            if any("industry" in v or "sector" in v for v in vals) and \
-               any("unlevered" in v for v in vals):
+            vals = [str(v).strip() for v in row.values]
+            has_industry = any(v.lower() in ("industry name", "industry", "sector") for v in vals)
+            has_unlevered = any(v.lower().startswith("unlevered") for v in vals)
+            if has_industry and has_unlevered:
                 header_row = i
                 break
         if header_row is not None:
@@ -193,7 +196,7 @@ def _parse_betas(raw: bytes) -> pd.DataFrame:
     # Spaltennamen flexibel matchen
     col_sector    = _find_col(df, ["Industry Name", "Industry", "Sector"])
     col_unlevered = _find_col(df, ["Unlevered beta corrected for cash", "Unlevered Beta", "Unlevered beta"])
-    col_levered   = _find_col(df, ["Beta", "Levered Beta", "Average Beta"])
+    col_levered   = _find_col(df, ["Levered Beta", "Average Levered Beta", "Average Beta", "levered beta"])
     col_de        = _find_col(df, ["D/E Ratio", "Debt/Equity"])
 
     if not col_sector or not col_unlevered:
