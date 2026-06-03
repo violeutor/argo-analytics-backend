@@ -2435,20 +2435,41 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         )
 
     # EDGAR-OD-01: On-Demand EDGAR-KPI-Enrich für frische US-Companies.
-    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) hier, Stufe 3 (DB-Read) im Trigger.
-    # BackgroundTask (nicht await): EDGAR-Fetch + tickers_map-Download dauern ~1-2s+,
-    # dürfen die Response nicht blockieren. Beim nächsten Frontend-Poll / Reload liegen
-    # die KPIs vor (analog Beta-Poller). Nicht-US-Listings (DE/EU) feuern gar nicht
-    # erst → fängt EDGAR-DE-CIK gleich mit ab.
+    # Gate-Stufe 1 (is_listed) + 2 (US-Heuristik) + 3 (edgar_xbrl-DB-Read) ALLE hier im
+    # Caller — Stufe 3 VOR add_task gezogen (S50-Fix): verhindert `queued`-Log-Spam +
+    # unnötigen Task-Start bei jedem Warm-Reload. Vorher lief der edgar_xbrl-Read
+    # INNERHALB des BackgroundTask → Task wurde immer gestartet, fand die Rows, returnte
+    # still (idempotent, kein Schaden, aber Log-Rauschen + ~1-2s Task-Overhead je Poll).
+    # Pre-Check ist ein synchroner ~20ms-Read. Bei Fehler: fail-open (Task starten — der
+    # Trigger hat seinen eigenen Guard als Sicherheitsnetz). BackgroundTask bleibt
+    # nicht-await: EDGAR-Fetch + tickers_map-Download dauern ~1-2s+, dürfen die Response
+    # nicht blockieren. Nicht-US-Listings (DE/EU) feuern gar nicht erst → fängt
+    # EDGAR-DE-CIK gleich mit ab.
     if is_listed and _cid and _looks_us_listed(_beta_ticker_raw, _beta_exchange):
-        background_tasks.add_task(
-            _trigger_edgar_kpi_ondemand,
-            _cid,
-            company_name,
-            (_beta_ticker_raw or "").split("·")[0].strip() or None,
-            _beta_exchange,
-        )
-        logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
+        _edgar_rows_exist = False
+        try:
+            _edgar_rows_exist = bool(
+                get_supabase().table("kpi_timeseries")
+                .select("id")
+                .eq("company_id", _cid)
+                .eq("source", "edgar_xbrl")
+                .limit(1)
+                .execute()
+                .data
+            )
+        except Exception as _e:
+            logger.debug("EDGAR-OD-01 Pre-Check failed für %s: %s — Task wird gestartet (fail-open)", company_name, _e)
+        if _edgar_rows_exist:
+            logger.debug("EDGAR-OD-01: %s hat bereits edgar_xbrl-Rows — kein Re-Trigger (Warm-Load)", company_name)
+        else:
+            background_tasks.add_task(
+                _trigger_edgar_kpi_ondemand,
+                _cid,
+                company_name,
+                (_beta_ticker_raw or "").split("·")[0].strip() or None,
+                _beta_exchange,
+            )
+            logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
 
     # yfinance Beta-Fallback: company-spezifisches Yahoo-Beta schlägt das
     # Damodaran-Sektor-Beta (das _fetch_beta_from_bridge ggf. schon als Fallback in
