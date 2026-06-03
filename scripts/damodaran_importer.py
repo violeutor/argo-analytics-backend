@@ -80,7 +80,7 @@ ARGO_TO_DAMODARAN: dict[str, str] = {
     "Life Sciences & Health":     "Drugs (Pharmaceutical)",
     "Digital Infrastructure":     "Software (System & Application)",
     "Financial Services":         "Financial Svcs. (Non-bank & Insurance)",
-    "Consumer & Commerce":        "Retail (Online)",
+    "Consumer & Commerce":        "Retail (General)",
     "Space & Defense":            "Aerospace/Defense",
     "Water & Circular Economy":   "Environmental & Waste Services",
     "Mining & Resources":         "Metals & Mining",
