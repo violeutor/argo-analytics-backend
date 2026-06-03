@@ -3243,26 +3243,3 @@ async def get_company_scores(name: str):
         "market_score":    cached.get("market_score"),
         "rating":          cached.get("rating"),
     }
-
-
-@router.get("/internal/test/stooq")
-async def test_stooq_connectivity(ticker: str = "nvda.us", apikey: str = ""):
-    """
-    BETA-SOURCE-01: Temporärer Connectivity-Test.
-    Läuft im Service-Prozess — testet ob Stooq von Renders Egress-IP erreichbar ist.
-    Nach positivem/negativem Befund wieder entfernen.
-    Aufruf: GET /api/v1/internal/test/stooq?ticker=nvda.us&apikey=DEIN_KEY
-    """
-    import httpx
-    url = f"https://stooq.com/q/d/l/?s={ticker}&i=d&apikey={apikey}"
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get(url)
-            lines = resp.text.strip().split("\n")[:5]
-            return {
-                "status": resp.status_code,
-                "lines": lines,
-                "ticker": ticker,
-            }
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
