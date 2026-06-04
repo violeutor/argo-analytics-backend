@@ -1563,6 +1563,8 @@ class ResolveResponse(BaseModel):
     resolved_composite_figi: str | None = None  # nur wenn is_listed + OpenFIGI Exchange-Resolution
     resolved_lifecycle_status: str | None = None  # DISAMBIG-03 — für still-gebundene Picks
     resolved_consolidated_into: str | None = None # DISAMBIG-03 — Referenz auf Nachfolge-Einheit
+    resolved_consolidated_into_id: str | None = None  # Wikidata-QID der Nachfolge-Einheit
+    resolved_dissolved_year: int | None = None        # P576 — für Referenz-String
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1701,6 +1703,12 @@ async def resolve_company(name: str) -> ResolveResponse:
         ),
         resolved_consolidated_into=(
             result.resolved.consolidated_into if result.resolved else None
+        ),
+        resolved_consolidated_into_id=(
+            result.resolved.consolidated_into_id if result.resolved else None
+        ),
+        resolved_dissolved_year=(
+            int(result.resolved.dissolved_year) if result.resolved and result.resolved.dissolved_year else None
         ),
         candidates=[
             ResolveCandidate(
