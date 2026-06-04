@@ -89,10 +89,54 @@ def upsert_ticker_yf(company_id: str, ticker_yf: str) -> None:
 _client: Client | None = None
 
 
+def _strip_bearer_authorization(client: Client) -> None:
+    """
+    RLS-HARDENING-01: Die neuen sb_secret_-Keys sind KEINE JWTs.
+
+    supabase-py setzt beim create_client beide Header identisch:
+        apikey:        <key>
+        Authorization: Bearer <key>
+
+    Beim Legacy-service_role-JWT liest PostgREST die Rolle aus dem Bearer-JWT
+    und bypassed RLS. Beim neuen sb_secret_-Key ist der Bearer KEIN JWT →
+    PostgREST lehnt mit 401 ab, selbst wenn apikey == Authorization (genau das
+    war der „KEY issue"-Log + 401 Backend / 502 Frontend). Der Gateway mappt den
+    sb_secret_-Key bereits über den apikey-Header auf service_role (BYPASSRLS);
+    der Authorization-Header muss daher LEER sein.
+
+    Wir entfernen den Authorization-Header defensiv auf allen Sub-Clients.
+    Relevant ist postgrest (.table()); storage/functions werden hier nicht
+    genutzt, aber sicherheitshalber mitbehandelt.
+    """
+    for attr in ("postgrest", "storage", "functions"):
+        sub = getattr(client, attr, None)
+        if sub is None:
+            continue
+        session = getattr(sub, "session", None) or getattr(sub, "_session", None)
+        headers = getattr(session, "headers", None)
+        if headers is not None:
+            headers.pop("Authorization", None)
+
+
 def get_supabase() -> Client:
     global _client
     if _client is None:
-        _client = create_client(settings.supabase_url, settings.supabase_service_key)
+        key     = settings.supabase_service_key
+        _client = create_client(settings.supabase_url, key)
+
+        # Neue sb_secret_/sb_publishable_-Keys: Bearer-Header strippen (kein JWT).
+        # Legacy-JWT (eyJ...): unverändert lassen.
+        # → Vollständiger Rollback per env-Var, KEINE Code-Änderung nötig:
+        #   SUPABASE_SERVICE_KEY zurück auf den Legacy-service_role-JWT setzen.
+        if key.startswith(("sb_secret_", "sb_publishable_")):
+            _strip_bearer_authorization(_client)
+            logger.info(
+                "get_supabase: neuer API-Key erkannt (%s…) — Authorization-Bearer entfernt",
+                key[:12],
+            )
+        else:
+            logger.info("get_supabase: Legacy-JWT-Key erkannt — Header unverändert")
+
     return _client
 
 
