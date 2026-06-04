@@ -11,6 +11,7 @@ Changes vs v2.6:
 import logging
 import asyncio
 import time
+import re
 import httpx
 from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks
