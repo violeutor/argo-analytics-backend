@@ -56,7 +56,7 @@ from src.services.enrichment import (
     EnrichmentResult,
     _is_likely_german,
 )
-from src.services.openfigi_resolver import resolve_entity, FigiCandidate
+from src.services.wikidata_resolver import resolve_entity, WikidataCandidate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["company"])
@@ -342,6 +342,32 @@ def _resolve_is_listed(company: dict) -> bool:
     if company.get("ticker"):
         return True
     return False
+
+
+# DISAMBIG-03: Rechtsform-Heuristik als unabhängige zweite Schicht.
+# Greift wenn Wikidata kein is_listed-Signal liefert (kein Eintrag → 0 Kandidaten).
+# Rechtsformen die per Definition NICHT börsennotiert sind → is_listed=False ableitbar
+# allein aus dem Namen, ohne externe Quelle. GmbH/Ltd/Inc/LLC etc. sind private Formen;
+# AG/SE/PLC KÖNNEN gelistet sein (aber müssen nicht) → kein Negativ-Schluss dort.
+_PRIVATE_LEGAL_FORMS = re.compile(
+    r"\b(GmbH|mbH|UG|GbR|OHG|KG(?!aA)|e\.?\s?V\.?|e\.?\s?G\.?|"
+    r"LLC|LLP|LP|Ltd|Limited|Inc|Incorporated|Corp(?!oration\b)|"
+    r"Pty|BV|Sarl|SAS)\b",
+    re.IGNORECASE,
+)
+
+
+def _infer_private_from_legal_form(name: str) -> bool | None:
+    """
+    True  → Name trägt eine eindeutig private Rechtsform (GmbH, Ltd, Inc, LLC …)
+    None  → keine eindeutige Aussage (AG/SE/PLC können gelistet sein, oder keine Form)
+
+    Bewusst KEIN 'False'-Rückgabewert: Eine AG ist nicht automatisch gelistet.
+    Der Negativ-Schluss (private) ist sicher; der Positiv-Schluss (listed) nicht.
+    """
+    if name and _PRIVATE_LEGAL_FORMS.search(name):
+        return True   # private
+    return None       # unbekannt — Wikidata/OpenFIGI entscheiden
 
 
 def _resolve_investment_path(company: dict) -> str | None:
@@ -1488,24 +1514,30 @@ def _get_fundamentals_source(
 # R1-Schutz: DB-Treffer (warm) → sofort show_modal=false, KEIN GLEIF-Call.
 # GLEIF feuert ausschließlich im Cold-Path (Company unbekannt).
 class ResolveCandidate(BaseModel):
-    figi: str
+    wikidata_id: str
     name: str
     legal_name: str | None = None
+    display_name: str | None = None
+    is_listed: bool = False          # direkt aus Wikidata P414 — kein nachgelagerter Guess
+    is_subsidiary: bool = False      # True wenn über P749 (Tochter) gefunden
+    parent_name: str | None = None   # Name der Muttergesellschaft (für Modal-Anzeige)
     ticker: str | None = None
-    exchange: str | None = None
+    exchange_label: str | None = None
     display_exchange: str | None = None
-    security_type: str | None = None
-    isin: str | None = None
+    headquarters: str | None = None
+    founded_year: str | None = None
 
 
 class ResolveResponse(BaseModel):
     query: str
     show_modal: bool
     resolved_name: str | None = None
-    resolved_isin: str | None = None
+    resolved_is_listed: bool | None = None   # direkt gesetzt — kein Downstream-Guess
+    resolved_wikidata_id: str | None = None  # für Enrichment-Downstream
     resolved_ticker: str | None = None
     resolved_exchange: str | None = None
-    resolved_composite_figi: str | None = None   # DISAMBIG-01: für Exchange-Resolution in Phase A
+    resolved_isin: str | None = None         # best-effort via EN-11, nicht Pflicht
+    resolved_composite_figi: str | None = None  # nur wenn is_listed + OpenFIGI Exchange-Resolution
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1514,20 +1546,33 @@ class ResolveResponse(BaseModel):
 async def resolve_company(name: str) -> ResolveResponse:
     q = name.lower().replace("-", " ").replace("_", " ").strip()
 
-    # 1. Warm-Path: Company bereits in DB mit geklärter Identität (ISIN vorhanden).
+    # 1. Warm-Path: Company bereits in DB mit geklärter Identität.
+    #    Gate: ticker (listed) ODER explizit is_listed=false (private, kein ticker erwartet).
+    #    Verhindert unnötigen Wikidata-Call für bekannte Entities.
     try:
         _db = get_supabase()
-        _hits = _db.table("companies").select("name,isin,ticker,exchange,composite_figi").ilike("name", q).limit(1).execute().data or []
+        _hits = (
+            _db.table("companies")
+            .select("name,isin,ticker,exchange,composite_figi,is_listed")
+            .ilike("name", q)
+            .limit(1)
+            .execute()
+            .data or []
+        )
         if _hits:
             hit = _hits[0]
-            if hit.get("isin"):
+            _is_listed = hit.get("is_listed")
+            _ticker = hit.get("ticker")
+            # Identität gilt als geklärt wenn: listed + ticker gesetzt ODER explizit private
+            if (_is_listed and _ticker) or (_is_listed is False):
                 return ResolveResponse(
                     query=name,
                     show_modal=False,
                     resolved_name=hit.get("name"),
-                    resolved_isin=hit.get("isin"),
-                    resolved_ticker=hit.get("ticker"),
+                    resolved_is_listed=_is_listed,
+                    resolved_ticker=_ticker,
                     resolved_exchange=hit.get("exchange"),
+                    resolved_isin=hit.get("isin"),
                     resolved_composite_figi=hit.get("composite_figi"),
                     candidates=[],
                     reason="db_hit",
@@ -1535,44 +1580,62 @@ async def resolve_company(name: str) -> ResolveResponse:
     except Exception as exc:
         logger.warning("resolve DB-Check failed für '%s': %s", name, exc)
 
-    # 2. Cold-Path: OpenFIGI Entity-Resolution.
+    # 2. Cold-Path: Wikidata Entity-Resolution (listed + private + Töchter).
     try:
         result = await resolve_entity(name)
     except Exception as exc:
-        logger.warning("OpenFIGI resolve failed für '%s': %s — fallthrough ohne Modal", name, exc)
-        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="figi_error")
+        logger.warning(
+            "Wikidata resolve failed für '%s': %s — fallthrough ohne Modal", name, exc
+        )
+        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="wikidata_error")
 
-    # C: Exchange nur durchreichen wenn es ein ECHTER Handelsplatz ist.
-    # display_exchange mappt bekannte exchCodes (GY→XETRA, UN→NYSE). Bei Composite-/
-    # Pseudo-Codes (QT) bleibt display_exchange == exchange → kein Venue → None.
-    # Verhindert dass "QT" als Pseudo-Exchange in companies.exchange landet.
-    _resolved_exchange = None
-    if result.resolved:
-        _dx = result.resolved.display_exchange
-        if _dx and _dx != result.resolved.exchange:
-            _resolved_exchange = _dx
+    # 3. Für listed Candidates: Exchange-Resolution via OpenFIGI (composite_figi → Suffix).
+    #    Nur wenn eindeutig aufgelöst + is_listed — kein OpenFIGI-Call für Private.
+    resolved_composite_figi: str | None = None
+    resolved_exchange: str | None = None
+    if result.resolved and result.resolved.is_listed:
+        try:
+            from src.services.openfigi_resolver import resolve_entity as figi_resolve
+            figi_result = await figi_resolve(
+                result.resolved.legal_name or result.resolved.name
+            )
+            if figi_result.resolved:
+                resolved_composite_figi = figi_result.resolved.composite_figi
+                _dx = figi_result.resolved.display_exchange
+                if _dx and _dx != figi_result.resolved.exchange:
+                    resolved_exchange = _dx
+            logger.debug(
+                "OpenFIGI Exchange-Resolution für '%s': composite=%s exchange=%s",
+                result.resolved.display_name, resolved_composite_figi, resolved_exchange,
+            )
+        except Exception as exc:
+            logger.debug("OpenFIGI Exchange-Resolution failed: %s", exc)
 
     return ResolveResponse(
         query=result.query,
         show_modal=result.show_modal,
-        # Kanonischer Name = normalisierter Legal Name aus dem Bloomberg-Instrumentennamen
-        # ("BAYER AG-REG" → "Bayer AG"). Findbar für Wikipedia/Wikidata/HAI, anders als
-        # der rohe Instrumentenname UND anders als der unscharfe User-Input ("Bayer").
-        resolved_name=result.resolved.legal_name if result.resolved else None,
-        resolved_isin=result.resolved.isin if result.resolved else None,
+        resolved_name=result.resolved.display_name if result.resolved else None,
+        resolved_is_listed=result.resolved.is_listed if result.resolved else None,
+        resolved_wikidata_id=result.resolved.wikidata_id if result.resolved else None,
         resolved_ticker=result.resolved.ticker if result.resolved else None,
-        resolved_exchange=_resolved_exchange,
-        resolved_composite_figi=result.resolved.composite_figi if result.resolved else None,
+        resolved_exchange=resolved_exchange or (
+            result.resolved.display_exchange if result.resolved else None
+        ),
+        resolved_composite_figi=resolved_composite_figi,
         candidates=[
             ResolveCandidate(
-                figi=c.figi,
+                wikidata_id=c.wikidata_id,
                 name=c.name,
                 legal_name=c.legal_name,
+                display_name=c.display_name,
+                is_listed=c.is_listed,
+                is_subsidiary=c.is_subsidiary,
+                parent_name=c.parent_name,
                 ticker=c.ticker,
-                exchange=c.exchange,
+                exchange_label=c.exchange_label,
                 display_exchange=c.display_exchange,
-                security_type=c.security_type,
-                isin=c.isin,
+                headquarters=c.headquarters,
+                founded_year=c.founded_year,
             )
             for c in result.candidates
         ],
@@ -1581,7 +1644,12 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None) -> CompanyDetailResponse:
+    """
+    is_listed_hint: vom Frontend nach /resolve gesetzt (resolved_is_listed).
+    Wird in den Insert übernommen wenn Company noch nicht in DB.
+    Überschreibt _resolve_is_listed() NICHT für Warm-Path (DB-Wert hat Vorrang).
+    """
     warnings: list[str] = []
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
@@ -1669,6 +1737,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 _insert["ticker"] = ticker
             if exchange:
                 _insert["exchange"] = exchange
+            # DISAMBIG-03: is_listed_hint kommt aus Wikidata P414 via /resolve —
+            # private Companies (is_listed=False) brauchen keinen Ticker/ISIN-Guard mehr.
+            # Zweite Schicht: Rechtsform-Heuristik greift wenn Wikidata kein Signal gab
+            # (kein Eintrag → is_listed_hint=None). "xy GmbH" → private, ohne externe Quelle.
+            _effective_listed_hint = is_listed_hint
+            if _effective_listed_hint is None:
+                if _infer_private_from_legal_form(name) is True:
+                    _effective_listed_hint = False
+                    logger.info(
+                        "DISAMBIG-03: '%s' via Rechtsform als private erkannt (kein Wikidata-Signal)",
+                        name,
+                    )
+            if _effective_listed_hint is False:
+                _insert["ipo_status"] = "pre_ipo_medium"  # Private-Pfad sofort korrekt
+            elif _effective_listed_hint is True and ticker:
+                _insert["ipo_status"] = "listed"
             # DISAMBIG-01: compositeFIGI aus URL-Param (kommt vom /resolve-Endpoint
             # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
             if composite_figi:
@@ -1683,7 +1767,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     company_name = company["name"]
 
     # 2. is_listed — robust (B-05)
+    # is_listed_hint aus /resolve überschreibt _resolve_is_listed() NUR wenn DB-Wert
+    # noch nicht gesetzt (Cold-Path, frischer Insert). Warm-Path: DB hat Vorrang.
     is_listed = _resolve_is_listed(company)
+    if not is_listed and is_listed_hint is True and ticker:
+        is_listed = True   # Frontend-Hint für frisch gelistete Company ohne DB-Eintrag
     proxy = company.get("proxy_ticker")
     logger.warning("TICKER_DEBUG %s — ticker=%s exchange=%s proxy_ticker=%s is_listed=%s", company_name, company.get("ticker"), company.get("exchange"), proxy, is_listed)
 
