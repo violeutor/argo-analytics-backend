@@ -1530,7 +1530,7 @@ class ResolveCandidate(BaseModel):
     name: str
     legal_name: str | None = None
     display_name: str | None = None
-    is_listed: bool = False          # direkt aus Wikidata P414 — kein nachgelagerter Guess
+    is_listed: bool = False          # aus Wikidata P31→Q6881511 (publicly traded company)
     is_subsidiary: bool = False      # True wenn über P749 (Tochter) gefunden
     parent_name: str | None = None   # Name der Muttergesellschaft (für Modal-Anzeige)
     ticker: str | None = None
@@ -1538,6 +1538,12 @@ class ResolveCandidate(BaseModel):
     display_exchange: str | None = None
     headquarters: str | None = None
     founded_year: str | None = None
+    # DISAMBIG-03 Lifecycle — fürs Modal: "Tochter von Bayer · 2018 aufgegangen in …"
+    lifecycle_status: str = "active"     # active | delisted | acquired | defunct
+    consolidated_into: str | None = None      # P7888 — überlebende Einheit (Referenz)
+    consolidated_into_id: str | None = None   # P7888 QID — Pointer für Re-Resolve
+    dissolved_year: str | None = None         # P576 — Auflösungsjahr
+    formerly_listed: bool = False             # P414 historisch + is_listed=False
 
 
 class ResolveResponse(BaseModel):
@@ -1550,6 +1556,8 @@ class ResolveResponse(BaseModel):
     resolved_exchange: str | None = None
     resolved_isin: str | None = None         # best-effort via EN-11, nicht Pflicht
     resolved_composite_figi: str | None = None  # nur wenn is_listed + OpenFIGI Exchange-Resolution
+    resolved_lifecycle_status: str | None = None  # DISAMBIG-03 — für still-gebundene Picks
+    resolved_consolidated_into: str | None = None # DISAMBIG-03 — Referenz auf Nachfolge-Einheit
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1676,10 +1684,19 @@ async def resolve_company(name: str) -> ResolveResponse:
         resolved_is_listed=result.resolved.is_listed if result.resolved else None,
         resolved_wikidata_id=result.resolved.wikidata_id if result.resolved else None,
         resolved_ticker=result.resolved.ticker if result.resolved else None,
+        # DISAMBIG-03: Live-Exchange nur durchreichen wenn aktuell börsennotiert.
+        # Eine delisted/acquired Entity trägt P414 nur historisch → kein Yahoo-Treiber.
         resolved_exchange=resolved_exchange or (
-            result.resolved.display_exchange if result.resolved else None
+            result.resolved.display_exchange
+            if (result.resolved and result.resolved.is_listed) else None
         ),
         resolved_composite_figi=resolved_composite_figi,
+        resolved_lifecycle_status=(
+            result.resolved.lifecycle_status if result.resolved else None
+        ),
+        resolved_consolidated_into=(
+            result.resolved.consolidated_into if result.resolved else None
+        ),
         candidates=[
             ResolveCandidate(
                 wikidata_id=c.wikidata_id,
@@ -1694,6 +1711,11 @@ async def resolve_company(name: str) -> ResolveResponse:
                 display_exchange=c.display_exchange,
                 headquarters=c.headquarters,
                 founded_year=c.founded_year,
+                lifecycle_status=c.lifecycle_status,
+                consolidated_into=c.consolidated_into,
+                consolidated_into_id=c.consolidated_into_id,
+                dissolved_year=c.dissolved_year,
+                formerly_listed=c.formerly_listed,
             )
             for c in result.candidates
         ],
@@ -1791,14 +1813,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             }
             if isin:
                 _insert["isin"] = isin
-            if ticker:
-                _insert["ticker"] = ticker
-            if exchange:
-                _insert["exchange"] = exchange
-            # DISAMBIG-03: is_listed_hint kommt aus Wikidata P414 via /resolve —
-            # private Companies (is_listed=False) brauchen keinen Ticker/ISIN-Guard mehr.
-            # Zweite Schicht: Rechtsform-Heuristik greift wenn Wikidata kein Signal gab
-            # (kein Eintrag → is_listed_hint=None). "xy GmbH" → private, ohne externe Quelle.
+            # DISAMBIG-03: effektiven Listed-Hint ZUERST bestimmen — ticker/exchange-
+            # Persistenz hängt davon ab.
+            #   is_listed_hint: aus Wikidata via /resolve (P31→Q6881511).
+            #   Zweite Schicht: Rechtsform-Heuristik wenn Wikidata kein Signal gab
+            #   (kein Eintrag → None). "xy GmbH" → private, ohne externe Quelle.
             _effective_listed_hint = is_listed_hint
             if _effective_listed_hint is None:
                 if _infer_private_from_legal_form(name) is True:
@@ -1807,6 +1826,18 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                         "DISAMBIG-03: '%s' via Rechtsform als private erkannt (kein Wikidata-Signal)",
                         name,
                     )
+            # DISAMBIG-03 Lifecycle: ticker/exchange sind LIVE-Felder. Bei einer explizit
+            # privaten ODER aufgegangenen Entity (is_listed_hint=False) dürfen sie NICHT
+            # geschrieben werden:
+            #   - ein historischer Ticker (Monsanto: MON) würde die generated column
+            #     is_listed (ticker IS NOT NULL) fälschlich auf True ziehen,
+            #   - ein historischer Exchange (NYSE) würde Yahoo-Lookups ins Leere treiben
+            #     und den widersprüchlichen Datensatz erzeugen (exchange ohne ticker,
+            #     is_listed=False), den der Bayer→Monsanto-Test aufgedeckt hat.
+            if ticker and _effective_listed_hint is not False:
+                _insert["ticker"] = ticker
+            if exchange and _effective_listed_hint is not False:
+                _insert["exchange"] = exchange
             if _effective_listed_hint is False:
                 _insert["ipo_status"] = "pre_ipo_medium"  # Private-Pfad sofort korrekt
             elif _effective_listed_hint is True and ticker:
