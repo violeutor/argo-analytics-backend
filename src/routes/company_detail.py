@@ -327,19 +327,30 @@ def _parse_headcount(value: str | None) -> int | None:
 
 def _resolve_is_listed(company: dict) -> bool:
     """
-    Robust listing detection — v2.2.
-    A company is considered listed if:
-      1. ipo_status == 'listed'  (canonical field, migration_003)
-      2. ipo_potential == 'IPO erfolgt'  (legacy fallback)
+    Robust listing detection — v2.3 (COL-ISLISTED-01).
+
+    Vorrang: companies.is_listed (generated column) wenn im dict vorhanden.
+    Fallback: Ableitung aus den Quellspalten — für Code-Pfade die ein
+    company-dict ohne is_listed-Feld haben (z.B. Teilprojektionen im Select).
+
+    Listed wenn:
+      1. is_listed (DB generated column)  — bevorzugt, Single Source of Truth
+      2. ipo_status == 'listed'           (kanonisch, migration_003)
+      3. ipo_potential == 'IPO erfolgt'   (Legacy: Ticker-Resultat, flippt false→true)
+      4. ticker gesetzt                   (eigener Ticker = selbst börsennotiert)
 
     NOTE: investment_path == 'IPO' deliberately NOT used here —
     that value means pre-IPO candidate, not yet listed.
     """
+    # DB-Spalte hat Vorrang — generated column, garantiert konsistent
+    _col = company.get("is_listed")
+    if _col is not None:
+        return bool(_col)
+    # Fallback: aus Quellspalten ableiten (dict ohne is_listed-Projektion)
     if company.get("ipo_status") == "listed":
         return True
     if company.get("ipo_potential") == "IPO erfolgt":
         return True
-    # Fallback: eigener Ticker in DB gesetzt → Company ist selbst börsennotiert
     if company.get("ticker"):
         return True
     return False
@@ -1548,8 +1559,8 @@ async def resolve_company(name: str) -> ResolveResponse:
     q = name.lower().replace("-", " ").replace("_", " ").strip()
 
     # 1. Warm-Path: Company bereits in DB mit geklärter Identität.
-    #    Gate: ticker (listed) ODER explizit is_listed=false (private, kein ticker erwartet).
-    #    Verhindert unnötigen Wikidata-Call für bekannte Entities.
+    #    Gate: ticker (listed) ODER explizit private (is_listed=false).
+    #    is_listed ist jetzt generated column (COL-ISLISTED-01) — direkt lesbar.
     try:
         _db = get_supabase()
         _hits = (
@@ -1564,7 +1575,8 @@ async def resolve_company(name: str) -> ResolveResponse:
             hit = _hits[0]
             _is_listed = hit.get("is_listed")
             _ticker = hit.get("ticker")
-            # Identität gilt als geklärt wenn: listed + ticker gesetzt ODER explizit private
+            # Identität geklärt wenn: listed + ticker gesetzt ODER explizit private.
+            # is_listed=False ist bei generated column ein echtes Signal (nicht NULL).
             if (_is_listed and _ticker) or (_is_listed is False):
                 return ResolveResponse(
                     query=name,
@@ -1589,6 +1601,51 @@ async def resolve_company(name: str) -> ResolveResponse:
             "Wikidata resolve failed für '%s': %s — fallthrough ohne Modal", name, exc
         )
         return ResolveResponse(query=name, show_modal=False, candidates=[], reason="wikidata_error")
+
+    # 2b. Wikidata-Degraded-Fallback: bei Rate-Limit/Outage (resolver_degraded) auf
+    #     OpenFIGI zurückfallen — der bewährte Listed-Resolver. Verhindert, dass eine
+    #     börsennotierte Company (Bayer) bei Wikidata-Ausfall stumm als private
+    #     angelegt wird. OpenFIGI kennt nur Listed → private Companies fallen hier
+    #     korrekt durch in den privaten Flow (kein FIGI-Match = kein Ticker).
+    if result.reason == "resolver_degraded":
+        logger.info("Wikidata degraded für '%s' — Fallback auf OpenFIGI", name)
+        try:
+            from src.services.openfigi_resolver import resolve_entity as figi_resolve
+            figi_result = await figi_resolve(name)
+            if figi_result.resolved or figi_result.candidates:
+                # OpenFIGI hat Listed-Treffer → mappe auf ResolveResponse
+                _r = figi_result.resolved
+                _fig_exchange = None
+                if _r and _r.display_exchange and _r.display_exchange != _r.exchange:
+                    _fig_exchange = _r.display_exchange
+                return ResolveResponse(
+                    query=name,
+                    show_modal=figi_result.show_modal,
+                    resolved_name=_r.legal_name if _r else None,
+                    resolved_is_listed=True if _r else None,  # OpenFIGI = nur Listed
+                    resolved_ticker=_r.ticker if _r else None,
+                    resolved_exchange=_fig_exchange,
+                    resolved_isin=_r.isin if _r else None,
+                    resolved_composite_figi=_r.composite_figi if _r else None,
+                    candidates=[
+                        ResolveCandidate(
+                            wikidata_id="",   # OpenFIGI-Fallback hat keine QID
+                            name=c.name,
+                            legal_name=c.legal_name,
+                            display_name=c.legal_name,
+                            is_listed=True,
+                            ticker=c.ticker,
+                            display_exchange=c.display_exchange,
+                        )
+                        for c in figi_result.candidates
+                    ],
+                    reason="openfigi_fallback",
+                )
+        except Exception as exc:
+            logger.warning("OpenFIGI-Fallback failed für '%s': %s", name, exc)
+        # OpenFIGI auch leer → kein Listed-Treffer. Rechtsform-Heuristik in /company
+        # (is_listed_hint=None) entscheidet dann private vs. unbekannt.
+        return ResolveResponse(query=name, show_modal=False, candidates=[], reason="resolver_degraded")
 
     # 3. Für listed Candidates: Exchange-Resolution via OpenFIGI (composite_figi → Suffix).
     #    Nur wenn eindeutig aufgelöst + is_listed — kein OpenFIGI-Call für Private.
