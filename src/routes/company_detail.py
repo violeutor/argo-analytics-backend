@@ -243,6 +243,11 @@ class CompanyDetailResponse(BaseModel):
     ipo_status: str | None          # listed | pre_ipo_high | pre_ipo_medium | pre_ipo_low
     ipo_potential: str | None       # legacy label für Frontend-Anzeige
     ipo_probability_pct: int | None
+    # DISAMBIG-03 Lifecycle (LIFECYCLE-01)
+    lifecycle_status: str = "active"          # active | delisted | acquired | defunct
+    consolidated_into: str | None = None      # Anzeigename der überlebenden Einheit (Referenz)
+    consolidated_into_id: str | None = None   # Wikidata-QID — Navigation/Re-Resolve
+    dissolved_year: int | None = None         # P576 — für Referenz-String
     # Market
     tam_usd_bn: float
     tam_source: str
@@ -1724,7 +1729,7 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None, lifecycle_status: str | None = None, consolidated_into_id: str | None = None, consolidated_into_name: str | None = None, dissolved_year: int | None = None) -> CompanyDetailResponse:
     """
     is_listed_hint: vom Frontend nach /resolve gesetzt (resolved_is_listed).
     Wird in den Insert übernommen wenn Company noch nicht in DB.
@@ -1846,6 +1851,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             # via Frontend) persistieren — ermöglicht Exchange-Resolution in Phase A.
             if composite_figi:
                 _insert["composite_figi"] = composite_figi
+            # DISAMBIG-03 Lifecycle (LIFECYCLE-01): aus /resolve via Frontend durchgereicht.
+            # Whitelist gegen die CHECK-Constraint — nie Garbage in den Insert.
+            _LIFECYCLE_OK = {"active", "delisted", "acquired", "defunct"}
+            if lifecycle_status in _LIFECYCLE_OK and lifecycle_status != "active":
+                _insert["lifecycle_status"] = lifecycle_status   # 'active' = DB-Default
+            if consolidated_into_id:
+                _insert["consolidated_into_id"] = consolidated_into_id
+            if consolidated_into_name:
+                _insert["consolidated_into_name"] = consolidated_into_name
+            if dissolved_year:
+                _insert["dissolved_year"] = int(dissolved_year)  # SMALLINT — vgl. founded-str-Hotfix
             result = db.table("companies").insert(_insert).execute()
             company = result.data[0] if result.data else {"name": name}
             warnings.append(f"'{name}' war nicht in der Datenbank — wird gerade angereichert.")
@@ -3240,6 +3256,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         ipo_status=ipo_status,
         ipo_potential=company.get("ipo_potential"),
         ipo_probability_pct=_ipo_probability(ipo_status, company.get("ipo_potential")),
+        lifecycle_status=company.get("lifecycle_status") or "active",
+        consolidated_into=company.get("consolidated_into_name"),
+        consolidated_into_id=company.get("consolidated_into_id"),
+        dissolved_year=company.get("dissolved_year"),
         tam_usd_bn=tam["tam_usd_bn"],
         tam_source=tam.get("source",""),
         tam_confidence=tam.get("confidence","medium"),
