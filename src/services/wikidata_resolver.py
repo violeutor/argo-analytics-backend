@@ -376,6 +376,37 @@ async def _run_sparql(client: httpx.AsyncClient, query: str) -> tuple[list[dict]
         return [], False
 
 
+# ── DISAMBIG-OUTAGE-01: Retry/Backoff für die Direct-Query ───────────────────
+# Im wdqs "1 req/min"-Outage-Fenster ist ein einzelner Versuch oft Pech-abhängig
+# (gerade ein anderer Request im selben Fenster). Ein kurzer Retry mit Backoff
+# gibt der EINEN entscheidenden Query (Direct) eine realistische Chance, ohne den
+# Happy-Path nennenswert zu verlangsamen (1. Versuch klappt → kein Sleep).
+# Nur HTTP-/Transport-Fehler (ok=False) werden wiederholt — ein echtes ok=True
+# mit 0 Treffern ist kein Fehler und wird sofort durchgereicht.
+_RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 4.0)  # 2 Retries → max ~6s Zusatz im Worst Case
+_SUBSIDIARY_DELAY_S: float = 0.3  # Mini-Pause vor Subsidiary, schont Rate-Limit
+
+
+async def _run_sparql_with_retry(
+    client: httpx.AsyncClient, query: str
+) -> tuple[list[dict], bool]:
+    """
+    _run_sparql mit Backoff-Retry bei ok=False (Transport/429/Outage).
+    Gibt beim ersten ok=True sofort zurück. Reihenfolge der Backoffs aus
+    _RETRY_BACKOFFS_S — leere Tuple = kein Retry (Verhalten = _run_sparql).
+    """
+    rows, ok = await _run_sparql(client, query)
+    if ok:
+        return rows, ok
+    for delay in _RETRY_BACKOFFS_S:
+        logger.debug("Wikidata Direct-Query retry in %.1fs (vorheriger Versuch ok=False)", delay)
+        await asyncio.sleep(delay)
+        rows, ok = await _run_sparql(client, query)
+        if ok:
+            return rows, ok
+    return rows, ok
+
+
 def _deduplicate(candidates: list[WikidataCandidate]) -> list[WikidataCandidate]:
     """
     Selbe Entity kann aus Direct- und Subsidiary-Query kommen → dedup by wikidata_id.
@@ -445,35 +476,44 @@ async def resolve_entity(
             public_class=_PUBLIC_CO_CLASS,
         )
 
-        # Beide Queries parallel — maximale Geschwindigkeit
-        (direct_rows, direct_ok), (subsidiary_rows, subsidiary_ok) = await asyncio.gather(
-            _run_sparql(client, direct_q),
-            _run_sparql(client, subsidiary_q),
-        )
+        # ── DISAMBIG-OUTAGE-01: Serialisiert statt parallel ──────────────────
+        # Vorher: asyncio.gather(direct, subsidiary) — beide gleichzeitig.
+        # Problem: Während des wdqs "1 req/min"-Outage-Fensters killt der
+        # Doppelschuss BEIDE Queries (die zweite ist garantiert über dem Limit,
+        # die erste oft durch Vor-Requests). Resultat: resolver_degraded, obwohl
+        # Wikidata einzelne Queries durchaus bedient (Enrichment-Single-Query 200 OK).
+        #
+        # Jetzt: Direct zuerst (mit Retry/Backoff), Subsidiary NUR wenn Direct ok.
+        # - Direct ist die einzige Query, die die gesuchte Entität selbst liefert.
+        #   Scheitert sie, ist alles weitere strukturell unvollständig → degraded.
+        #   Die Subsidiary-Query dann gar nicht erst feuern (spart Rate-Budget).
+        # - Ein Direct-Erfolg landet via _cache_set im 24h-Cache → ab dann zeigt
+        #   jeder Folge-Load das Modal, auch wenn Wikidata wieder 429t.
+        #
+        # Trade-off: Happy-Path ~100–150ms langsamer (sequenziell statt parallel).
+        # Bei funktionierendem Wikidata vernachlässigbar; im Outage der einzige Weg
+        # zu einem belastbaren Ergebnis.
+        direct_rows, direct_ok = await _run_sparql_with_retry(client, direct_q)
+
+        if not direct_ok:
+            # Subsidiary gar nicht feuern — würde im Outage nur Rate-Budget verbrennen
+            # und kann die fehlende Hauptentität ohnehin nicht ersetzen.
+            logger.warning(
+                "Wikidata resolve '%s': Direct-Query degraded (ok=False, Subsidiary übersprungen) "
+                "→ resolver_degraded (OpenFIGI-Fallback)",
+                query,
+            )
+            return WikidataResolutionResult(query, [], False, None, "resolver_degraded")
+
+        # Direct ok → Subsidiary-Query feuern (kurze Pause schont das Rate-Limit
+        # im Outage-Fenster; ohne Outage ist die Pause irrelevant).
+        await asyncio.sleep(_SUBSIDIARY_DELAY_S)
+        subsidiary_rows, subsidiary_ok = await _run_sparql(client, subsidiary_q)
 
         logger.info(
             "Wikidata resolve '%s': %d direct (ok=%s) + %d subsidiary (ok=%s) rows",
             query, len(direct_rows), direct_ok, len(subsidiary_rows), subsidiary_ok,
         )
-
-        # Degraded-Erkennung (Option 2): Die Direct-Query ist die EINZIGE, die die
-        # gesuchte Entität selbst (Mutterkonzern / Haupteintrag) liefern kann.
-        # Scheitert sie (Timeout/429/Outage → ok=False), ist die Kandidatenmenge
-        # strukturell unvollständig — der prominenteste Treffer (z.B. Bayer AG) könnte
-        # fehlen. Dann NICHT stumm eine Tochter-only-Liste zeigen, sondern an den
-        # OpenFIGI-Fallback in company_detail übergeben (bewährter Listed-Resolver).
-        #
-        # Abgrenzung: direct_ok=True + 0 Treffer = ECHTES Leer (legitimer Marken-/
-        # Eigentümer-Fall, z.B. eine Marke die selbst keine Entität ist aber Töchter
-        # hat) → kein degraded, Töchter werden gezeigt. Genau diese Unterscheidung
-        # war vorher unmöglich (Fehler sah aus wie Leere → Bayer AG verschwand).
-        if not direct_ok:
-            logger.warning(
-                "Wikidata resolve '%s': Direct-Query degraded (ok=False, subsidiary_ok=%s) "
-                "→ resolver_degraded (OpenFIGI-Fallback)",
-                query, subsidiary_ok,
-            )
-            return WikidataResolutionResult(query, [], False, None, "resolver_degraded")
 
         # Parse — direkte Treffer zuerst
         direct_cands = [c for row in direct_rows
