@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -52,6 +53,62 @@ _HEADERS = {
 # Q4830453 = business, Q43229 = organization — both cover subsidiaries
 _BUSINESS_CLASS = "wd:Q4830453"
 _PUBLIC_CO_CLASS = "wd:Q6881511"   # publicly traded company
+
+
+# ─── 24h In-Memory-Cache (WIKIDATA-CACHE-01) ─────────────────────────────────
+# Motivation: Wikidata wdqs hat regelmäßige 429-Outages (1 req/min-Limit).
+# Ohne Cache macht jede Suche nach "Bayer" o.ä. während eines Outage-Fensters
+# den gesamten Lifecycle-Zweig unnutzbar → resolver_degraded → kein Modal.
+# Lösung: erfolgreiche Auflösungen (ok=True, candidates vorhanden) für 24h cachen.
+# Degraded-Ergebnisse (ok=False) werden NICHT gecacht — dann soll beim nächsten
+# Request neu versucht werden. Single-Instance Render → einfaches dict, kein Redis.
+#
+# Wichtige Eigenschaften:
+#   - Cache-Key: normalize(name) — case-insensitive, whitespace-normalisiert
+#   - TTL: 86400s (24h) — Wikidata-Daten ändern sich selten, Stale ist akzeptabel
+#   - Thread-Safety: asyncio single-thread, kein Lock nötig
+#   - Memory: realistisch <500 Einträge = ~1MB (Argo Single-Instance, kein Problem)
+
+_CACHE_TTL = 86_400  # 24h in Sekunden
+
+@dataclass
+class _CacheEntry:
+    result: "WikidataResolutionResult"
+    stored_at: float  # time.monotonic()
+
+_resolve_cache: dict[str, _CacheEntry] = {}
+
+
+def _cache_key(name: str) -> str:
+    """Normalize für Cache-Key: lowercase + whitespace-kollaps."""
+    return " ".join(name.strip().lower().split())
+
+
+def _cache_get(name: str) -> "WikidataResolutionResult | None":
+    key = _cache_key(name)
+    entry = _resolve_cache.get(key)
+    if entry is None:
+        return None
+    if time.monotonic() - entry.stored_at > _CACHE_TTL:
+        del _resolve_cache[key]
+        logger.debug("Wikidata cache EXPIRED für '%s'", name)
+        return None
+    logger.info("Wikidata cache HIT für '%s' (%d Kandidaten)", name, len(entry.result.candidates))
+    return entry.result
+
+
+def _cache_set(name: str, result: "WikidataResolutionResult") -> None:
+    """Nur cachen wenn Ergebnis belastbar ist (kein degraded, mind. 1 Kandidat)."""
+    if result.reason == "resolver_degraded":
+        return
+    # no_wikidata_match (echtes Leer) cachen wir NICHT — könnte sich ändern wenn
+    # ein Unternehmen einen Wikidata-Eintrag bekommt. Kostet nichts außer einem
+    # weiteren Outage-Fenster-Fehlversuch.
+    if result.reason == "no_wikidata_match":
+        return
+    _resolve_cache[_cache_key(name)] = _CacheEntry(result=result, stored_at=time.monotonic())
+    logger.debug("Wikidata cache SET für '%s' (%d Kandidaten, reason=%s)",
+                 name, len(result.candidates), result.reason)
 
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
@@ -365,6 +422,13 @@ async def resolve_entity(
     if not query:
         return WikidataResolutionResult(query, [], False, None, "empty_query")
 
+    # WIKIDATA-CACHE-01: Cache-Lookup vor dem ersten Netzwerk-Call.
+    # Outage-Resilienz: war die Auflösung in den letzten 24h erfolgreich,
+    # liefern wir das gecachte Ergebnis sofort zurück — kein Wikidata-Hit nötig.
+    cached = _cache_get(query)
+    if cached is not None:
+        return cached
+
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(timeout=_TIMEOUT, headers=_HEADERS)
@@ -452,20 +516,26 @@ async def resolve_entity(
             if _norm(c.display_name) == qn or _norm(c.name) == qn
         ]
         if len(exact) == 1:
-            return WikidataResolutionResult(
+            result = WikidataResolutionResult(
                 query, candidates, False, exact[0], "exact_name_match"
             )
+            _cache_set(query, result)
+            return result
 
         # Genau ein Kandidat gesamt → still binden
         if len(candidates) == 1:
-            return WikidataResolutionResult(
+            result = WikidataResolutionResult(
                 query, candidates, False, candidates[0], "single_candidate"
             )
+            _cache_set(query, result)
+            return result
 
         # ≥2 Kandidaten → Modal
-        return WikidataResolutionResult(
+        result = WikidataResolutionResult(
             query, candidates, True, None, "multiple_candidates"
         )
+        _cache_set(query, result)
+        return result
 
     finally:
         if owns_client:

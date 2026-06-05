@@ -1171,6 +1171,59 @@ async def _trigger_beta_enrich_on_bridge(
         logger.debug("_trigger_beta_enrich_on_bridge failed für %s: %s", symbol, e)
 
 
+def _derive_region_from_hq(headquarters: str | None) -> str | None:
+    """
+    REGION-CLASS-01: Region aus Wikidata-Headquarters-String ableiten.
+
+    Problem: Beim Cold-Path-Insert ist `region` oft noch leer. _looks_us_listed()
+    prüft nur Ticker-Suffix + Exchange — beides kann beim ersten Request fehlen.
+    Ergebnis: Bayer AG (BAYN, Exchange noch None) → region=None → fällt in den
+    US-Pfad → EDGAR SC 13G/13D → CIK-404 für ein deutsches Unternehmen.
+
+    Fix: headquarters ist die robusteste Quelle, weil Wikidata P159 (HQ) in den
+    meisten Fällen schon beim /resolve befüllt ist und via URL-Param übergeben wird.
+    Nur eine grobe DE/US/EU-Auflösung — kein ISO-Mapping nötig.
+    """
+    if not headquarters:
+        return None
+    hq = headquarters.lower()
+
+    # ── Deutschland ──────────────────────────────────────────────────────────
+    _de_signals = (
+        "germany", "deutschland", "berlin", "munich", "münchen", "hamburg",
+        "frankfurt", "cologne", "köln", "düsseldorf", "stuttgart", "hannover",
+        "dortmund", "essen", "leipzig", "bremen", "dresden", "nuremberg",
+        "nürnberg", "leverkusen", "wolfsburg", "bonn", "mannheim", "karlsruhe",
+        "augsburg", "wiesbaden", "gelsenkirchen", "mönchengladbach", "aachen",
+    )
+    if any(s in hq for s in _de_signals):
+        return "DE"
+
+    # ── USA ──────────────────────────────────────────────────────────────────
+    _us_signals = (
+        "united states", "usa", "u.s.", "new york", "san francisco", "palo alto",
+        "mountain view", "menlo park", "austin", "seattle", "boston", "chicago",
+        "los angeles", "houston", "dallas", "denver", "atlanta", "miami",
+        "washington", "cambridge", "san jose", "santa clara", "redwood city",
+        "sunnyvale", "cupertino",
+    )
+    if any(s in hq for s in _us_signals):
+        return "US"
+
+    # ── Weitere EU-Länder (keine EDGAR-Calls, keine BA-Calls) ────────────────
+    _eu_signals = (
+        "france", "paris", "netherlands", "amsterdam", "spain", "madrid",
+        "italy", "milan", "milano", "sweden", "stockholm", "switzerland",
+        "zürich", "zurich", "austria", "vienna", "wien", "belgium", "brussels",
+        "denmark", "copenhagen", "finland", "helsinki", "norway", "oslo",
+        "portugal", "lisbon", "poland", "warsaw", "ireland", "dublin",
+    )
+    if any(s in hq for s in _eu_signals):
+        return "EU"
+
+    return None
+
+
 def _looks_us_listed(ticker: str | None, exchange: str | None) -> bool:
     """
     EDGAR-OD-01 / Gate-Stufe 2: US-Heuristik (kostenlos, in-memory).
@@ -1565,6 +1618,7 @@ class ResolveResponse(BaseModel):
     resolved_consolidated_into: str | None = None # DISAMBIG-03 — Referenz auf Nachfolge-Einheit
     resolved_consolidated_into_id: str | None = None  # Wikidata-QID der Nachfolge-Einheit
     resolved_dissolved_year: int | None = None        # P576 — für Referenz-String
+    resolved_headquarters: str | None = None           # REGION-CLASS-01 — für region-Ableitung im Insert
     candidates: list[ResolveCandidate] = []
     reason: str
 
@@ -1710,6 +1764,9 @@ async def resolve_company(name: str) -> ResolveResponse:
         resolved_dissolved_year=(
             int(result.resolved.dissolved_year) if result.resolved and result.resolved.dissolved_year else None
         ),
+        resolved_headquarters=(
+            result.resolved.headquarters if result.resolved else None
+        ),
         candidates=[
             ResolveCandidate(
                 wikidata_id=c.wikidata_id,
@@ -1737,11 +1794,16 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None, lifecycle_status: str | None = None, consolidated_into_id: str | None = None, consolidated_into_name: str | None = None, dissolved_year: int | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None, lifecycle_status: str | None = None, consolidated_into_id: str | None = None, consolidated_into_name: str | None = None, dissolved_year: int | None = None, headquarters: str | None = None) -> CompanyDetailResponse:
     """
     is_listed_hint: vom Frontend nach /resolve gesetzt (resolved_is_listed).
     Wird in den Insert übernommen wenn Company noch nicht in DB.
     Überschreibt _resolve_is_listed() NICHT für Warm-Path (DB-Wert hat Vorrang).
+
+    headquarters: REGION-CLASS-01 — Wikidata P159 via /resolve (URL-Param).
+    Wird im Cold-Path-Insert genutzt um `region` sofort korrekt zu setzen,
+    bevor der Enrichment-Cron das Feld nachschreibt. Verhindert, dass eine
+    DE-Company (Bayer AG) als region=US landet und EDGAR SC 13G/13D-Calls feuert.
     """
     warnings: list[str] = []
 
@@ -1826,6 +1888,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             }
             if isin:
                 _insert["isin"] = isin
+            # REGION-CLASS-01: Region sofort beim Insert setzen wenn headquarters bekannt.
+            # Ohne diesen Write landet `region` als None in der DB → _looks_us_listed()
+            # gibt True für bare Ticker (z.B. BAYN ohne Suffix) → EDGAR SC 13G/13D für
+            # deutsches Unternehmen. headquarters kommt aus Wikidata P159 via /resolve.
+            _derived_region = _derive_region_from_hq(headquarters)
+            if _derived_region:
+                _insert["region"] = _derived_region
+                logger.info(
+                    "REGION-CLASS-01: region='%s' für '%s' aus headquarters='%s' abgeleitet",
+                    _derived_region, name, headquarters,
+                )
             # DISAMBIG-03: effektiven Listed-Hint ZUERST bestimmen — ticker/exchange-
             # Persistenz hängt davon ab.
             #   is_listed_hint: aus Wikidata via /resolve (P31→Q6881511).
