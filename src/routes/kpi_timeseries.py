@@ -177,7 +177,6 @@ class ScoringDetail(BaseModel):
 
 
 class CompanyDetailResponse(BaseModel):
-    id: str | None = None   # FE-COMPANYID-01: Supabase company_id → Frontend kpi-timeseries Call
     name: str
     category: str | None
     industry: str | None
@@ -2645,7 +2644,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             logger.warning("SC scoring failed for %s: %s", company_name, _sc_err)
 
     return CompanyDetailResponse(
-        id=company.get("id"),
         name=company_name,
         category=company.get("category"),
         industry=company.get("industry"),
