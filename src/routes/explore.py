@@ -92,8 +92,19 @@ def _sort_key(company: dict, scores: dict, customer_type: str) -> float:
 # ── User-Kontext ──────────────────────────────────────────────────────────────
 
 def _resolve_user_id(authorization: str | None) -> str | None:
-    """Phase 1: ARGO_DEFAULT_USER_ID. Phase 2: PyJWT nach Q-D01."""
-    # TODO AUTH: JWT-Extraktion nach Q-D01
+    """
+    Löst user_id auf.
+    1. Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung)
+    2. Fallback: ARGO_DEFAULT_USER_ID (Dogfooding / kein Auth-Header)
+    """
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        try:
+            user = get_supabase().auth.get_user(token)
+            if user and user.user:
+                return str(user.user.id)
+        except Exception as e:
+            logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
     return _DEFAULT_USER_ID
 
 

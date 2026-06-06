@@ -39,10 +39,10 @@ _DEFAULT_USER_ID: str | None = os.getenv("ARGO_DEFAULT_USER_ID")
 
 def _resolve_user_id(authorization: str | None) -> str | None:
     """
-    Löst user_id auf — Phase 1: env var, Phase 2: JWT.
-
-    TODO AUTH (nach Q-D01): JWT-Pfad aktivieren:
-    ─────────────────────────────────────────────
+    Löst user_id auf.
+    1. Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung)
+    2. Fallback: ARGO_DEFAULT_USER_ID (Dogfooding / kein Auth-Header)
+    """
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
         try:
@@ -51,9 +51,6 @@ def _resolve_user_id(authorization: str | None) -> str | None:
                 return str(user.user.id)
         except Exception as e:
             logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
-    ─────────────────────────────────────────────
-    Bis dahin: ARGO_DEFAULT_USER_ID ist der einzige Pfad.
-    """
     return _DEFAULT_USER_ID
 
 
