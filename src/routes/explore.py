@@ -3,7 +3,7 @@ src/routes/explore.py
 EXPLORE-01: Personalisierter Explore-Feed.
 
 Logik:
-  1. user_id auflösen (ARGO_DEFAULT_USER_ID / später JWT via Q-D01)
+  1. user_id auflösen (Bearer-Token → Supabase auth.get_user())
   2. user_industry_preferences → sector_keys des Users
   3. user_profiles → customer_type (vc/pe/ma_agency/corporate/family_office)
   4. Companies nach Industry filtern + company_scores joinen
@@ -24,7 +24,6 @@ Phase 2: ML-basiertes Ranking wenn genug User-Interaktionsdaten vorhanden.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
@@ -33,8 +32,6 @@ from src.integrations.supabase import get_supabase
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["explore"])
-
-_DEFAULT_USER_ID: str | None = os.getenv("ARGO_DEFAULT_USER_ID")
 
 # ── Taxonomy-Mapping: sector_key → industry-Label-Varianten ──────────────────
 # Companies.industry ist Freitext — ILIKE-Match auf bekannte Varianten.
@@ -94,8 +91,8 @@ def _sort_key(company: dict, scores: dict, customer_type: str) -> float:
 def _resolve_user_id(authorization: str | None) -> str | None:
     """
     Löst user_id auf.
-    1. Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung)
-    2. Fallback: ARGO_DEFAULT_USER_ID (Dogfooding / kein Auth-Header)
+    Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung).
+    Kein Token oder ungültiger Token → None (Feed antwortet leer).
     """
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
@@ -105,7 +102,7 @@ def _resolve_user_id(authorization: str | None) -> str | None:
                 return str(user.user.id)
         except Exception as e:
             logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
-    return _DEFAULT_USER_ID
+    return None
 
 
 def _get_user_context(user_id: str) -> tuple[list[str], str]:

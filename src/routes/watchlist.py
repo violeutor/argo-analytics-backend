@@ -2,11 +2,10 @@
 src/routes/watchlist.py
 WATCHLIST-01: Per-User Watchlist Endpoints.
 
-Auth-Strategie (Phasen):
-  Phase 1 (jetzt): ARGO_DEFAULT_USER_ID env var — Single-User Dogfooding.
-    Render → Environment → ARGO_DEFAULT_USER_ID = <deine auth.users UUID>
-  Phase 2 (nach Q-D01): JWT aus Authorization-Header via supabase-py.
-    Q-D01 (supabase-py Auth-Bug) muss zuerst gelöst sein.
+Auth-Strategie (AUTH-GATE-01 aktiv):
+  Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung).
+  Kein Token → None → starred=False / 401 je nach Endpoint.
+  ARGO_DEFAULT_USER_ID-Fallback entfernt (AUTH-GATE-01, Session 57).
 
 Endpoints:
   GET  /watchlist/status/{company_id}  → {starred: bool}
@@ -22,7 +21,6 @@ Tabelle: user_watchlist (WATCHLIST-01 Migration)
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -32,16 +30,12 @@ from src.integrations.supabase import get_supabase
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["watchlist"])
 
-# Phase 1: Dogfooding — UUID des geseedeten Admin-Profils (auth.users)
-# Render → Settings → Environment Variables → ARGO_DEFAULT_USER_ID
-_DEFAULT_USER_ID: str | None = os.getenv("ARGO_DEFAULT_USER_ID")
-
 
 def _resolve_user_id(authorization: str | None) -> str | None:
     """
     Löst user_id auf.
-    1. Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung)
-    2. Fallback: ARGO_DEFAULT_USER_ID (Dogfooding / kein Auth-Header)
+    Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung).
+    Kein Token oder ungültiger Token → None (Endpoints antworten leer / 401).
     """
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
@@ -51,7 +45,7 @@ def _resolve_user_id(authorization: str | None) -> str | None:
                 return str(user.user.id)
         except Exception as e:
             logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
-    return _DEFAULT_USER_ID
+    return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -91,7 +85,7 @@ async def watchlist_add(
     """Fügt eine Company zur Watchlist hinzu (idempotent via upsert)."""
     user_id = _resolve_user_id(authorization)
     if not user_id:
-        raise HTTPException(status_code=401, detail="No user context — ARGO_DEFAULT_USER_ID not set")
+        raise HTTPException(status_code=401, detail="No user context — Bearer token required")
     try:
         get_supabase().table("user_watchlist").upsert(
             {"user_id": user_id, "company_id": company_id},
@@ -112,7 +106,7 @@ async def watchlist_remove(
     """Entfernt eine Company aus der Watchlist."""
     user_id = _resolve_user_id(authorization)
     if not user_id:
-        raise HTTPException(status_code=401, detail="No user context — ARGO_DEFAULT_USER_ID not set")
+        raise HTTPException(status_code=401, detail="No user context — Bearer token required")
     try:
         get_supabase().table("user_watchlist").delete()\
             .eq("user_id", user_id)\
