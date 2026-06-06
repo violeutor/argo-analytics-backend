@@ -116,7 +116,12 @@ async def get_kpi_timeseries(
     if not company_id or company_id == "undefined":
         company = fetch_company_by_name(name)
         if not company:
-            raise HTTPException(status_code=404, detail=f"Company '{name}' nicht gefunden.")
+            # KPI-404-01: kein 404 für das Read-Modal. Eine unbekannte/nicht
+            # aufgelöste Company ist für die Zeitreihen-Ansicht kein Fehler, sondern
+            # schlicht "keine Daten" — Frontend zeigt Leerzustand statt Netzwerkfehler.
+            # (Write-Endpoint behält seinen 404: dort ist es ein echter Bridge-Fehler.)
+            logger.info("kpi_timeseries GET: Company '%s' nicht aufgelöst → 200 leer", name)
+            return KPITimeseriesResponse(company_name=name, metrics={}, years=[])
         company_id = company["id"]
 
     try:
