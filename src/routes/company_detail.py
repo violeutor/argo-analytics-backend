@@ -1225,6 +1225,36 @@ def _derive_region_from_hq(headquarters: str | None) -> str | None:
     return None
 
 
+def _derive_region_from_exchange(exchange: str | None) -> str | None:
+    """
+    REGION-CLASS-01: Region aus der primary exchange (OpenFIGI) ableiten.
+
+    Warum exchange statt HQ: Die Börse ist das verlässlichere Signal als der
+    Firmensitz. Ein US-Konzern mit DE-Zweitnotiz bleibt US (EDGAR-Pfad); ein
+    DE-Konzern mit US-ADR bleibt DE (BA-Pfad). HQ kann irreführen (Steuersitz
+    Dublin → US-Primärnotierung). Die primary exchange wird via /resolve aus
+    OpenFIGI aufgelöst und als URL-Param mitgegeben — daraus baut der Resolver
+    ohnehin das Yahoo-Suffix (`_EXCHANGE_SUFFIX`). Dieselbe SSOT für Region nutzen.
+
+    Kein Henne-Ei: hängt nur am Exchange-Code (upstream aufgelöst), nicht am Suffix.
+
+    Mapping (konsistent mit `_looks_us_listed`):
+      - DE-Venues (Xetra/Frankfurt: gy/gf/xetra/frankfurt/fse) → "DE"
+      - jedes andere bekannte Nicht-US-Venue in _EXCHANGE_SUFFIX  → "EU"
+      - präsenter Code OHNE Suffix-Eintrag (UN/UQ/UA …)           → "US"
+      - LEER/None → None (→ HQ-Fallback; verhindert dass eine noch nicht
+        aufgelöste Exchange fälschlich als US durchläuft — der Bayer→EDGAR-Bug)
+    """
+    ex = (exchange or "").split("·")[-1].strip().lower()
+    if not ex:
+        return None
+    if ex in ("gy", "gf", "xetra", "frankfurt", "fse"):
+        return "DE"
+    if ex in _EXCHANGE_SUFFIX:
+        return "EU"
+    return "US"
+
+
 def _looks_us_listed(ticker: str | None, exchange: str | None) -> bool:
     """
     EDGAR-OD-01 / Gate-Stufe 2: US-Heuristik (kostenlos, in-memory).
@@ -1889,16 +1919,18 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             }
             if isin:
                 _insert["isin"] = isin
-            # REGION-CLASS-01: Region sofort beim Insert setzen wenn headquarters bekannt.
-            # Ohne diesen Write landet `region` als None in der DB → _looks_us_listed()
-            # gibt True für bare Ticker (z.B. BAYN ohne Suffix) → EDGAR SC 13G/13D für
-            # deutsches Unternehmen. headquarters kommt aus Wikidata P159 via /resolve.
-            _derived_region = _derive_region_from_hq(headquarters)
+            # REGION-CLASS-01: Region sofort beim Insert setzen.
+            # Primärquelle = OpenFIGI primary exchange (via /resolve URL-Param) — dieselbe
+            # SSOT, aus der auch das Yahoo-Suffix gebaut wird. HQ nur als Fallback wenn keine
+            # Exchange aufgelöst ist (private/unlisted). Ohne korrekte region landet sie als
+            # None → _looks_us_listed() gibt True für bare Ticker (BAYN ohne Suffix) → EDGAR
+            # SC 13G/13D für ein DE-Unternehmen (CIK-404). exchange/headquarters via /resolve.
+            _derived_region = _derive_region_from_exchange(exchange) or _derive_region_from_hq(headquarters)
             if _derived_region:
                 _insert["region"] = _derived_region
                 logger.info(
-                    "REGION-CLASS-01: region='%s' für '%s' aus headquarters='%s' abgeleitet",
-                    _derived_region, name, headquarters,
+                    "REGION-CLASS-01: region='%s' für '%s' (exchange='%s', hq='%s')",
+                    _derived_region, name, exchange, headquarters,
                 )
             # DISAMBIG-03: effektiven Listed-Hint ZUERST bestimmen — ticker/exchange-
             # Persistenz hängt davon ab.
