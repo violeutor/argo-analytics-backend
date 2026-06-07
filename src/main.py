@@ -17,6 +17,7 @@ from src.routes.debug import router as debug_router
 from src.routes.notifications import router as notifications_router
 from src.routes.watchlist import router as watchlist_router
 from src.routes.explore import router as explore_router
+from src.routes.access_request import router as access_request_router
 import os
 import asyncio
 import logging
@@ -445,6 +446,7 @@ app.include_router(debug_router)
 app.include_router(notifications_router)
 app.include_router(watchlist_router)
 app.include_router(explore_router)
+app.include_router(access_request_router, prefix="/api/v1")
 
 
 @app.post("/internal/bafin/trigger")
