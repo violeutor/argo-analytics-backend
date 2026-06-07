@@ -24,7 +24,7 @@ import httpx
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, EmailStr, field_validator
 
-from src.lib.supabase import get_supabase  # service_role-Client (bestehender Helper)
+from src.integrations.supabase import get_supabase  # service_role-Client (bestehender Helper)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
