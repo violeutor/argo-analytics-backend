@@ -34,23 +34,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["explore"])
 
 # ── Taxonomy-Mapping: sector_key → industry-Label-Varianten ──────────────────
-# Companies.industry ist Freitext — ILIKE-Match auf bekannte Varianten.
-# Taxonomy v1.0 (schema_user_profiles_v2.sql CHECK-Constraint).
+# Companies.industry trägt die Taxonomy-v1.0-Klartext-Labels (z.B. "Carbon & Climate",
+# "Energy & Power"). sector_key (user_industry_preferences) ist der Taxonomy-Key.
+# Diese Map überbrückt beide. Primär = exaktes DB-Label, danach Text-Varianten als
+# Fallback (greifen bei künftigen/abweichenden Werten, schaden bei aktuellem Datensatz nicht).
+# ILIKE-/Substring-Match via _industry_matches.
 _SECTOR_INDUSTRY_MAP: dict[str, list[str]] = {
-    "climate_tech":        ["Climate Tech", "CleanTech", "Clean Tech", "Cleantech"],
-    "energy_transition":   ["Energy Transition", "Energy", "Renewable Energy", "Clean Energy"],
-    "mobility":            ["Mobility", "Transportation", "Automotive", "EV"],
-    "health_tech":         ["Health Tech", "HealthTech", "Digital Health", "MedTech"],
-    "biotech_pharma":      ["Biotech", "Pharma", "Life Sciences", "Pharmaceuticals", "Biopharma"],
+    "climate_tech":        ["Carbon & Climate", "Water & Circular Economy", "Climate Tech", "CleanTech"],
+    "energy_transition":   ["Energy & Power", "Energy Transition", "Renewable Energy", "Clean Energy"],
+    "mobility":            ["Mobility & Transport", "Mobility", "Transportation", "Automotive"],
+    "health_tech":         ["Life Sciences & Health", "Health Tech", "Digital Health", "MedTech"],
+    "biotech_pharma":      ["Life Sciences & Health", "Biotech", "Pharma", "Life Sciences"],
     "fintech":             ["FinTech", "Financial Technology", "Finance", "InsurTech"],
-    "enterprise_software": ["Enterprise Software", "SaaS", "B2B Software", "Software"],
-    "deep_tech":           ["Deep Tech", "DeepTech", "Advanced Technology", "Hard Tech"],
+    "enterprise_software": ["Digital Infrastructure", "Enterprise Software", "SaaS", "B2B Software"],
+    "deep_tech":           ["Digital Infrastructure", "Materials & Chemicals", "Deep Tech", "Advanced Technology"],
     "consumer_tech":       ["Consumer Tech", "Consumer Technology", "B2C Tech"],
-    "industrial_tech":     ["Industrial Tech", "IndustrialTech", "Industrials", "Manufacturing"],
-    "food_agritech":       ["Food Tech", "AgriTech", "Agriculture", "Food & AgriTech", "Agritech"],
-    "space_defense":       ["Space", "Defense", "Aerospace", "Space & Defense", "Space Tech"],
+    "industrial_tech":     ["Industrial & Manufacturing", "Materials & Chemicals", "Industrial Tech", "Manufacturing"],
+    "food_agritech":       ["Agriculture & Food", "Food Tech", "AgriTech", "Agritech"],
+    "space_defense":       ["Space & Defense", "Space", "Defense", "Aerospace"],
     "media_entertainment": ["Media", "Entertainment", "Media & Entertainment", "Content"],
-    "real_estate_proptech":["PropTech", "Real Estate", "Property Tech", "Construction Tech"],
+    "real_estate_proptech":["Built Environment", "PropTech", "Real Estate", "Property Tech"],
 }
 
 # ── Customer-Type Sort-Profil ─────────────────────────────────────────────────
