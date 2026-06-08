@@ -82,6 +82,29 @@ async def list_access_requests(authorization: str | None = Header(None)):
         raise HTTPException(status_code=500, detail="Failed to fetch requests")
 
 
+# ── GET /api/v1/admin/users ──────────────────────────────────────────────────
+
+@router.get("/api/v1/admin/users")
+async def list_users(authorization: str | None = Header(None)):
+    """Alle user_profiles für User-Health-Tab im Admin-Dashboard. Admin-only."""
+    _require_admin(authorization)
+    db = get_supabase()
+    try:
+        res = (
+            db.table("user_profiles")
+            .select(
+                "id, full_name, company_name, email, customer_type, "
+                "subscription_tier, onboarding_completed_at, created_at, is_admin"
+            )
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"users": res.data or []}
+    except Exception as exc:
+        logger.error("list_users FAILED: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+
 # ── POST /api/v1/admin/activate/{request_id} ─────────────────────────────────
 
 @router.post("/api/v1/admin/activate/{request_id}")
