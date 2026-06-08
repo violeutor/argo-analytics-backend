@@ -433,7 +433,11 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(APIKeyMiddleware)
 
-app.include_router(admin_router)          # ACTIVATE-01: zuerst — kein Pfad-Konflikt mit anderen Routern
+# Explizite /api/v1-Routen mit festen Pfaden ZUERST — verhindert Shadowing
+# durch spätere Router mit Pfad-Parametern (z.B. /api/v1/{slug}).
+app.include_router(admin_router)                              # /api/v1/admin/...
+app.include_router(user_profile_router)                       # /api/v1/user-profile, /api/v1/user-preferences
+app.include_router(access_request_router, prefix="/api/v1")   # /api/v1/access-requests
 app.include_router(analyze_router)
 app.include_router(companies_router)
 app.include_router(search_router)
@@ -449,8 +453,6 @@ app.include_router(debug_router)
 app.include_router(notifications_router)
 app.include_router(watchlist_router)
 app.include_router(explore_router)
-app.include_router(access_request_router, prefix="/api/v1")
-app.include_router(user_profile_router)   # ONBOARD-WIRE-01: Routen tragen /api/v1 selbst
 
 
 @app.post("/internal/bafin/trigger")
