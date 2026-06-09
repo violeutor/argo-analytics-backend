@@ -1328,6 +1328,50 @@ async def _trigger_edgar_kpi_ondemand(
         logger.debug("_trigger_edgar_kpi_ondemand failed für %s: %s", company_name, e)
 
 
+async def _trigger_yf_kpi_ondemand(
+    company_id,
+    company_name: str,
+    ticker: str | None,
+) -> None:
+    """
+    YH-KPI-TS-01: Fire-and-Forget On-Demand yfinance-KPI-Enrichment beim Cold-Load.
+
+    Spiegelbild von _trigger_edgar_kpi_ondemand für EU/DE/UK-Listed Companies.
+    Gate im Caller (get_company_detail):
+      is_listed=True AND NOT _looks_us_listed(ticker, exchange)
+
+    ticker ist bereits ein aufgelöstes yfinance-Symbol (z.B. "SIE.DE") —
+    Auflösung via _resolve_yf_symbol() geschieht im Caller vor add_task.
+
+    Eigener DB-Read als zweiter Guard (analog EDGAR-OD-01 Stufe 3):
+    yfinance-Rows bereits vorhanden? → kein Re-Trigger (Warm-Load-Schutz).
+    """
+    try:
+        db = get_supabase()
+        existing = (
+            db.table("kpi_timeseries")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("source", "yfinance")
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        if existing:
+            logger.debug("YH-KPI-TS-01: %s hat bereits yfinance-Rows — kein Re-Trigger", company_name)
+            return
+
+        from src.services.yfinance_kpi import enrich_one_company_yf
+        result = await enrich_one_company_yf(company_id, company_name, ticker)
+        logger.info(
+            "YH-KPI-TS-01: On-Demand-Enrich für %s — found=%s, %d rows written",
+            company_name, result.get("found"), result.get("rows_written", 0),
+        )
+    except Exception as e:
+        # Fire-and-Forget — yfinance-Ausfall darf den Cold-Load nicht beeinträchtigen
+        logger.debug("_trigger_yf_kpi_ondemand failed für %s: %s", company_name, e)
+
+
 def _build_fundamentals(
     is_listed: bool,
     yahoo: dict,
@@ -2756,6 +2800,41 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 _beta_exchange,
             )
             logger.info("EDGAR-OD-01: On-Demand-Enrich queued (BackgroundTask) für %s", company_name)
+
+    # YH-KPI-TS-01: On-Demand yfinance-KPI-Enrich für frische EU/DE-Listed Companies.
+    # Spiegelbild von EDGAR-OD-01 — selbes Gate-Pattern, gespiegelter US-Check.
+    # Pre-Check auf "yfinance"-Rows VOR add_task (analog EDGAR-OD-01 S50-Fix):
+    # verhindert Log-Spam + unnötigen Task-Start bei jedem Warm-Reload.
+    # _resolve_yf_symbol liefert das korrekte yfinance-Symbol mit Exchange-Suffix
+    # (z.B. "SIE · Frankfurt" → "SIE.DE") — muss VOR dem add_task aufgelöst werden,
+    # da der BackgroundTask keinen Zugriff auf company-Felder mehr hat.
+    if is_listed and _cid and not _looks_us_listed(_beta_ticker_raw, _beta_exchange):
+        _yf_ticker = _resolve_yf_symbol(_beta_ticker_raw)
+        _yf_rows_exist = False
+        try:
+            _yf_rows_exist = bool(
+                get_supabase().table("kpi_timeseries")
+                .select("id")
+                .eq("company_id", _cid)
+                .eq("source", "yfinance")
+                .limit(1)
+                .execute()
+                .data
+            )
+        except Exception as _e:
+            logger.debug("YH-KPI-TS-01 Pre-Check failed für %s: %s — fail-open", company_name, _e)
+        if _yf_rows_exist:
+            logger.debug("YH-KPI-TS-01: %s hat bereits yfinance-Rows — kein Re-Trigger (Warm-Load)", company_name)
+        elif _yf_ticker:
+            background_tasks.add_task(
+                _trigger_yf_kpi_ondemand,
+                _cid,
+                company_name,
+                _yf_ticker,
+            )
+            logger.info("YH-KPI-TS-01: On-Demand-Enrich queued (BackgroundTask) für %s (%s)", company_name, _yf_ticker)
+        else:
+            logger.debug("YH-KPI-TS-01: kein yfinance-Symbol für %s — kein Trigger", company_name)
 
     # yfinance Beta-Fallback: company-spezifisches Yahoo-Beta schlägt das
     # Damodaran-Sektor-Beta (das _fetch_beta_from_bridge ggf. schon als Fallback in

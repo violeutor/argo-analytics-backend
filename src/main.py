@@ -297,6 +297,24 @@ async def _cron_edgar_kpi():
         logger.exception("EDGAR KPI Cron FEHLER: %s", e)
 
 
+async def _cron_yf_kpi():
+    """YH-KPI-TS-01 — yfinance KPI Pipeline für EU/DE-Listed, täglich 05:20 UTC."""
+    try:
+        from src.integrations.supabase import fetch_companies
+        from src.services.yfinance_kpi import run_yfinance_kpi_pipeline
+
+        companies = fetch_companies(limit=500)
+        logger.info("YF KPI Cron gestartet — %d Companies", len(companies))
+        stats = await run_yfinance_kpi_pipeline(companies)
+        logger.info(
+            "YF KPI Cron fertig — %d Companies, %d rows written, %d skipped, %d errors",
+            stats["companies_processed"], stats["rows_written"],
+            stats["rows_skipped"], stats["errors"],
+        )
+    except Exception as e:
+        logger.exception("YF KPI Cron FEHLER: %s", e)
+
+
 async def _cron_bafin_ownership(company_name: str | None = None) -> dict:
     """
     BaFin Stimmrechtsmitteilungen — direkt im Argo Backend (kein Bridge-Hop nötig).
@@ -369,7 +387,9 @@ async def lifespan(app):
             await _cron_ticker_yf()              # 04:45 UTC — ticker_yf (BUG-42)
             await asyncio.sleep(30 * 60)
             await _cron_edgar_kpi()              # 05:15 UTC — EDGAR XBRL KPIs (KPI-03)
-            await asyncio.sleep(15 * 60)
+            await asyncio.sleep(5 * 60)
+            await _cron_yf_kpi()                 # 05:20 UTC — yfinance KPIs EU/DE (YH-KPI-TS-01)
+            await asyncio.sleep(10 * 60)
             await _cron_buyer_enrichment()       # 05:30 UTC — Buyer
             await asyncio.sleep(30 * 60)
             await _cron_scoring()                # 06:00 UTC — Scoring
@@ -529,6 +549,43 @@ async def trigger_edgar_kpi(background_tasks: BackgroundTasks):
     """Manueller Trigger für _cron_edgar_kpi (Testing/Debugging)."""
     background_tasks.add_task(_cron_edgar_kpi)
     return {"status": "triggered", "job": "_cron_edgar_kpi"}
+
+
+@app.post("/internal/yf-kpi/trigger")
+async def trigger_yf_kpi(background_tasks: BackgroundTasks):
+    """Manueller Trigger für _cron_yf_kpi — alle EU/DE-Listed Companies (YH-KPI-TS-01)."""
+    background_tasks.add_task(_cron_yf_kpi)
+    return {"status": "triggered", "job": "_cron_yf_kpi"}
+
+
+@app.post("/internal/yf-kpi/enrich/{company_name}")
+async def trigger_yf_kpi_ondemand(company_name: str, background_tasks: BackgroundTasks):
+    """
+    YH-KPI-TS-01: On-Demand yfinance-KPI-Enrich für eine einzelne EU/DE Company.
+    Analog /internal/edgar-kpi/enrich/{company_name} — manuelle Reserve für Testing.
+    """
+    async def _run():
+        try:
+            from src.integrations.supabase import fetch_company_by_name
+            from src.services.yfinance_kpi import enrich_one_company_yf
+            from src.routes.company_detail import _resolve_yf_symbol
+
+            co = fetch_company_by_name(company_name)
+            if not co:
+                logger.warning("YF-KPI-OD Endpoint: Company '%s' nicht in DB", company_name)
+                return
+            ticker_raw = co.get("ticker_yf") or co.get("ticker") or None
+            ticker     = _resolve_yf_symbol(ticker_raw) if ticker_raw else None
+            result = await enrich_one_company_yf(co["id"], co.get("name", company_name), ticker)
+            logger.info(
+                "YF-KPI-OD Endpoint: '%s' — found=%s, %d rows written",
+                company_name, result.get("found"), result.get("rows_written", 0),
+            )
+        except Exception as e:
+            logger.exception("YF-KPI-OD Endpoint FEHLER für '%s': %s", company_name, e)
+
+    background_tasks.add_task(_run)
+    return {"status": "triggered", "company": company_name, "job": "yf_kpi_ondemand"}
 
 
 @app.post("/internal/edgar-kpi/enrich/{company_name}")
