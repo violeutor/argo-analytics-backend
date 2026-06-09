@@ -419,6 +419,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
 
+        # TEMP-DIAG (yftest): Browser-Diagnose ohne X-API-Key zulassen.
+        # Eng auf den Diagnose-Pfad begrenzt — NICHT /internal/ gesamt
+        # (edgar-kpi/funding-enrich haben Side-Effects, bleiben geschützt).
+        # MIT dem yftest-Endpoint zusammen wieder entfernen.
+        if request.url.path.startswith("/internal/yftest"):
+            return await call_next(request)
+
         api_key = request.headers.get("X-API-Key")
         expected = os.getenv("API_KEY")
 
