@@ -20,7 +20,6 @@ from src.routes.explore import router as explore_router
 from src.routes.access_request import router as access_request_router
 from src.routes.user_profile import router as user_profile_router
 from src.routes.admin import router as admin_router
-from src.routes.yftest import router as yftest_router   # TEMP-DIAG — mit Endpoint wieder entfernen
 import os
 import asyncio
 import logging
@@ -420,13 +419,6 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
 
-        # TEMP-DIAG (yftest): Browser-Diagnose ohne X-API-Key zulassen.
-        # Eng auf den Diagnose-Pfad begrenzt — NICHT /internal/ gesamt
-        # (edgar-kpi/funding-enrich haben Side-Effects, bleiben geschützt).
-        # MIT dem yftest-Endpoint zusammen wieder entfernen.
-        if request.url.path.startswith("/internal/yftest"):
-            return await call_next(request)
-
         api_key = request.headers.get("X-API-Key")
         expected = os.getenv("API_KEY")
 
@@ -443,7 +435,6 @@ app.add_middleware(APIKeyMiddleware)
 
 # Explizite /api/v1-Routen mit festen Pfaden ZUERST — verhindert Shadowing
 # durch spätere Router mit Pfad-Parametern (z.B. /api/v1/{slug}).
-app.include_router(yftest_router)                            # TEMP-DIAG /internal/yftest/{ticker}
 app.include_router(admin_router)                              # /api/v1/admin/...
 app.include_router(user_profile_router)                       # /api/v1/user-profile, /api/v1/user-preferences
 app.include_router(access_request_router, prefix="/api/v1")   # /api/v1/access-requests

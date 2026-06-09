@@ -1617,40 +1617,6 @@ async def enrich_company(
             if sh.name.lower() not in known:
                 result.investors.append(sh)
 
-    # ── EU-Listed Fundamentals (EODHD → ESAP 2027) ───────────────────────────
-    # Nur für EU-Listed Companies mit bekanntem Ticker + Exchange.
-    # Schreibt via write_eu_kpi_rows() in kpi_timeseries — analog EDGAR-OD-01.
-    # Provider-Wechsel 2027: EU_FUNDAMENTALS_PROVIDER=esap in Render-Env-Vars setzen.
-    _is_eu_listed = (
-        is_listed
-        and result.ticker
-        and result.exchange
-        and result.exchange.upper() not in ("US", "NASDAQ", "NYSE", "OTC")
-    )
-    if _is_eu_listed:
-        _company_id_eu = company_record.get("id")
-        if _company_id_eu:
-            try:
-                from src.services.eu_fundamentals_adapter import (
-                    fetch_eu_fundamentals,
-                    write_eu_kpi_rows,
-                )
-                _eu_fund = await asyncio.wait_for(
-                    fetch_eu_fundamentals(result.ticker, result.exchange),
-                    timeout=10.0,
-                )
-                if _eu_fund:
-                    write_eu_kpi_rows(_company_id_eu, _eu_fund)
-                    # shares_outstanding → direkt in EnrichmentResult für market_cap
-                    if _eu_fund.shares_outstanding and not company_record.get("shares_outstanding"):
-                        result.__dict__.setdefault("shares_outstanding", _eu_fund.shares_outstanding)
-            except asyncio.TimeoutError:
-                logger.warning("EU Fundamentals timeout für %s", company_name)
-            except Exception as _e:
-                logger.warning("EU Fundamentals failed für %s: %s", company_name, _e)
-        else:
-            logger.debug("EU Fundamentals skip: kein company_id für %s", company_name)
-
     # category/industry erneut prüfen: Phase B kann description nachgeliefert haben,
     # aus der sich jetzt Tags/Kategorie ableiten lassen (wenn Phase A noch leer war).
     if (not result.category or not result.industry) and result.description:
