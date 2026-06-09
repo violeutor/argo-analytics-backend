@@ -1283,6 +1283,18 @@ def compute_all_scores(
     buy  = buyers or []
     vds  = value_drivers or []
 
+    # BUYER-MFR-01: Käufer mit echtem MFR annotieren BEVOR Scoring sie liest.
+    # SC-02 + ma_score filtern auf b["mfr"]=="Feasible" — das Feld existiert
+    # nicht in potential_buyers, sondern wird hier aus dem Verhältnis
+    # Buyer-Marktkapitalisierung ÷ Target-Bewertung berechnet (valuation.py).
+    # Ohne diesen Schritt ist feasible_buyers immer 0 → buyer_bonus immer 0.
+    if buy:
+        try:
+            from src.services.valuation import annotate_buyers_with_mfr
+            buy = annotate_buyers_with_mfr(buy, company)
+        except Exception as _e:
+            logger.warning("BUYER-MFR-01: MFR-Annotation fehlgeschlagen: %s", _e)
+
     result     = ScoreResult()
     all_inputs: dict = {}
 

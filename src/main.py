@@ -228,6 +228,7 @@ async def _cron_scoring():
         from src.integrations.supabase import (
             fetch_companies, fetch_company_scores, upsert_company_scores,
             fetch_signals, fetch_value_drivers, fetch_market_data,
+            fetch_potential_buyers,
         )
         from src.services.score_calculator import compute_all_scores
 
@@ -243,9 +244,12 @@ async def _cron_scoring():
                 signals_raw   = fetch_signals(cid, limit=50)
                 vd_cached     = fetch_value_drivers(cid)
                 market_data   = fetch_market_data(cid)  # BUG-40: market_data fehlte im Cron
+                buyers        = fetch_potential_buyers(cid)  # BUYER-CRON-WIRE-01
                 vd_list: list[dict] = []
                 if vd_cached:
-                    for key in ("enablers", "contributors", "buyers"):
+                    # value_drivers hat NUR enablers/contributors/etfs — kein "buyers".
+                    # Akquisiteure kommen aus potential_buyers (separate Tabelle).
+                    for key in ("enablers", "contributors"):
                         vd_list.extend(vd_cached.get(key) or [])
 
                 result = compute_all_scores(
@@ -253,6 +257,7 @@ async def _cron_scoring():
                     signals=signals_raw,
                     value_drivers=vd_list,
                     market_data=market_data,  # BUG-40
+                    buyers=buyers,            # BUYER-CRON-WIRE-01 — MFR-Annotation in compute_all_scores
                 )
                 if upsert_company_scores(cid, result.to_dict()):
                     written += 1

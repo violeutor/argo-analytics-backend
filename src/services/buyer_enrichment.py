@@ -247,61 +247,73 @@ def _yahoo_ticker(ticker: str, exchange: str | None) -> str:
     return ticker
 
 
+def _fetch_market_cap_sync(ticker: str, exchange: str | None) -> float | None:
+    """
+    Synchroner yfinance-Abruf der Marktkapitalisierung → Mrd USD.
+
+    BUYER-MKTCAP-01-Fix: Der alte Pfad las `marketCap` aus dem /v8/finance/chart
+    meta-Objekt — dieses Feld existiert dort NICHT (chart liefert nur Preis/
+    Zeitreihe). Ergebnis war market_cap_usd_bn durchgehend NULL.
+    yfinance fast_info.market_cap ist die verlässliche Quelle (dieselbe Lib wie
+    der KPI-Writer). Währung wird via valuation.to_usd nach USD normalisiert —
+    ein DE-Buyer notiert in EUR, der Wert muss USD sein für den MFR-Vergleich.
+
+    Suffix-Fallback .DE → .F analog _fetch_yf_fundamentals.
+    """
+    import yfinance as yf
+    from src.services.valuation import to_usd
+
+    candidates = [ticker]
+    if ticker.upper().endswith(".DE"):
+        candidates.append(ticker[:-3] + ".F")
+
+    for sym in candidates:
+        try:
+            t  = yf.Ticker(sym)
+            fi = t.fast_info
+            mcap_native = getattr(fi, "market_cap", None)
+            currency    = getattr(fi, "currency", None) or "USD"
+            if not mcap_native or float(mcap_native) <= 0:
+                continue
+
+            mcap_usd = to_usd(float(mcap_native), currency)
+            if mcap_usd is None:
+                # Unbekannte Währung — lieber None als falsche Größenordnung
+                logger.debug("Buyer-MktCap: unbekannte Währung '%s' für %s", currency, sym)
+                continue
+
+            return round(mcap_usd / 1e9, 2)   # → Mrd USD
+        except Exception as e:
+            logger.debug("Buyer-MktCap sync failed für %s: %s", sym, e)
+            continue
+
+    return None
+
+
 async def _fetch_market_cap(
     buyer: PotentialBuyer,
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient,   # beibehalten für Signatur-Kompatibilität (ungenutzt)
 ) -> float | None:
     """
-    Fetcht market_cap_usd_bn via Yahoo Finance für einen Ticker.
-    Gibt None zurück wenn Ticker unbekannt oder API-Fehler.
+    Async Wrapper: market_cap_usd_bn via yfinance (asyncio.to_thread).
+    Gibt None zurück wenn Ticker unbekannt, Währung unbekannt oder Fehler.
     """
     if not buyer.ticker:
         return None
 
     yahoo_ticker = _yahoo_ticker(buyer.ticker, buyer.exchange)
     try:
-        resp = await client.get(
-            _YAHOO_QUOTE_URL.format(ticker=yahoo_ticker),
-            params={"interval": "1d", "range": "1d"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8.0,
+        return await asyncio.wait_for(
+            asyncio.to_thread(_fetch_market_cap_sync, yahoo_ticker, buyer.exchange),
+            timeout=10.0,
         )
-        if resp.status_code != 200:
-            # Fallback: .F statt .DE für Frankfurt
-            if yahoo_ticker.endswith(".DE"):
-                yahoo_ticker_f = yahoo_ticker[:-3] + ".F"
-                resp2 = await client.get(
-                    _YAHOO_QUOTE_URL.format(ticker=yahoo_ticker_f),
-                    params={"interval": "1d", "range": "1d"},
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=6.0,
-                )
-                if resp2.status_code == 200:
-                    resp = resp2
-                else:
-                    logger.warning(
-                        "Yahoo: Ticker '%s' (auch '%s') nicht gefunden (HTTP %s/%s) fuer %s",
-                        yahoo_ticker, yahoo_ticker_f, resp.status_code, resp2.status_code, buyer.name,
-                    )
-                    return None
-            else:
-                logger.warning(
-                    "Yahoo: Ticker '%s' nicht gefunden (HTTP %s) fuer %s",
-                    yahoo_ticker, resp.status_code, buyer.name,
-                )
-                return None
-
-        data = resp.json()
-        meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-        mcap = meta.get("marketCap")
-        if mcap and float(mcap) > 0:
-            return round(float(mcap) / 1e9, 2)
-
+    except asyncio.TimeoutError:
+        logger.warning("Buyer-MktCap: Timeout für %s (%s)", buyer.name, yahoo_ticker)
         return None
-
     except Exception as e:
-        logger.debug("Yahoo market_cap failed für %s (%s): %s", buyer.name, yahoo_ticker, e)
+        logger.debug("Buyer-MktCap failed für %s (%s): %s", buyer.name, yahoo_ticker, e)
         return None
+
 
 
 # ── Haupt-Pipeline ────────────────────────────────────────────────────────────
