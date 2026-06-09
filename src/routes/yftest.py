@@ -40,7 +40,23 @@ async def yftest(ticker: str):
     Roher yfinance-Aufruf auf Render — fast_info + .info getrennt ausgewiesen.
     Kein Auth, kein Side-Effect, reine Lese-Diagnose.
     """
-    import yfinance as yf
+    # yfinance-Import absichern — fehlt es, ist DAS die Diagnose.
+    # (company_detail._fetch_yf_fundamentals verschluckt denselben ImportError
+    #  still und gibt {} zurück → leere Fundamentals, niemand merkt es.)
+    try:
+        import yfinance as yf
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "diagnosis": "yfinance_fehlt",
+            "bedeutung": (
+                "yfinance ist auf Render NICHT installiert. Wäre die Ursache für "
+                "leere Fundamentals: company_detail fängt diesen ImportError still "
+                "ab → {}. Fix: yfinance in requirements.txt. Evtl. mit Bridge-Cleanup "
+                "rausgeflogen."
+            ),
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
 
     def _sync_probe(sym: str) -> dict:
         result: dict = {"ticker": sym}
@@ -116,6 +132,16 @@ async def yftest(ticker: str):
             "ticker": ticker,
             "diagnosis": "timeout",
             "bedeutung": "yfinance-Call >20s — auf Render oft = Rate-Limit/Block auf der Cloud-IP.",
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "ticker": ticker,
+            "diagnosis": "endpoint_crash",
+            "bedeutung": "Endpoint selbst ist gecrasht — Fehlertext zeigt die Ursache.",
+            "error_type": type(e).__name__,
+            "error": str(e)[:300],
+            "traceback": traceback.format_exc()[-800:],
         }
 
 
