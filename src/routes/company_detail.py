@@ -271,6 +271,7 @@ class CompanyDetailResponse(BaseModel):
     fundamentals: FundamentalsData
     # Scoring
     scorings: list[ScoringDetail]
+    ma_aggregate: dict = {}   # BUYER-AGG-01: Top-3-feasible Mittelwert + Tooltip-Daten
     # Supply chain
     supply_chain_upstream: list[dict]
     supply_chain_downstream: list[dict]
@@ -3241,6 +3242,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []
     from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company
 
+    # BUYER-AGG-01: vor dem Branch initialisieren (im not-cache-valid-Pfad sonst undefined)
+    _ma_aggregate: float | None = None
+    _ma_aggregate_meta: dict = {"aggregate_score": None, "basis": "none",
+                                "deals_considered": 0, "feasible_count": 0, "contributors": []}
+
     if not is_cache_valid(potential_buyers_raw):
         # Noch nicht generiert oder abgelaufen → BackgroundTask, scorings=[]
         if company_id:
@@ -3270,15 +3276,27 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             if not mcap:
                 continue
             try:
+                # BUYER-FIN-01: echte Buyer-Financials statt hartcodierter Annahmen.
+                # cash: aus yfinance (buyer_enrichment) — Fallback mcap×0.05 nur wenn fehlt.
+                # debt_ebitda: echt wenn vorhanden, sonst 0.0 → scoring.py lässt die
+                #   debt-Korrektur weg (1c: korrigieren nur wenn debt-Daten da).
+                _cash = buyer.get("cash_usd_bn")
+                if _cash is None:
+                    _cash = float(mcap) * 0.05   # transparenter Fallback, nicht erfunden-als-Wahrheit
+                _debt_ebitda = buyer.get("debt_ebitda")
+                if _debt_ebitda is None:
+                    _debt_ebitda = 0.0           # 0 → keine debt-Korrektur (1c)
+
                 req = AnalyzeRequest(
                     company_name=company_name,
                     buyer_name=buyer["name"],
                     tam_usd_bn=tam["tam_usd_bn"],
                     buyer_market_cap_usd_bn=float(mcap),
-                    buyer_cash_usd_bn=float(mcap) * 0.05,
-                    buyer_debt_ebitda=1.5,
+                    buyer_cash_usd_bn=float(_cash),
+                    buyer_debt_ebitda=float(_debt_ebitda),
                     target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
                     target_stage=company.get("funding_stage") or "series_b",
+                    target_vertical=company.get("industry"),   # VALUATION-SSOT-01 Vertical-Korrektur
                     tech_readiness_override=auto_tr,
                 )
                 scores = compute_scores(req)
@@ -3307,6 +3325,32 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
 
         if scorings:
             _tr_ref[0] = scorings[0].tech_readiness.overall
+
+        # BUYER-AGG-01: M&A-Aggregat = Mittelwert der Top-3 FEASIBLE Deals.
+        # "Mehrere realistische Heimathäfen" statt Best-Case-Wette (Andreas S64).
+        # Feasible/Watch zählen als realistisch; Overstretch fällt raus.
+        # Fällt auf Top-3 aller Deals zurück wenn keine feasiblen existieren
+        # (dann mit Hinweis-Flag, damit Frontend es einordnen kann).
+        _feasible = [s for s in scorings if s.mfr_signal in ("Feasible", "Watch")]
+        _agg_pool = _feasible if _feasible else scorings
+        _top3 = _agg_pool[:3]
+        if _top3:
+            _ma_aggregate = round(sum(s.deal_success_score for s in _top3) / len(_top3), 4)
+            _ma_aggregate_meta = {
+                "aggregate_score":   _ma_aggregate,
+                "basis":             "top3_feasible" if _feasible else "top3_all_fallback",
+                "deals_considered":  len(_top3),
+                "feasible_count":    len(_feasible),
+                "contributors": [
+                    {"buyer": s.buyer_name, "deal_success_score": s.deal_success_score,
+                     "mfr_signal": s.mfr_signal, "srr_category": s.srr_category}
+                    for s in _top3
+                ],
+            }
+        else:
+            _ma_aggregate = None
+            _ma_aggregate_meta = {"aggregate_score": None, "basis": "none",
+                                  "deals_considered": 0, "feasible_count": 0, "contributors": []}
 
     # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
@@ -3419,6 +3463,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     headcount_snapshots=(
                         fetch_headcount_snapshots(company_id) if company_id and not is_listed else None
                     ),
+                    ma_aggregate=_ma_aggregate_meta,   # BUYER-AGG-01: Deal-Aggregat aus scoring.py-Engine
                 )
                 scores_result = sc_result.to_dict()
 
@@ -3500,6 +3545,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         is_known=True,
         warnings=warnings,
         scores=scores_result,
+        ma_aggregate=_ma_aggregate_meta,
         potential_buyers=[
             {
                 "name":                b.get("name"),

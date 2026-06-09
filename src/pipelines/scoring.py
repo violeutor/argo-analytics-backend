@@ -22,17 +22,12 @@ from src.models.schemas import (
     ScoreResult,
     TechReadinessInputs,
 )
+# VALUATION-SSOT-01: Stage/Vertical-Multiplikatoren + Target-Bewertung kommen
+# aus valuation.py — die EINE Quelle. Lokale _STAGE_MULTIPLIERS entfernt
+# (war divergent: seed 8.0 vs. valuation 5.0 → systematische Überbewertung).
+from src.services.valuation import stage_multiplier, vertical_delta
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-_STAGE_MULTIPLIERS = {
-    "seed": 8.0,
-    "series_a": 6.0,
-    "series_b": 5.0,
-    "series_c": 4.0,
-    "series_d_plus": 3.5,
-    "public": 1.0,
-}
 
 _TR_WEIGHTS = {
     "tech_stack_fit": 0.20,
@@ -210,8 +205,12 @@ def compute_mfr(
     buyer_debt_ebitda: float,
     target_funding_usd_mn: float,
     target_stage: str,
+    target_vertical: str | None = None,
 ) -> MFRResult:
-    multiplier = _STAGE_MULTIPLIERS.get(target_stage, 5.0)
+    # VALUATION-SSOT-01: EV = funding × stage_mult × vertical_delta (zentrale Tabelle).
+    # Ersetzt die lokale _STAGE_MULTIPLIERS-Berechnung. Vertical justiert branchenspezifisch
+    # (z.B. deep_tech 1.30, biotech_pharma 0.85) — default 1.0 wenn unbekannt.
+    multiplier = stage_multiplier(target_stage) * vertical_delta(target_vertical)
     estimated_ev_usd_bn = (target_funding_usd_mn * multiplier) / 1000
 
     mfr = estimated_ev_usd_bn / buyer_market_cap_usd_bn if buyer_market_cap_usd_bn > 0 else 999
@@ -323,6 +322,7 @@ def compute_scores(request: AnalyzeRequest) -> ScoreResult:
         buyer_debt_ebitda=request.buyer_debt_ebitda,
         target_funding_usd_mn=request.target_funding_usd_mn,
         target_stage=request.target_stage,
+        target_vertical=request.target_vertical,
     )
     tr = compute_tech_readiness(
         inputs=request.tech_readiness_inputs,

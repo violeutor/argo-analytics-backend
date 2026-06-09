@@ -406,17 +406,25 @@ def compute_financial_score(
 
 # ── SC-02 · Strategic Score ────────────────────────────────────────────────────
 
-def compute_strategic_score(company: dict, buyers: list[dict]) -> tuple[float, dict]:
+def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dict | None = None) -> tuple[float, dict]:
     """
     SC-02: Strategic Score (0–10).
 
-    Inputs: srr, mfr_confidence, tech_readiness, buyer_count.
+    Breiter als ma_score: strategische Attraktivität für M&A, Partnerschaften
+    UND Peer-Positionierung. Behält eigene SRR/TR/MFR-Gewichtung.
+
+    Inputs: srr, mfr_confidence, tech_readiness, feasible_buyer_count (aus Aggregat).
 
     Gewichtung:
       SRR             0–3.5 Pkt  (Strategische Relevanz)
       TechReadiness   0–3.5 Pkt  (Technologische Reife)
       MFR             0–3.0 Pkt  (Buyer Feasibility)
-      Buyer Bonus     0–1.0 Pkt  (Anzahl valider Käufer)
+      Buyer Bonus     0–1.0 Pkt  (Anzahl realistischer Käufer aus Deal-Engine)
+
+    HINWEIS: SRR/MFR werden hier weiter aus Company-Feldern gelesen (Legacy).
+    Der feasible-Count kommt jetzt aus dem echten Deal-Aggregat (BUYER-AGG-01)
+    statt aus nicht-existentem b["mfr"]. Vollständige SC-02-Neuausrichtung auf
+    die Per-Buyer-Engine ist eine offene Produktentscheidung (SC02-REWORK-01).
     """
     inputs: dict = {}
 
@@ -432,10 +440,10 @@ def compute_strategic_score(company: dict, buyers: list[dict]) -> tuple[float, d
     mfr_pts = _MFR_SCORE.get(mfr, 0.5)
     tr_pts  = tr * 3.5
 
-    # Feasible Buyer Count Bonus (max +1.0 bei ≥5 Käufern)
-    feasible_buyers = [b for b in (buyers or []) if b.get("mfr") == "Feasible"]
-    buyer_bonus = min(1.0, len(feasible_buyers) * 0.25)
-    inputs["feasible_buyers"] = len(feasible_buyers)
+    # Buyer Bonus aus echtem Deal-Aggregat (feasible_count), nicht aus b["mfr"]
+    feasible_count = (ma_aggregate or {}).get("feasible_count", 0)
+    buyer_bonus = min(1.0, feasible_count * 0.25)
+    inputs["feasible_buyers"] = feasible_count
 
     score = srr_pts + mfr_pts + tr_pts + buyer_bonus
     return _safe_round(score), inputs
@@ -757,35 +765,58 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     return _safe_round(score), inputs
 
 
-def compute_ma_score(company: dict, buyers: list[dict]) -> tuple[float, dict]:
+def compute_ma_score(company: dict, ma_aggregate: dict | None = None) -> tuple[float, dict]:
     """
     M&A Score (0–10): Attraktivität als Akquisitions-Target.
 
-    Basis: SRR × MFR × TechReadiness (bestehende Deal-Composite-Logik).
-    Ergänzt durch Stage-Attraktivität + Feasible Buyer Count.
+    BUYER-AGG-01 Neuausrichtung: Konsumiert das Deal-Aggregat aus der echten
+    Per-Buyer-Engine (src/pipelines/scoring.py, SRR×MFR×TechReadiness), statt
+    SRR/MFR aus nicht-existenten Company-Feldern zu raten (alter toter Pfad:
+    company.get("srr")/mfr_confidence → immer Default).
 
-    Hoch für: Series A–C, hoher SRR, Feasible MFR, viele potenzielle Käufer.
-    Niedrig für: S-1 gefilter (geht an Markt), bereits listed (zu teuer).
+    ma_aggregate (aus company_detail._ma_aggregate_meta):
+        aggregate_score:  Mittelwert Top-3-feasible deal_success_score [0..1]
+        feasible_count:   Anzahl realistischer Käufer
+        basis:            'top3_feasible' | 'top3_all_fallback' | 'none'
+
+    Score-Aufbau (0–10):
+        deal_success-Aggregat   0–7.0 Pkt  (aggregate_score × 7)
+        Feasible-Käufer-Breite  0–1.5 Pkt  (mehrere Heimathäfen = robuster)
+        Stage-Attraktivität     0–0.85 Pkt
+        Reserve / kein-Aggregat → konservativer Mittelwert
     """
     inputs: dict = {}
+    agg = ma_aggregate or {}
 
-    srr = company.get("srr") or company.get("strategic_relevance_rating")
-    mfr = company.get("mfr_confidence")
-    tr  = float(company.get("tech_readiness") or 0.5)
-    stage = _resolve_funding_stage(company)
+    agg_score      = agg.get("aggregate_score")
+    feasible_count = agg.get("feasible_count", 0)
+    basis          = agg.get("basis", "none")
+    stage          = _resolve_funding_stage(company)
 
-    inputs.update({"srr": srr, "mfr": mfr, "tech_readiness": tr, "funding_stage": stage})
+    inputs.update({
+        "ma_aggregate_score": agg_score,
+        "feasible_count":     feasible_count,
+        "aggregate_basis":    basis,
+        "funding_stage":      stage,
+    })
 
-    srr_pts   = _SRR_SCORE.get(srr, 1.0)
-    mfr_pts   = _MFR_SCORE.get(mfr, 0.5)
-    tr_pts    = tr * 3.0
-    stage_pts = _stage_match(stage, _STAGE_MA_SCORE) * 0.1   # max +0.85 Pkt
+    if agg_score is None:
+        # Kein Buyer-Scoring verfügbar (noch nicht angereichert / nicht bewertbar).
+        # Konservativer Stage-basierter Mittelwert statt Null — kein hartes 0.
+        stage_pts = _stage_match(stage, _STAGE_MA_SCORE) * 0.1
+        score = 3.0 + stage_pts
+        inputs["fallback"] = "no_buyer_aggregate"
+        return _safe_round(score), inputs
 
-    feasible = [b for b in (buyers or []) if b.get("mfr") == "Feasible"]
-    buyer_pts = min(1.5, len(feasible) * 0.5)
-    inputs["feasible_buyers"] = len(feasible)
+    deal_pts  = float(agg_score) * 7.0                       # 0..7
+    # Breite: mehrere feasible Käufer = mehrere realistische Exits
+    width_pts = min(1.5, feasible_count * 0.5)               # 0..1.5
+    stage_pts = _stage_match(stage, _STAGE_MA_SCORE) * 0.1   # 0..0.85
+    # Fallback-Basis (keine feasiblen, nur Top-3-all) leicht dämpfen
+    penalty   = 0.85 if basis == "top3_all_fallback" else 1.0
 
-    score = srr_pts + mfr_pts + tr_pts + stage_pts + buyer_pts
+    score = (deal_pts + width_pts + stage_pts) * penalty
+    inputs["width_pts"] = round(width_pts, 2)
     return _safe_round(score), inputs
 
 
@@ -1257,6 +1288,7 @@ def compute_all_scores(
     value_drivers:       list[dict] | None = None,
     funding_momentum:    dict | None       = None,   # SC-01: Momentum-Pfad für US Private
     headcount_snapshots: list[dict] | None = None,   # SC-01: optionaler CAGR-Bonus
+    ma_aggregate:        dict | None       = None,   # BUYER-AGG-01: Deal-Aggregat aus scoring.py-Engine
 ) -> ScoreResult:
     """
     SC-Haupt-Pipeline: Berechnet alle Sub-Scores, Path-Scores und Composite.
@@ -1283,24 +1315,12 @@ def compute_all_scores(
     buy  = buyers or []
     vds  = value_drivers or []
 
-    # BUYER-MFR-01: Käufer mit echtem MFR annotieren BEVOR Scoring sie liest.
-    # SC-02 + ma_score filtern auf b["mfr"]=="Feasible" — das Feld existiert
-    # nicht in potential_buyers, sondern wird hier aus dem Verhältnis
-    # Buyer-Marktkapitalisierung ÷ Target-Bewertung berechnet (valuation.py).
-    # Ohne diesen Schritt ist feasible_buyers immer 0 → buyer_bonus immer 0.
-    if buy:
-        try:
-            from src.services.valuation import annotate_buyers_with_mfr
-            buy = annotate_buyers_with_mfr(buy, company)
-        except Exception as _e:
-            logger.warning("BUYER-MFR-01: MFR-Annotation fehlgeschlagen: %s", _e)
-
     result     = ScoreResult()
     all_inputs: dict = {}
 
     # ── Sub-Scores ──────────────────────────────────────────────────────────
     _run(result, "financial_score",    lambda: compute_financial_score(company, funding_momentum, headcount_snapshots), all_inputs, "financial",    "SC-01")
-    _run(result, "strategic_score",    lambda: compute_strategic_score(company, buy),        all_inputs, "strategic",    "SC-02")
+    _run(result, "strategic_score",    lambda: compute_strategic_score(company, buy, ma_aggregate), all_inputs, "strategic",    "SC-02")
     _run(result, "market_score",       lambda: compute_market_score(mkt, company),           all_inputs, "market",       "SC-03")
     _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
     _run(result, "ownership_score",    lambda: compute_ownership_score(company, own),        all_inputs, "ownership",    "SC-08")
@@ -1318,7 +1338,7 @@ def compute_all_scores(
 
     # ── Path-Scores ─────────────────────────────────────────────────────────
     _run(result, "ipo_score",          lambda: compute_ipo_score(company, sigs),             all_inputs, "ipo",          "IPO")
-    _run(result, "ma_score",           lambda: compute_ma_score(company, buy),               all_inputs, "ma",           "M&A")
+    _run(result, "ma_score",           lambda: compute_ma_score(company, ma_aggregate),      all_inputs, "ma",           "M&A")
     _run(result, "etf_score",          lambda: compute_etf_score(company, vds),              all_inputs, "etf",          "ETF")
     _run(result, "enabler_score",      lambda: compute_enabler_score(company, vds, buy),     all_inputs, "enabler",      "Enabler")
 

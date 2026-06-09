@@ -13,6 +13,10 @@ class AnalyzeRequest(BaseModel):
     buyer_debt_ebitda: float = Field(0.0, description="Buyer net debt / EBITDA ratio")
     target_funding_usd_mn: float = Field(0.0, description="Target total funding raised in USD millions")
     target_stage: Literal["seed", "series_a", "series_b", "series_c", "series_d_plus", "public"] = "series_b"
+    target_vertical: str | None = Field(
+        None,
+        description="14-Sektor sector_key (company.industry) für Vertical-Multiplikator-Korrektur",
+    )
     tech_readiness_inputs: "TechReadinessInputs | None" = None
     # v1.1 — Auto-TR: vorberechneter Wert aus compute_auto_tech_readiness()
     # Hat Vorrang vor tech_readiness_inputs wenn gesetzt.
