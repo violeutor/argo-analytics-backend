@@ -430,15 +430,19 @@ def _harvest_supply_chain(company: dict) -> list[dict]:
     return out
 
 
-def _harvest_peers(company: dict) -> list[dict]:
+def _harvest_peers(company: dict, company_id: str | None) -> list[dict]:
     """
-    Layer 1b (DB, 1 Read). peers_resolved sind schon companies-Rows → market_cap
-    gratis (prefetched_mcap), kein Resolve. Größenfilter macht später das Gate.
-    Fehlt peers_resolved (Cold-Path vor Konsolidierung), bleibt der Layer leer.
+    Layer 1b (DB). peers_resolved sind schon companies-Rows → market_cap gratis
+    (prefetched_mcap), kein Resolve. Größenfilter macht später das Gate.
+    peers_resolved wird AUTORITATIV aus der DB gelesen (fetch_peers_resolved) —
+    die Cold-Path-Konsolidierung schreibt sie evtl. nach dem company-Snapshot;
+    Fallback auf den Snapshot, falls company_id fehlt.
     """
-    from src.integrations.supabase import fetch_companies_by_ids
+    from src.integrations.supabase import fetch_companies_by_ids, fetch_peers_resolved
 
-    peer_ids = company.get("peers_resolved") or []
+    peer_ids = fetch_peers_resolved(company_id) if company_id else []
+    if not peer_ids:
+        peer_ids = company.get("peers_resolved") or []
     if not peer_ids:
         return []
 
@@ -509,7 +513,7 @@ def _dedup_pool(pool: list[dict]) -> list[dict]:
     return out
 
 
-async def _build_buyer_pool(company: dict, client: httpx.AsyncClient) -> list[dict]:
+async def _build_buyer_pool(company: dict, company_id: str | None, client: httpx.AsyncClient) -> list[dict]:
     """
     Kaskade: Layer 1 (supply_chain + peers) immer; Sektor (Wikidata) + Adjazenz
     (Haiku) nur, wenn der Pool darunter unter _MIN_POOL bleibt — kostenbewusst.
@@ -517,7 +521,7 @@ async def _build_buyer_pool(company: dict, client: httpx.AsyncClient) -> list[di
     """
     pool: list[dict] = []
     pool += _harvest_supply_chain(company)
-    pool += _harvest_peers(company)
+    pool += _harvest_peers(company, company_id)
 
     if len(pool) < _MIN_POOL:
         pool += await _harvest_sector(company, client)
@@ -571,7 +575,7 @@ async def enrich_buyers_for_company(
         follow_redirects=True,
     ) as client:
         # ── 1. Pool aufbauen (deterministisch first, extern nur zum Auffüllen) ────
-        pool = await _build_buyer_pool(company, client)
+        pool = await _build_buyer_pool(company, company_id, client)
         if not pool:
             logger.info("Buyer-Enrichment: leerer Pool für %s", name)
             return 0

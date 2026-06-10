@@ -3265,6 +3265,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         background_tasks.add_task(_funding_enrichment_bg)
         logger.info("FUNDING-OD-01: Funding-Enrichment queued (BackgroundTask) für %s", company_name)
 
+    # 8b. PEERS-CONSOLIDATE-01: peers beim Load mitwärmen (war bisher nur on-tab).
+    # ensure_peers ist cache-aware (30d) → bei frischem Cache ein No-Op. VOR dem
+    # Buyer-Task eingereiht, damit peers_resolved existiert, wenn die Buyer-
+    # Enrichment es (autoritativ aus der DB) liest. Peer-Enrichment wird geschedult
+    # (nicht inline) → jeder Background-Task bleibt beschränkt; der Buyer-Peer-Layer
+    # greift, sobald die Peer-Financials durch sind (spätestens nächster Zyklus).
+    if company_id:
+        async def _peers_warm_bg():
+            try:
+                from src.routes.peers import ensure_peers
+                await ensure_peers(company, background_tasks=background_tasks)
+            except Exception as e:
+                logger.debug("PEERS-CONSOLIDATE-01: warm failed für %s: %s", company_name, e)
+        background_tasks.add_task(_peers_warm_bg)
+        logger.info("PEERS-CONSOLIDATE-01: peers warm queued für %s", company_name)
+
     # 9. Scoring — R-23: company-spezifische Käufer (kein Fallback auf globale Seed-Buyers)
     potential_buyers_raw = fetch_potential_buyers(company_id) if company_id else []
     from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company

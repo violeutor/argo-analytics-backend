@@ -863,6 +863,26 @@ def upsert_company_scores(company_id: str, scores: dict) -> bool:
         return False
 
 
+def fetch_peers_resolved(company_id: str) -> list[str]:
+    """
+    BUYER-IDENT-02: frische peers_resolved-Liste direkt aus der DB. Die
+    Cold-Path-Konsolidierung (PEERS-CONSOLIDATE-01) schreibt peers_resolved evtl.
+    NACH dem company-Snapshot, den die Buyer-Enrichment als BackgroundTask hält —
+    deshalb hier autoritativ aus der DB lesen statt aus dem Snapshot.
+    """
+    if not company_id:
+        return []
+    db = get_supabase()
+    try:
+        rows = (db.table("companies").select("peers_resolved")
+                .eq("id", company_id).limit(1).execute().data) or []
+        if rows and rows[0].get("peers_resolved"):
+            return rows[0]["peers_resolved"]
+    except Exception as e:
+        logger.warning("fetch_peers_resolved failed für %s: %s", company_id, e)
+    return []
+
+
 def fetch_companies_by_ids(ids: list[str]) -> list[dict]:
     """
     BUYER-IDENT-02: Holt companies-Rows zu einer ID-Liste (Peer-Harvest im

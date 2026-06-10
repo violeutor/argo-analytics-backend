@@ -92,58 +92,66 @@ class PeersResponse(BaseModel):
 
 # ── Haupt-Endpoint ────────────────────────────────────────────────────────────
 
-@router.get("/company/{name}/peers", response_model=PeersResponse)
-async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersResponse:
+async def _schedule_or_await(background_tasks, fn, *args) -> None:
     """
-    Gibt Peer-Companies zurück.
-    Cache: 30 Tage — danach neu generiert via Claude.
-    Neu angelegte Peers werden via BackgroundTask angereichert (organic DB growth).
+    Endpoint-Pfad (background_tasks gesetzt) → schedulen (schnelle Response).
+    Cold-Path-Pfad (None) → inline awaiten (kein Response zu blockieren; der
+    Buyer-Pool braucht die Peer-Financials zeitnah).
+    """
+    if background_tasks is not None:
+        background_tasks.add_task(fn, *args)
+        return
+    try:
+        await fn(*args)
+    except Exception as e:
+        logger.debug("_schedule_or_await inline failed (%s): %s",
+                     getattr(fn, "__name__", fn), e)
+
+
+async def ensure_peers(
+    company: dict,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    """
+    PEERS-CONSOLIDATE-01: idempotenter Peer-Generierungs-Kern, aus get_peers
+    extrahiert. Cache-aware (30d) → bei gültigem Cache kein Claude-Call.
+    Sonst: Namen generieren → resolve/create → peers_resolved schreiben.
+
+    Aufrufpfade:
+      - Endpoint get_peers (background_tasks gesetzt → Peer-Enrichment geschedult)
+      - Cold-Path-Konsolidierung in company_detail (background_tasks=None →
+        Peer-Enrichment inline, damit der Buyer-Pool die Peer-Financials bekommt)
+
+    Returns: {"resolved_ids", "peer_notes", "generated_at", "from_cache"}.
     """
     db = get_supabase()
+    company_id   = company.get("id")
+    company_name = company.get("name", "")
+    if not company_id:
+        return {"resolved_ids": [], "peer_notes": {}, "generated_at": None, "from_cache": False}
 
-    # 1. Company laden
-    company = fetch_company_by_name(name)
-    if not company:
-        raise HTTPException(status_code=404, detail=f"Company '{name}' nicht gefunden.")
-
-    company_id   = company["id"]
-    company_name = company["name"]
-
-    # 2. Cache prüfen
+    # Cache prüfen
     peers_resolved = company.get("peers_resolved") or []
     generated_at   = company.get("peers_generated_at")
-    peers_context  = company.get("peers_context") or {}   # {peer_name: positioning_note}
+    peers_context  = company.get("peers_context") or {}
     cache_valid    = False
-
     if peers_resolved and generated_at:
         try:
             gen_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
             cache_valid = (datetime.now(timezone.utc) - gen_dt).days < _CACHE_TTL_DAYS
         except Exception:
             pass
-
     if cache_valid and peers_resolved:
-        peer_rows = _fetch_peers_by_ids(db, peers_resolved)
-        return PeersResponse(
-            status="ready",
-            company_name=company_name,
-            peers=[_to_peer_model(p, peers_context) for p in peer_rows],
-            benchmark=_build_benchmark(company, peer_rows),
-            generated_at=generated_at,
-            from_cache=True,
-        )
+        return {"resolved_ids": peers_resolved, "peer_notes": peers_context,
+                "generated_at": generated_at, "from_cache": True}
 
-    # 3. Claude generiert Peer-Namen + Positioning Notes
+    # Claude generiert Peer-Namen + Positioning Notes
     peer_names, peer_notes = await _claude_generate_peers(company)
     if not peer_names:
-        return PeersResponse(
-            status="empty",
-            company_name=company_name,
-            peers=[],
-            benchmark=[],
-        )
+        return {"resolved_ids": [], "peer_notes": {}, "generated_at": None, "from_cache": False}
 
-    # 4. Peers in DB auflösen / anlegen — neue Rows via BackgroundTask anreichern
+    # Peers in DB auflösen / anlegen
     all_companies = fetch_companies(limit=500)
     name_to_id: dict[str, str] = {c["name"].lower(): c["id"] for c in all_companies}
 
@@ -151,36 +159,30 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
     company_name_lower = company_name.lower()
     resolved_ids: list[str] = []
     for peer_name in peer_names:
-        # Skip wenn Peer-Name die eigene Company exakt matcht (case-insensitive)
-        pn_lower = peer_name.lower()
-        if pn_lower == company_name_lower:
+        if peer_name.lower() == company_name_lower:
             logger.info("Self-reference skipped: peer '%s' matches source '%s'", peer_name, company_name)
             continue
         peer_id, is_new = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
-        if peer_id:
-            resolved_ids.append(peer_id)
-            name_to_id[peer_name.lower()] = peer_id
-            if is_new:
-                # Neue Company: vollständiges Enrichment
-                background_tasks.add_task(_enrich_new_peer, peer_id, peer_name)
-                logger.info("Enrichment scheduled for new peer: %s", peer_name)
-            else:
-                # Bestehende Company ohne Score: Enrichment nachholen ohne
-                # auf manuelles Aufrufen zu warten (PEERS-01)
-                try:
-                    _score_check = db.table("company_scores").select("composite_score").eq(
-                        "company_id", peer_id
-                    ).limit(1).execute()
-                    _has_score = bool((_score_check.data or [{}])[0].get("composite_score"))
-                except Exception:
-                    _has_score = False
-                if not _has_score:
-                    background_tasks.add_task(_enrich_new_peer, peer_id, peer_name)
-                    logger.info(
-                        "Enrichment scheduled for existing peer without score: %s", peer_name
-                    )
+        if not peer_id:
+            continue
+        resolved_ids.append(peer_id)
+        name_to_id[peer_name.lower()] = peer_id
+        if is_new:
+            # Neue Company: vollständiges Enrichment
+            await _schedule_or_await(background_tasks, _enrich_new_peer, peer_id, peer_name)
+        else:
+            # Bestehende Company ohne Score: Enrichment nachholen (PEERS-01)
+            try:
+                _score_check = db.table("company_scores").select("composite_score").eq(
+                    "company_id", peer_id
+                ).limit(1).execute()
+                _has_score = bool((_score_check.data or [{}])[0].get("composite_score"))
+            except Exception:
+                _has_score = False
+            if not _has_score:
+                await _schedule_or_await(background_tasks, _enrich_new_peer, peer_id, peer_name)
 
-    # 5. peers_resolved + peers_context + generated_at in companies schreiben
+    # peers_resolved + peers_context + generated_at in companies schreiben
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         db.table("companies").update({
@@ -193,16 +195,42 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
     except Exception as e:
         logger.warning("peers_resolved upsert failed for %s: %s", company_name, e)
 
-    # 6. Peer-Daten aus DB aggregieren
-    peer_rows = _fetch_peers_by_ids(db, resolved_ids)
+    return {"resolved_ids": resolved_ids, "peer_notes": peer_notes,
+            "generated_at": now_iso, "from_cache": False}
 
+
+@router.get("/company/{name}/peers", response_model=PeersResponse)
+async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersResponse:
+    """
+    Gibt Peer-Companies zurück. Cache 30 Tage. Generierungs-Kern = ensure_peers
+    (idempotent, auch vom Cold-Path in company_detail genutzt).
+    """
+    db = get_supabase()
+
+    company = fetch_company_by_name(name)
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Company '{name}' nicht gefunden.")
+
+    company_name = company["name"]
+    result = await ensure_peers(company, background_tasks=background_tasks)
+    resolved_ids = result["resolved_ids"]
+
+    if not resolved_ids:
+        return PeersResponse(
+            status="empty",
+            company_name=company_name,
+            peers=[],
+            benchmark=[],
+        )
+
+    peer_rows = _fetch_peers_by_ids(db, resolved_ids)
     return PeersResponse(
         status="ready",
         company_name=company_name,
-        peers=[_to_peer_model(p, peer_notes) for p in peer_rows],
+        peers=[_to_peer_model(p, result["peer_notes"]) for p in peer_rows],
         benchmark=_build_benchmark(company, peer_rows),
-        generated_at=now_iso,
-        from_cache=False,
+        generated_at=result["generated_at"],
+        from_cache=result["from_cache"],
     )
 
 
