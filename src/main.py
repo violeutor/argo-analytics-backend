@@ -141,9 +141,19 @@ async def _cron_buyer_enrichment():
 
         enriched = 0
         skipped  = 0
+        filtered = 0
         for company in companies:
             cid = company.get("id")
             if not cid:
+                continue
+            # BUYER-AS-COMPANY-01 Entry-Point: Buyer-Gen NUR für Screening-Targets,
+            # nicht für Buyer-Origin-Companies (source='buyer_gen'). Sonst kaskadiert
+            # die Buyer-Generierung über das gesamte Acquirer-Universum (Veolia wird
+            # als Company eingefügt → bekäme selbst Käufer → deren Käufer …).
+            # On-demand-Loads einer Buyer-Company triggern weiterhin ihr Enrichment;
+            # nur der proaktive Cron lässt sie aus.
+            if company.get("source") == "buyer_gen":
+                filtered += 1
                 continue
             try:
                 existing = fetch_potential_buyers(cid)
@@ -160,8 +170,8 @@ async def _cron_buyer_enrichment():
                 logger.warning("Buyer-Enrichment Cron: %s failed — %s", company.get("name"), ce)
 
         logger.info(
-            "Buyer-Enrichment Cron fertig — %d enriched, %d skipped (cached)",
-            enriched, skipped,
+            "Buyer-Enrichment Cron fertig — %d enriched, %d skipped (cached), %d filtered (buyer_gen)",
+            enriched, skipped, filtered,
         )
     except Exception as e:
         logger.exception("Buyer-Enrichment Cron FEHLER: %s", e)
