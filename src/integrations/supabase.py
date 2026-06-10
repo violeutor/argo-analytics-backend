@@ -863,6 +863,26 @@ def upsert_company_scores(company_id: str, scores: dict) -> bool:
         return False
 
 
+def fetch_companies_by_ids(ids: list[str]) -> list[dict]:
+    """
+    BUYER-IDENT-02: Holt companies-Rows zu einer ID-Liste (Peer-Harvest im
+    Buyer-Pool). Liefert die fürs Size-Gate + den Insert nötigen Felder.
+    Leere/ungültige Eingabe → leere Liste (kein Crash beim Cold-Path).
+    """
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return []
+    db = get_supabase()
+    try:
+        rows = (db.table("companies").select(
+            "id, name, ticker, exchange, market_cap_usd_bn"
+        ).in_("id", ids).execute().data) or []
+        return rows
+    except Exception as e:
+        logger.warning("fetch_companies_by_ids failed (%d ids): %s", len(ids), e)
+        return []
+
+
 def fetch_potential_buyers(company_id: str) -> list[dict]:
     """
     BUYER-AS-COMPANY-01: Gibt die Buyer-KANTEN eines Targets zurück, gejoint mit

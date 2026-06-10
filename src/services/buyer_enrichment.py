@@ -54,6 +54,36 @@ _CACHE_TTL_DAYS = 30
 # Tunable: bei Bedarf justieren, wenn das Target-Spektrum sich verschiebt.
 _MAX_TARGET_MKTCAP_FOR_BUYERS_USD_BN = 100.0
 
+# ── BUYER-IDENT-02 · Pool-Aufbau + Size-Gate ────────────────────────────────────
+# Ein potential buyer ist eine börsennotierte Firma, die (a) strategisch an das
+# Target angrenzt (Quelle = source_type) UND (b) materiell größer ist (Size-Gate).
+# Korrektheit trägt allein das Size-Gate. source_type/relevance sind Provenance +
+# Ranking + rationale-Anker, NIE korrektheitstragend.
+
+# Size-Gate (Korrektheit). Getrennt von Ranking — das Gate wirft nur das
+# strukturell Unmögliche raus; den 3–5×-Stretch differenziert die Scoring-Engine
+# (MFR/_DEPLOYABLE_CASH_FRACTION/execution_warning), nicht dieses Gate.
+_MIN_BUYER_SIZE_RATIO          = 3.0   # listed Target: hartes Feasibility-Minimum
+_COMFORTABLE_BUYER_SIZE_RATIO  = 5.0   # nur Ranking-Signal (≥5× = komfortabel)
+_MIN_BUYER_MKTCAP_FLOOR_USD_BN = 2.0   # privates Target: Micro-Cap-Backstop
+
+# Pool-Kaskade. Layer 1 (supply_chain + peers) läuft immer (kuratiert/DB, kein
+# externer Call außer 1 DB-Read). Sektor (Wikidata) + Adjazenz (Haiku) ziehen
+# nur, wenn der Pool darunter bleibt — kostenbewusst, Haiku als Gap-Filler.
+_MIN_POOL        = 4
+_MAX_ADJACENT_LLM = 3
+
+# Provenance-Prioritätsreihenfolge für Pool-Dedup (höchste zuerst). Same identity
+# aus mehreren Quellen → die kuratierte/stärkere gewinnt. Reine Sortier-Hilfe,
+# entscheidet NICHT über Aufnahme (das tut das Size-Gate).
+_SOURCE_PRIORITY: dict[str, int] = {
+    "supply_downstream": 0,
+    "supply_upstream":   1,
+    "peer_larger":       2,
+    "same_sector":       3,
+    "adjacent_llm":      4,
+}
+
 
 # ── Kandidaten-Datenklasse (Haiku-Output, vor Resolve) ──────────────────────────
 
@@ -99,58 +129,50 @@ def is_cache_valid(buyers: list[dict]) -> bool:
 
 # ── Schritt 1: Claude generiert Käufer-Namen ────────────────────────────────────
 
-async def _claude_generate_buyers(
+async def _claude_generate_adjacent(
     company: dict,
     client: httpx.AsyncClient,
-) -> list[BuyerCandidate]:
+    limit: int = _MAX_ADJACENT_LLM,
+) -> list[dict]:
     """
-    Claude Haiku generiert 5–8 strategische Käufer-Kandidaten für eine Company.
-    Liefert NAMEN (+ Ticker/Exchange als Hinweis für den Resolver). Der Ticker
-    ist KEINE Wahrheit mehr — er hilft dem Resolver nur beim Disambiguieren.
+    BUYER-IDENT-02 · Layer 3 (Gap-Filler). Haiku generiert NUR Kandidaten aus
+    ANGRENZENDEN Sektoren — Capability-Buys über die Sektorgrenze (z.B. ein
+    Autobauer kauft eine Lidar-Firma). Same-Sector deckt der deterministische
+    Wikidata-Layer ab; Supply-Chain die kuratierte Schiene. Haikus Stärke ist
+    genau die Sektor-Adjazenz, die kein Graph sauber kennt.
+
+    Gibt normalisierte Pool-Dicts zurück (source_type='adjacent_llm',
+    needs_resolve=True — der Name ist ein Vorschlag, die Identität klärt der
+    Wikidata-Resolver, das Size-Gate entscheidet über Aufnahme).
     """
     api_key = settings.anthropic_api_key
     if not api_key:
-        logger.warning("ANTHROPIC_API_KEY fehlt — Buyer-Generierung nicht möglich")
+        logger.warning("ANTHROPIC_API_KEY fehlt — Adjazenz-Generierung nicht möglich")
         return []
 
     name     = company.get("name", "")
     category = company.get("category") or "—"
     industry = company.get("industry") or "—"
     region   = company.get("region") or "—"
-    stage    = company.get("funding_stage") or "—"
     desc     = (company.get("description") or company.get("summary") or "—")[:300]
-    funding  = company.get("funding_total_usd_mn")
-    funding_str = f"${funding:.0f}M" if funding else "—"
 
-    prompt = f"""Du bist ein erfahrener M&A-Analyst. Identifiziere 5–8 strategische Käufer für dieses Unternehmen.
+    prompt = f"""Du bist ein erfahrener M&A-Analyst. Nenne {limit} börsennotierte Unternehmen aus ANGRENZENDEN Sektoren (NICHT demselben Sektor), die dieses Target übernehmen würden, um dessen Technologie für den EIGENEN Bedarf zu nutzen (Capability-Buy über die Sektorgrenze).
 
 Target Company: {name}
 Kategorie: {category}
 Industrie: {industry}
 Region: {region}
-Funding Stage: {stage} ({funding_str} gesamt)
 Beschreibung: {desc}
 
-Regeln für Käufer:
-- Muss börsennotiert sein (sonst keine direkte Partizipation am Käufer möglich)
-- Gleiche oder angrenzende Industrie (strategischer Fit, nicht nur finanziell)
-- Deutlich größer als das Target (realistischer Akquisiteur)
-- Reale, existierende Unternehmen — keine fiktiven Namen
-- Mische US + Europa wenn relevant
-- strategic_rationale: 1 präziser Satz — welche strategische Logik treibt diese Akquisition?
+Regeln:
+- NICHT derselbe Sektor wie das Target (das wird separat abgedeckt) — echte Sektor-Adjazenz
+- Börsennotiert, real existierend, deutlich größer als das Target
+- rationale: 1 Satz — welchen eigenen Bedarf deckt der Käufer mit dieser Technologie?
+- Ticker/Exchange nur als Hinweis; bei Unsicherheit leer ("")
 
-Ticker/Exchange sind nur HINWEISE für die Disambiguierung — wenn du unsicher bist,
-lasse sie leer (""). Der exakte Name ist wichtiger als der Ticker.
-
-Antworte NUR mit einem JSON-Array, kein Markdown:
+Antworte NUR mit JSON-Array, kein Markdown:
 [
-  {{
-    "name": "Siemens Energy",
-    "ticker": "ENR",
-    "exchange": "Frankfurt",
-    "confidence": "high",
-    "strategic_rationale": "..."
-  }}
+  {{"name": "Volkswagen", "ticker": "VOW3", "exchange": "Frankfurt", "rationale": "..."}}
 ]"""
 
     try:
@@ -158,57 +180,50 @@ Antworte NUR mit einem JSON-Array, kein Markdown:
             _CLAUDE_API_URL,
             headers={
                 "x-api-key":         api_key,
-                "anthropic-version":  "2023-06-01",
+                "anthropic-version": "2023-06-01",
                 "content-type":      "application/json",
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 800,
+                "max_tokens": 600,
                 "messages":   [{"role": "user", "content": prompt}],
             },
             timeout=25.0,
         )
-
         if resp.status_code != 200:
-            logger.warning("Buyer-Gen Claude API %s für %s", resp.status_code, name)
+            logger.warning("Adjazenz-Gen Claude API %s für %s", resp.status_code, name)
             return []
 
         raw = resp.json()["content"][0]["text"].strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
         parsed = json.loads(raw)
 
-        candidates: list[BuyerCandidate] = []
+        out: list[dict] = []
         seen: set[str] = set()
         for item in parsed:
             if not isinstance(item, dict):
                 continue
-            bname  = (item.get("name") or "").strip()
-            ticker = (item.get("ticker") or "").strip().upper() or None
-            exch   = (item.get("exchange") or "").strip() or None
-            conf   = item.get("confidence", "medium")
-            rat    = (item.get("strategic_rationale") or "").strip() or None
-
+            bname = (item.get("name") or "").strip()
             if not bname or bname.lower() in seen:
                 continue
             seen.add(bname.lower())
-            if conf not in ("high", "medium", "low"):
-                conf = "medium"
-
-            candidates.append(BuyerCandidate(
+            out.append(_mk_pool_item(
                 name=bname,
-                ticker_hint=ticker,
-                exchange_hint=exch,
-                strategic_rationale=rat,
-                confidence=conf,
+                source_type="adjacent_llm",
+                ticker_hint=(item.get("ticker") or "").strip().upper() or None,
+                exchange_hint=(item.get("exchange") or "").strip() or None,
+                rationale_seed=(item.get("rationale") or "").strip() or None,
+                confidence="low",
+                needs_resolve=True,
             ))
-            if len(candidates) >= 8:
+            if len(out) >= limit:
                 break
 
-        logger.info("Claude Buyer-Gen für %s: %d Kandidaten", name, len(candidates))
-        return candidates
+        logger.info("Adjazenz-Gen für %s: %d Kandidaten", name, len(out))
+        return out
 
     except Exception as e:
-        logger.warning("_claude_generate_buyers failed für %s: %s", name, e)
+        logger.warning("_claude_generate_adjacent failed für %s: %s", name, e)
         return []
 
 
@@ -322,6 +337,200 @@ def _autopick_listed(result) -> "object | None":
     return None
 
 
+# ── BUYER-IDENT-02 · Pool-Builder + Size-Gate ───────────────────────────────────
+
+def _mk_pool_item(
+    *,
+    name: str,
+    source_type: str,
+    ticker_hint: str | None = None,
+    exchange_hint: str | None = None,
+    source_relevance: float | None = None,
+    rationale_seed: str | None = None,
+    confidence: str = "medium",
+    needs_resolve: bool = False,
+    buyer_company_id: str | None = None,
+    prefetched_mcap: float | None = None,
+) -> dict:
+    """Normalisierter Pool-Kandidat — eine Form über alle Quellen."""
+    return {
+        "name":             name,
+        "source_type":      source_type,
+        "ticker_hint":      ticker_hint,
+        "exchange_hint":    exchange_hint,
+        "source_relevance": source_relevance,
+        "rationale_seed":   rationale_seed,
+        "confidence":       confidence,
+        "needs_resolve":    needs_resolve,
+        "buyer_company_id": buyer_company_id,   # gesetzt für peers (schon companies-Row)
+        "prefetched_mcap":  prefetched_mcap,
+    }
+
+
+def _target_size_usd_bn(company: dict) -> float | None:
+    """Target-Größe für das Size-Gate. None = privates Target (kein market_cap)."""
+    mc = company.get("market_cap_usd_bn")
+    try:
+        return float(mc) if mc else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _passes_size_gate(buyer_mcap: float | None, target_mcap: float | None) -> bool:
+    """
+    Korrektheits-Filter (das EINZIGE korrektheitstragende Kriterium).
+      - buyer_mcap fehlt/0 → nicht verifizierbar → raus.
+      - Listed Target (target_mcap gesetzt): Ratio (hartes Feasibility-Minimum).
+        Den 3–5×-Stretch differenziert die Scoring-Engine, nicht dieses Gate.
+      - Privates Target (kein market_cap): absoluter Floor gegen Micro-Caps.
+    """
+    if not buyer_mcap or buyer_mcap <= 0:
+        return False
+    if target_mcap and target_mcap > 0:
+        return buyer_mcap >= target_mcap * _MIN_BUYER_SIZE_RATIO
+    return buyer_mcap >= _MIN_BUYER_MKTCAP_FLOOR_USD_BN
+
+
+# ── Harvest-Layer ───────────────────────────────────────────────────────────────
+
+def _harvest_supply_chain(company: dict) -> list[dict]:
+    """
+    Layer 1a (kuratiert, deterministisch, 0 externe Calls). supply_chain.py liefert
+    große listed Firmen, die an das Technologie-Thema des Targets angrenzen — mit
+    kuratierter `relevance` (→ source_relevance) und `role` (→ rationale_seed).
+    Identität ist kuratiert → kein Wikidata-Resolve nötig (needs_resolve=False).
+    """
+    try:
+        from src.services.supply_chain import COMPANY_TAGS, get_supply_chain
+    except ImportError as e:
+        logger.warning("supply_chain-Layer übersprungen (Import fehlgeschlagen): %s", e)
+        return []
+
+    name = company.get("name", "")
+    tags = COMPANY_TAGS.get(name) or company.get("tags") or []
+    if not tags:
+        return []
+
+    sc = get_supply_chain(tags)
+    out: list[dict] = []
+    for direction, st in (("upstream", "supply_upstream"),
+                          ("downstream", "supply_downstream")):
+        for item in sc.get(direction, []):
+            tk = (item.get("ticker") or "").strip().upper() or None
+            out.append(_mk_pool_item(
+                name=item.get("name") or tk or "",
+                source_type=st,
+                ticker_hint=tk,
+                exchange_hint=item.get("exchange") or None,
+                source_relevance=item.get("relevance"),
+                rationale_seed=item.get("role"),
+                confidence="high",
+                needs_resolve=False,
+            ))
+    return out
+
+
+def _harvest_peers(company: dict) -> list[dict]:
+    """
+    Layer 1b (DB, 1 Read). peers_resolved sind schon companies-Rows → market_cap
+    gratis (prefetched_mcap), kein Resolve. Größenfilter macht später das Gate.
+    Fehlt peers_resolved (Cold-Path vor Konsolidierung), bleibt der Layer leer.
+    """
+    from src.integrations.supabase import fetch_companies_by_ids
+
+    peer_ids = company.get("peers_resolved") or []
+    if not peer_ids:
+        return []
+
+    out: list[dict] = []
+    for p in fetch_companies_by_ids(peer_ids):
+        if not p.get("id"):
+            continue
+        out.append(_mk_pool_item(
+            name=p.get("name") or "",
+            source_type="peer_larger",
+            ticker_hint=p.get("ticker"),
+            exchange_hint=p.get("exchange"),
+            rationale_seed="Etablierter Wettbewerber im selben Raum",
+            confidence="medium",
+            needs_resolve=False,
+            buyer_company_id=p["id"],
+            prefetched_mcap=p.get("market_cap_usd_bn"),
+        ))
+    return out
+
+
+async def _harvest_sector(company: dict, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Layer 2 (Wikidata, conditional). Listed Sektor-Incumbents über P452 (Industrie).
+    Bereits aufgelöst (Ticker/Exchange aus Wikidata) → needs_resolve=False.
+    """
+    from src.services.wikidata_resolver import find_sector_incumbents
+
+    industry = company.get("industry") or company.get("category")
+    if not industry:
+        return []
+    try:
+        cands = await find_sector_incumbents(industry, client=client)
+    except Exception as e:
+        logger.debug("Sector-Harvest failed für '%s': %s", industry, e)
+        return []
+
+    out: list[dict] = []
+    for c in cands:
+        if not getattr(c, "is_listed", False):
+            continue
+        out.append(_mk_pool_item(
+            name=getattr(c, "display_name", None) or getattr(c, "name", ""),
+            source_type="same_sector",
+            ticker_hint=getattr(c, "ticker", None),
+            exchange_hint=getattr(c, "display_exchange", None),
+            rationale_seed=f"Sektor-Incumbent ({industry})",
+            confidence="medium",
+            needs_resolve=False,
+        ))
+    return out
+
+
+def _dedup_pool(pool: list[dict]) -> list[dict]:
+    """
+    Dieselbe Identität aus mehreren Quellen → kuratierte/stärkere Quelle gewinnt
+    (Sortierung nach _SOURCE_PRIORITY vor dem Dedup). Key: Ticker, sonst Name.
+    """
+    ranked = sorted(pool, key=lambda x: _SOURCE_PRIORITY.get(x["source_type"], 9))
+    seen: set[str] = set()
+    out: list[dict] = []
+    for item in ranked:
+        key = (item.get("ticker_hint") or item.get("name") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+async def _build_buyer_pool(company: dict, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Kaskade: Layer 1 (supply_chain + peers) immer; Sektor (Wikidata) + Adjazenz
+    (Haiku) nur, wenn der Pool darunter unter _MIN_POOL bleibt — kostenbewusst.
+    Gibt deduplizierte, nach Provenance-Priorität geordnete Kandidaten zurück.
+    """
+    pool: list[dict] = []
+    pool += _harvest_supply_chain(company)
+    pool += _harvest_peers(company)
+
+    if len(pool) < _MIN_POOL:
+        pool += await _harvest_sector(company, client)
+    if len(pool) < _MIN_POOL:
+        pool += await _claude_generate_adjacent(company, client)
+
+    deduped = _dedup_pool(pool)
+    by_src = ", ".join(sorted({c["source_type"] for c in deduped})) or "—"
+    logger.info("Buyer-Pool '%s': %d Kandidaten (%s)",
+                company.get("name", ""), len(deduped), by_src)
+    return deduped
+
+
 # ── Haupt-Pipeline ──────────────────────────────────────────────────────────────
 
 async def enrich_buyers_for_company(
@@ -329,12 +538,14 @@ async def enrich_buyers_for_company(
     company_id: str,
 ) -> int:
     """
-    Haupt-Pipeline: Gate → Haiku-Namen → Resolve → find-or-create Company →
-    Financials-Fill → Kante upserten. Gibt die Anzahl geschriebener Kanten zurück.
+    Haupt-Pipeline (BUYER-IDENT-02): Gate → Pool aufbauen (supply_chain/peers/
+    sector/adjacency) → je Kandidat resolve (nur adjacent_llm) → find-or-create →
+    Financials-Fill → SIZE-GATE → Kante mit source_type/source_relevance upserten.
+    Gibt die Anzahl geschriebener Kanten zurück.
 
     Aufgerufen:
       - On-demand als BackgroundTask in company_detail.py (erster Request)
-      - Täglich via Cron in main.py (nur für Screening-Targets, nicht Buyer-Origins)
+      - Täglich via Cron in main.py (nur Screening-Targets, nicht Buyer-Origins)
     """
     from src.integrations.supabase import (
         find_or_create_buyer_company,
@@ -343,15 +554,15 @@ async def enrich_buyers_for_company(
     )
     from src.services.wikidata_resolver import resolve_entity
 
-    name = company.get("name", "")
+    name        = company.get("name", "")
+    target_size = _target_size_usd_bn(company)
 
     # ── 0. Acquirability-Gate (target-seitig, BUYER-IDENT-01/NVIDIA) ─────────────
-    target_mktcap = company.get("market_cap_usd_bn")
-    if target_mktcap and float(target_mktcap) > _MAX_TARGET_MKTCAP_FOR_BUYERS_USD_BN:
+    if target_size and target_size > _MAX_TARGET_MKTCAP_FOR_BUYERS_USD_BN:
         logger.info(
             "Buyer-Enrichment: '%s' ist Mega-Cap (%.0f Mrd USD > %.0f) → kein Käufer-Universum "
             "(Investitionspfad = Direktkauf der Aktie)",
-            name, float(target_mktcap), _MAX_TARGET_MKTCAP_FOR_BUYERS_USD_BN,
+            name, target_size, _MAX_TARGET_MKTCAP_FOR_BUYERS_USD_BN,
         )
         return 0
 
@@ -359,66 +570,76 @@ async def enrich_buyers_for_company(
         timeout=httpx.Timeout(15.0, connect=4.0),
         follow_redirects=True,
     ) as client:
-        # ── 1. Haiku generiert Kandidaten-Namen ──────────────────────────────────
-        candidates = await _claude_generate_buyers(company, client)
-        if not candidates:
-            logger.info("Buyer-Enrichment: keine Kandidaten für %s", name)
+        # ── 1. Pool aufbauen (deterministisch first, extern nur zum Auffüllen) ────
+        pool = await _build_buyer_pool(company, client)
+        if not pool:
+            logger.info("Buyer-Enrichment: leerer Pool für %s", name)
             return 0
 
         edges: list[dict] = []
         seen_buyer_ids: set[str] = set()
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        for cand in candidates:
-            # ── 2. Resolve (Wikidata) — Auto-Pick listed, kein Modal ──────────────
-            try:
-                res = await resolve_entity(cand.name, client=client)
-            except Exception as e:
-                logger.debug("Buyer-Resolve failed für '%s': %s", cand.name, e)
-                continue
+        for cand in pool:
+            buyer_id  = cand.get("buyer_company_id")   # gesetzt nur für peers
+            buyer_co  = None
+            buyer_mcap = cand.get("prefetched_mcap")
 
-            picked = _autopick_listed(res)
-            if picked is None:
-                logger.info(
-                    "Buyer-Resolve: '%s' nicht als listed auflösbar (reason=%s) → verworfen",
-                    cand.name, getattr(res, "reason", "?"),
+            if not buyer_id:
+                # ── 2. Resolve (Wikidata) — nur für adjacent_llm (Name → Identität) ──
+                r_name   = cand["name"]
+                r_ticker = cand.get("ticker_hint")
+                r_exch   = cand.get("exchange_hint")
+                r_hq     = None
+                r_founded: int | None = None
+
+                if cand.get("needs_resolve"):
+                    try:
+                        res = await resolve_entity(cand["name"], client=client)
+                    except Exception as e:
+                        logger.debug("Buyer-Resolve failed für '%s': %s", cand["name"], e)
+                        continue
+                    picked = _autopick_listed(res)
+                    if picked is None:
+                        logger.info(
+                            "Buyer-Resolve: '%s' nicht als listed auflösbar (reason=%s) → verworfen",
+                            cand["name"], getattr(res, "reason", "?"),
+                        )
+                        continue
+                    r_name   = getattr(picked, "display_name", None) or cand["name"]
+                    r_ticker = getattr(picked, "ticker", None) or cand.get("ticker_hint")
+                    r_exch   = cand.get("exchange_hint") or getattr(picked, "display_exchange", None)
+                    r_hq     = getattr(picked, "headquarters", None)
+                    founded  = getattr(picked, "founded_year", None)
+                    try:
+                        r_founded = int(founded) if founded else None
+                    except (ValueError, TypeError):
+                        r_founded = None
+
+                # ── 3. find-or-create Buyer-Company ───────────────────────────────
+                buyer_co = find_or_create_buyer_company(
+                    name=r_name, ticker=r_ticker, exchange=r_exch,
+                    headquarters=r_hq, founding_year=r_founded,
                 )
-                continue
+                if not buyer_co or not buyer_co.get("id"):
+                    continue
+                buyer_id   = buyer_co["id"]
+                buyer_mcap = buyer_co.get("market_cap_usd_bn")
 
-            resolved_name   = getattr(picked, "display_name", None) or cand.name
-            resolved_ticker = getattr(picked, "ticker", None) or cand.ticker_hint
-            # Exchange in Hinweis-Form (matcht _EXCHANGE_SUFFIX + companies.exchange).
-            resolved_exch   = cand.exchange_hint or getattr(picked, "display_exchange", None)
-            founded         = getattr(picked, "founded_year", None)
-            try:
-                founded_int = int(founded) if founded else None
-            except (ValueError, TypeError):
-                founded_int = None
-
-            # ── 3. find-or-create Buyer-Company ───────────────────────────────────
-            buyer_co = find_or_create_buyer_company(
-                name=resolved_name,
-                ticker=resolved_ticker,
-                exchange=resolved_exch,
-                headquarters=getattr(picked, "headquarters", None),
-                founding_year=founded_int,
-            )
-            if not buyer_co or not buyer_co.get("id"):
+            # Self-Edge- + Dedup-Schutz (CHECK fängt Self-Edge zusätzlich ab)
+            if buyer_id == company_id or buyer_id in seen_buyer_ids:
                 continue
-            buyer_id = buyer_co["id"]
-            if buyer_id == company_id:
-                continue  # Self-Edge-Schutz (CHECK fängt es zusätzlich ab)
-            if buyer_id in seen_buyer_ids:
-                continue  # Dedup innerhalb dieses Targets
             seen_buyer_ids.add(buyer_id)
 
-            # ── 4. Financials-Fill: nur wenn die Buyer-Company noch keine hat ─────
-            if not buyer_co.get("market_cap_usd_bn"):
-                yt = _yahoo_ticker(resolved_ticker or "", resolved_exch)
+            # ── 4. Financials-Fill: nur wenn noch keine market_cap bekannt ────────
+            if not buyer_mcap:
+                tk = (buyer_co.get("ticker")   if buyer_co else None) or cand.get("ticker_hint")
+                ex = (buyer_co.get("exchange") if buyer_co else None) or cand.get("exchange_hint")
+                yt = _yahoo_ticker(tk or "", ex)
                 if yt:
                     try:
                         fin = await asyncio.wait_for(
-                            asyncio.to_thread(_fetch_company_financials_sync, yt, resolved_exch),
+                            asyncio.to_thread(_fetch_company_financials_sync, yt, ex),
                             timeout=12.0,
                         )
                         persist_company_financials(
@@ -427,27 +648,39 @@ async def enrich_buyers_for_company(
                             fin.get("cash_usd_bn"),
                             fin.get("debt_ebitda"),
                         )
+                        buyer_mcap = fin.get("market_cap_usd_bn")
                     except asyncio.TimeoutError:
-                        logger.warning("Company-Fin Timeout für %s (%s)", resolved_name, yt)
+                        logger.warning("Company-Fin Timeout für %s (%s)", cand["name"], yt)
                     except Exception as e:
-                        logger.debug("Company-Fin failed für %s (%s): %s", resolved_name, yt, e)
+                        logger.debug("Company-Fin failed für %s (%s): %s", cand["name"], yt, e)
 
-            # ── 5. Kante sammeln ──────────────────────────────────────────────────
+            # ── 5. SIZE-GATE (Korrektheit) — materiell größer als das Target ──────
+            if not _passes_size_gate(buyer_mcap, target_size):
+                logger.debug(
+                    "Size-Gate: '%s' (mcap=%s) unter Schwelle für target_size=%s [%s] → raus",
+                    cand["name"], buyer_mcap, target_size, cand["source_type"],
+                )
+                continue
+
+            # ── 6. Kante mit Provenance ───────────────────────────────────────────
             edges.append({
                 "target_company_id":   company_id,
                 "buyer_company_id":    buyer_id,
-                "strategic_rationale": cand.strategic_rationale,
-                "confidence":          cand.confidence,
+                "strategic_rationale": cand.get("rationale_seed"),
+                "confidence":          cand.get("confidence", "medium"),
+                "source_type":         cand["source_type"],
+                "source_relevance":    cand.get("source_relevance"),
                 "generated_at":        now_iso,
             })
 
         if not edges:
-            logger.info("Buyer-Enrichment %s: 0 Kanten nach Resolve", name)
+            logger.info("Buyer-Enrichment %s: 0 Kanten nach Pool+Size-Gate", name)
             return 0
 
         written = upsert_potential_buyers(edges)
         logger.info(
-            "Buyer-Enrichment %s: %d Kandidaten → %d Kanten geschrieben",
-            name, len(candidates), written,
+            "Buyer-Enrichment %s: Pool=%d → %d Kanten (%s)",
+            name, len(pool), written,
+            ", ".join(sorted({e["source_type"] for e in edges})),
         )
         return written

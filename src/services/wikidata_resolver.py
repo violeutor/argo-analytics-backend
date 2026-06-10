@@ -350,6 +350,31 @@ LIMIT 10
 """
 
 
+# BUYER-IDENT-02 · Layer 2: listed Sektor-Incumbents über P452 (Industrie).
+# Matcht die Industrie per Label (Argo-`industry`/`category`-Text). P414-Pflicht
+# (?item wdt:P414 ?exchange) filtert hart auf börsennotiert — Käufer müssen
+# listed sein. Liefert dieselben Bindings wie _DIRECT_QUERY → _parse_binding nutzbar.
+_SECTOR_QUERY = """
+SELECT DISTINCT ?item ?itemLabel ?officialName ?ticker ?exchangeLabel ?hqLabel ?founded
+       ?dissolved ?mergedInto ?mergedIntoLabel
+       (IF(EXISTS {{ ?item wdt:P31/wdt:P279* {public_class}. }}, true, false) AS ?isPublic)
+WHERE {{
+  ?industry rdfs:label "{name}"@en .
+  ?item wdt:P452 ?industry ;
+        wdt:P31/wdt:P279* {business_class} ;
+        wdt:P414 ?exchange .
+  OPTIONAL {{ ?item wdt:P571 ?founded. }}
+  OPTIONAL {{ ?item wdt:P159 ?hq. }}
+  OPTIONAL {{ ?item wdt:P1448 ?officialName. FILTER(LANG(?officialName) = "en") }}
+  OPTIONAL {{ ?item wdt:P249 ?ticker. }}
+  OPTIONAL {{ ?item wdt:P576 ?dissolved. }}
+  OPTIONAL {{ ?item wdt:P7888 ?mergedInto. }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}}
+LIMIT 15
+"""
+
+
 async def _run_sparql(client: httpx.AsyncClient, query: str) -> tuple[list[dict], bool]:
     """
     SPARQL Query ausführen → (rows, ok).
@@ -434,6 +459,52 @@ def _sort_candidates(candidates: list[WikidataCandidate]) -> list[WikidataCandid
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
+
+async def find_sector_incumbents(
+    industry_label: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+) -> list[WikidataCandidate]:
+    """
+    BUYER-IDENT-02 · Layer 2. Listed Incumbents in einer Industrie (P452),
+    Industrie per Label gematcht. Reiner Kandidaten-Harvest für den Buyer-Pool —
+    KEINE Modal-/Resolution-Semantik, kein Cache (die Ergebnismenge ist breit und
+    nutzt sich anders ab als eine Identitäts-Auflösung).
+
+    Gibt listed-first sortierte Kandidaten zurück (Size-Gate filtert nachgelagert).
+    Bei Outage/Transport-Fehler (ok=False) → leere Liste (Layer degradiert sauber,
+    die Kaskade fällt auf Adjazenz/Haiku durch).
+    """
+    label = (industry_label or "").strip()
+    if not label:
+        return []
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, headers=_HEADERS)
+    try:
+        query = _SECTOR_QUERY.format(
+            name=label.replace('"', '\\"'),
+            business_class=_BUSINESS_CLASS,
+            public_class=_PUBLIC_CO_CLASS,
+        )
+        rows, ok = await _run_sparql_with_retry(client, query)
+        if not ok:
+            logger.warning("find_sector_incumbents '%s': SPARQL degraded → leer", label)
+            return []
+
+        cands = [c for row in rows
+                 if (c := _parse_binding(row, is_subsidiary=False)) is not None]
+        cands = _sort_candidates(_deduplicate(cands))
+        logger.info(
+            "find_sector_incumbents '%s': %d Kandidaten (%d listed)",
+            label, len(cands), sum(1 for c in cands if c.is_listed),
+        )
+        return cands
+    finally:
+        if owns_client:
+            await client.aclose()
+
 
 async def resolve_entity(
     name: str,
