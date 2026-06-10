@@ -340,6 +340,48 @@ def _derive_quadrant(deal_success_score: float, mfr: MFRResult) -> str:
     return "LowPotential_HighRisk"
 
 
+# ── Segment-Linse (BUYER-FE-RENDER-01 / SRR-SIZE-BIAS-01) ─────────────────────
+# customer_type bestimmt NUR die Anzeige-Reihenfolge der Buyer-Liste — NICHT die
+# Scores (SRR/MFR/TR sind betrachter-unabhängig) und NICHT das ma_aggregate
+# (intrinsische M&A-Stärke der Company). Zwei Sortier-Modi:
+#   transformativity → nach deal_success (höchster Upside-falls-Eintritt zuerst)
+#   probability      → Feasible-first, dann deal_success (wer kauft realistisch)
+# Mapping aus dem user_profiles-Schema-Kommentar (Z.388ff): ma_agency/pe/corporate
+# = Wahrscheinlichkeit; family_office/vc = Transformativität.
+_SEGMENT_LENS: dict[str, tuple[str, str]] = {
+    "family_office": ("transformativity", "Investitionspfad"),
+    "vc":            ("transformativity", "Exit-Landschaft"),
+    "other":         ("transformativity", "Investitionspfad"),
+    "pe":            ("probability",      "Exit & Buy-and-Build"),
+    "ma_agency":     ("probability",      "Käufer-Shortlist"),
+    "corporate":     ("probability",      "Build-vs-Buy"),
+}
+_MFR_RANK: dict[str, int] = {"Feasible": 0, "Watch": 1, "Overstretch": 2}
+
+
+def segment_lens(customer_type: str | None) -> tuple[str, str]:
+    """customer_type → (sort_mode, anzeige_label). Unbekannt → 'other'-Default."""
+    return _SEGMENT_LENS.get(customer_type or "other", _SEGMENT_LENS["other"])
+
+
+def sort_scorings_by_lens(scorings: list, customer_type: str | None) -> tuple[list, dict]:
+    """
+    Sortiert die Buyer-Scoring-Liste nach der customer_type-Linse (Read-Time, Anzeige).
+    Operiert duck-typed auf Objekten mit .mfr_signal + .deal_success_score
+    (z.B. ScoringDetail) — kein Import des Response-Modells nötig.
+    Returns (sortierte_liste, lens_meta) — lens_meta trägt Tab-Label + Modus fürs FE.
+    """
+    mode, label = segment_lens(customer_type)
+    if mode == "probability":
+        ordered = sorted(
+            scorings,
+            key=lambda s: (_MFR_RANK.get(s.mfr_signal, 3), -s.deal_success_score),
+        )
+    else:
+        ordered = sorted(scorings, key=lambda s: -s.deal_success_score)
+    return ordered, {"mode": mode, "label": label, "customer_type": customer_type or "other"}
+
+
 # ── Master scoring function ───────────────────────────────────────────────────
 
 def compute_scores(request: AnalyzeRequest) -> ScoreResult:

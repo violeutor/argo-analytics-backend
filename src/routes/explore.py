@@ -29,6 +29,7 @@ from typing import Optional
 from fastapi import APIRouter, Header, Query
 
 from src.integrations.supabase import get_supabase
+from src.services.auth_context import resolve_user_id as _resolve_user_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["explore"])
@@ -90,22 +91,7 @@ def _sort_key(company: dict, scores: dict, customer_type: str) -> float:
 
 
 # ── User-Kontext ──────────────────────────────────────────────────────────────
-
-def _resolve_user_id(authorization: str | None) -> str | None:
-    """
-    Löst user_id auf.
-    Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung).
-    Kein Token oder ungültiger Token → None (Feed antwortet leer).
-    """
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
-        try:
-            user = get_supabase().auth.get_user(token)
-            if user and user.user:
-                return str(user.user.id)
-        except Exception as e:
-            logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
-    return None
+# _resolve_user_id konsolidiert nach src/services/auth_context.py (AUTH-CONTEXT-01).
 
 
 def _get_user_context(user_id: str) -> tuple[list[str], str]:

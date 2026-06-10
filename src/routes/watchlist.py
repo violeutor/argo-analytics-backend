@@ -26,26 +26,10 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException
 
 from src.integrations.supabase import get_supabase
+from src.services.auth_context import resolve_user_id as _resolve_user_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["watchlist"])
-
-
-def _resolve_user_id(authorization: str | None) -> str | None:
-    """
-    Löst user_id auf.
-    Bearer-Token aus Authorization-Header → Supabase auth.get_user() (serverseitige Validierung).
-    Kein Token oder ungültiger Token → None (Endpoints antworten leer / 401).
-    """
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
-        try:
-            user = get_supabase().auth.get_user(token)
-            if user and user.user:
-                return str(user.user.id)
-        except Exception as e:
-            logger.debug("JWT-Auflösung fehlgeschlagen: %s", e)
-    return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

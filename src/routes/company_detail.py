@@ -14,7 +14,7 @@ import time
 import re
 import httpx
 from src.config import settings
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel
 
 from src.integrations.supabase import (
@@ -47,7 +47,8 @@ from src.services.market_data_enrichment import (
     enrich_market_data_sync_wrapper,
 )
 from src.services.value_drivers_enrichment import enrich_value_drivers
-from src.pipelines.scoring import compute_scores, compute_auto_tech_readiness
+from src.pipelines.scoring import compute_scores, compute_auto_tech_readiness, sort_scorings_by_lens
+from src.services.auth_context import resolve_user_context
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
     enrich_company,
@@ -272,6 +273,7 @@ class CompanyDetailResponse(BaseModel):
     # Scoring
     scorings: list[ScoringDetail]
     ma_aggregate: dict = {}   # BUYER-AGG-01: Top-3-feasible Mittelwert + Tooltip-Daten
+    lens: dict = {}           # BUYER-FE-RENDER-01: {mode, label, customer_type} — Anzeige-Linse je Segment
     # Supply chain
     supply_chain_upstream: list[dict]
     supply_chain_downstream: list[dict]
@@ -1870,7 +1872,7 @@ async def resolve_company(name: str) -> ResolveResponse:
 
 
 @router.get("/company/{name}", response_model=CompanyDetailResponse)
-async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None, lifecycle_status: str | None = None, consolidated_into_id: str | None = None, consolidated_into_name: str | None = None, dissolved_year: int | None = None, headquarters: str | None = None) -> CompanyDetailResponse:
+async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin: str | None = None, ticker: str | None = None, exchange: str | None = None, composite_figi: str | None = None, is_listed_hint: bool | None = None, lifecycle_status: str | None = None, consolidated_into_id: str | None = None, consolidated_into_name: str | None = None, dissolved_year: int | None = None, headquarters: str | None = None, authorization: str | None = Header(default=None)) -> CompanyDetailResponse:
     """
     is_listed_hint: vom Frontend nach /resolve gesetzt (resolved_is_listed).
     Wird in den Insert übernommen wenn Company noch nicht in DB.
@@ -1882,6 +1884,16 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     DE-Company (Bayer AG) als region=US landet und EDGAR SC 13G/13D-Calls feuert.
     """
     warnings: list[str] = []
+
+    # AUTH-GATE-01: company_detail ist kein öffentlicher Lookup (Sales-led —
+    # keine Leistung ohne Account). Kein gültiger User → 401. customer_type
+    # steuert die Buyer-Anzeige-Linse (sort_scorings_by_lens, weiter unten).
+    # Hinweis: der subscription_tier='pro'-Gate gehört als Middleware (eine Stelle,
+    # alle Endpoints) — bewusst NICHT hier pro-Endpoint gestreut (SUBSCRIPTION-GATE-01).
+    _ctx = resolve_user_context(authorization)
+    if _ctx is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    customer_type = _ctx.customer_type
 
     # 1. Lookup — gezielter Query statt fetch_companies(limit=500).
     #    Alt: alle 500 Companies laden + client-side durchsuchen — bei jedem Request.
@@ -3352,6 +3364,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             _ma_aggregate_meta = {"aggregate_score": None, "basis": "none",
                                   "deals_considered": 0, "feasible_count": 0, "contributors": []}
 
+    # BUYER-FE-RENDER-01 / SRR-SIZE-BIAS-01: customer_type-Linse sortiert NUR die
+    # Anzeige-Reihenfolge der Buyer. ma_aggregate (oben, deal_success-Basis) + _tr_ref
+    # wurden bereits berechnet und bleiben viewer-unabhängig — intrinsische M&A-Stärke
+    # der Company, nicht des Betrachters. Leere scorings → leer, lens_meta trägt das Label.
+    scorings, _lens_meta = sort_scorings_by_lens(scorings, customer_type)
+
     # 10. Supply chain
     sc_tags = COMPANY_TAGS.get(company_name, enrichment.tags)
     sc = get_supply_chain(sc_tags)
@@ -3546,6 +3564,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         warnings=warnings,
         scores=scores_result,
         ma_aggregate=_ma_aggregate_meta,
+        lens=_lens_meta,
         potential_buyers=[
             {
                 "name":                b.get("name"),
