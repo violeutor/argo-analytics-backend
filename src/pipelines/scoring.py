@@ -11,6 +11,11 @@ v1.1 — Auto TechReadiness:
   - compute_auto_tech_readiness(): berechnet TR-Basiswert aus Stage, Kategorie, Funding-Pace
   - Ersetzt pauschalen 0.5-Fallback für private Companies
   - tech_readiness_override in AnalyzeRequest: wenn gesetzt, überschreibt compute_tech_readiness()
+
+v1.2 — MFR Cash-Wiring + execution_warning (S65):
+  - BUYER-FIN-01-WIRE: buyer_cash_usd_bn fließt jetzt in MFR ein (war toter Parameter).
+    Feasibility basiert auf Netto-Finanzierungsbedarf (EV − deployable Cash), nicht roher EV.
+  - EXEC-WARN-WIRE: execution_warning blockiert das A-Rating (war berechnet, nie genutzt).
 """
 
 import math
@@ -41,6 +46,10 @@ _TR_WEIGHTS = {
 
 _MFR_FEASIBLE_THRESHOLD = 0.15
 _MFR_WATCH_THRESHOLD = 0.50
+
+# Anteil der Cash-Reserve, der realistisch für einen Deal einsetzbar ist
+# (Working Capital / Liquiditätspuffer bleibt). Tunable — 0.70 = konservativ.
+_DEPLOYABLE_CASH_FRACTION = 0.70
 
 _SRR_HIGH_STRATEGIC = 0.15
 _SRR_TRANSFORMATIONAL = 0.50
@@ -213,8 +222,20 @@ def compute_mfr(
     multiplier = stage_multiplier(target_stage) * vertical_delta(target_vertical)
     estimated_ev_usd_bn = (target_funding_usd_mn * multiplier) / 1000
 
-    mfr = estimated_ev_usd_bn / buyer_market_cap_usd_bn if buyer_market_cap_usd_bn > 0 else 999
+    # BUYER-FIN-01-WIRE: Cash-Polster reduziert den Finanzierungsbedarf.
+    # Vorher war buyer_cash_usd_bn ein toter Parameter — BUYER-FIN-01 holt die
+    # echte Cash via yfinance, aber sie floss nie in die Feasibility ein.
+    # Was nach Einsatz der liquiden Mittel bleibt (EV − Cash), muss über
+    # Debt/Equity gestemmt werden — DAS ist die Last relativ zur Marktkapitalisierung.
+    # _DEPLOYABLE_CASH_FRACTION: kein Käufer kippt 100% Treasury in einen Deal
+    # (Working Capital bleibt) — konservativer Anteil statt voller Reserve.
+    # Cash fehlt (None) → 0.0 = Käufer muss voll finanzieren, nie geschenkt.
+    deployable_cash = max(buyer_cash_usd_bn or 0.0, 0.0) * _DEPLOYABLE_CASH_FRACTION
+    net_financing_need = max(estimated_ev_usd_bn - deployable_cash, 0.0)
 
+    mfr = net_financing_need / buyer_market_cap_usd_bn if buyer_market_cap_usd_bn > 0 else 999
+
+    # Hohe Verschuldung verteuert die Restfinanzierung (Debt-Kapazität knapper).
     if buyer_debt_ebitda > 3.0:
         mfr = mfr * (1 + (buyer_debt_ebitda - 3.0) * 0.1)
 
@@ -290,7 +311,14 @@ def _normalize_mfr(mfr_value: float) -> float:
 # ── Rating & Quadrant ─────────────────────────────────────────────────────────
 
 def _derive_rating(srr: SRRResult, mfr: MFRResult, tr: TechReadinessResult) -> str:
-    if srr.category == "Transformational++" and mfr.signal == "Feasible" and tr.value >= 0.6:
+    # EXEC-WARN-WIRE: execution_warning (low-cap + SRR>5) = Buyer-seitiges
+    # Integrationsrisiko. Vorher berechnet, aber nie genutzt — ein kleiner Käufer
+    # konnte "A · No-Brainer" UND execution-geflaggt sein (Widerspruch).
+    # TechReadiness misst nur Target-Reife, nicht ob der Käufer die Übernahme
+    # schultern kann. → A blockiert bei Warnung, fällt in den B-Pfad.
+    # Die Flag bleibt auf dem SRRResult → Frontend zeigt Badge unabhängig vom Rating.
+    if (srr.category == "Transformational++" and mfr.signal == "Feasible"
+            and tr.value >= 0.6 and not srr.execution_warning):
         return "A · No-Brainer"
     if srr.category in ("Transformational++", "Transformational") and mfr.signal in ("Feasible", "Watch") and tr.value >= 0.5:
         return "B · Solide"
