@@ -3040,6 +3040,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     if fd_source.get("quality_flag") == "partial" and is_listed:
         warnings.append("Marktdaten eingeschränkt verfügbar — kleinere Börse, Yahoo Finance lückenhaft.")
 
+    # BUYER-AS-COMPANY-01: Target-Financials in die companies-SSOT persistieren.
+    # market_cap war bisher Request-Live + weggeworfen — jetzt gespeichert, damit
+    # (a) das target-seitige Acquirability-Gate sie kennt und (b) diese Company als
+    # Buyer eines anderen Targets per JOIN ihre market_cap mitbringt. Nicht-None only.
+    if company_id and (fundamentals.market_cap_bn is not None or fundamentals.debt_ebitda is not None):
+        try:
+            from src.integrations.supabase import persist_company_financials
+            persist_company_financials(
+                company_id,
+                market_cap_usd_bn=fundamentals.market_cap_bn,
+                debt_ebitda=fundamentals.debt_ebitda,
+            )
+        except Exception as _fin_err:
+            logger.debug("persist_company_financials für %s übersprungen: %s", company_name, _fin_err)
+
     # 7. Ownership
     if company_name in _OWNERSHIP_OVERRIDES:
         ownership = _OWNERSHIP_OVERRIDES[company_name]

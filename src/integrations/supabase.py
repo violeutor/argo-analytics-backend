@@ -865,17 +865,52 @@ def upsert_company_scores(company_id: str, scores: dict) -> bool:
 
 def fetch_potential_buyers(company_id: str) -> list[dict]:
     """
-    R-23: Gibt company-spezifische Käufer aus potential_buyers zurück.
-    Sortiert nach generated_at DESC — stellt sicher dass is_cache_valid()
-    den neuesten Eintrag prüft (BUG-32: war order("confidence") → unzuverlässig).
-    Leere Liste wenn noch nicht generiert oder TTL abgelaufen.
+    BUYER-AS-COMPANY-01: Gibt die Buyer-KANTEN eines Targets zurück, gejoint mit
+    der jeweiligen Buyer-companies-Row. Liefert die Legacy-Dict-Form
+    (name/ticker/exchange/market_cap_usd_bn/cash_usd_bn/debt_ebitda/
+    strategic_rationale/confidence/generated_at), damit der Scoring-Pfad in
+    company_detail.py unverändert weiterläuft.
+
+    Financials kommen aus companies (SSOT), name/ticker/exchange ebenfalls;
+    strategic_rationale + confidence + generated_at sind Kanten-Eigenschaften.
+    Sortiert nach generated_at DESC — is_cache_valid() prüft den neuesten Eintrag.
     """
     db = get_supabase()
     try:
-        result = db.table("potential_buyers").select("*").eq(
-            "company_id", company_id
-        ).order("generated_at", desc=True).execute()
-        return result.data or []
+        edges = (db.table("potential_buyers").select(
+            "buyer_company_id, strategic_rationale, confidence, generated_at"
+        ).eq("target_company_id", company_id)
+         .order("generated_at", desc=True).execute().data) or []
+        if not edges:
+            return []
+
+        buyer_ids = [e["buyer_company_id"] for e in edges if e.get("buyer_company_id")]
+        if not buyer_ids:
+            return []
+
+        comp_rows = (db.table("companies").select(
+            "id, name, ticker, exchange, market_cap_usd_bn, cash_usd_bn, debt_ebitda"
+        ).in_("id", buyer_ids).execute().data) or []
+        comp_by_id = {c["id"]: c for c in comp_rows}
+
+        out: list[dict] = []
+        for e in edges:
+            c = comp_by_id.get(e.get("buyer_company_id"))
+            if not c:
+                continue  # Buyer-Company gelöscht (CASCADE) o.ä. → Kante überspringen
+            out.append({
+                "buyer_company_id":    c["id"],
+                "name":                c.get("name"),
+                "ticker":              c.get("ticker"),
+                "exchange":            c.get("exchange"),
+                "market_cap_usd_bn":   c.get("market_cap_usd_bn"),
+                "cash_usd_bn":         c.get("cash_usd_bn"),
+                "debt_ebitda":         c.get("debt_ebitda"),
+                "strategic_rationale": e.get("strategic_rationale"),
+                "confidence":          e.get("confidence"),
+                "generated_at":        e.get("generated_at"),
+            })
+        return out
     except Exception as e:
         logger.warning("fetch_potential_buyers failed für %s: %s", company_id, e)
         return []
@@ -883,9 +918,11 @@ def fetch_potential_buyers(company_id: str) -> list[dict]:
 
 def upsert_potential_buyers(rows: list[dict]) -> int:
     """
-    R-23: Schreibt potential_buyers in DB.
-    UNIQUE(company_id, name) → ON CONFLICT DO UPDATE (aktualisiert market_cap + generated_at).
-    Gibt Anzahl geschriebener Rows zurück.
+    BUYER-AS-COMPANY-01: Schreibt Buyer-KANTEN.
+    Erwartet Rows mit target_company_id, buyer_company_id, strategic_rationale,
+    confidence, generated_at. UNIQUE(target_company_id, buyer_company_id) →
+    ON CONFLICT DO UPDATE (aktualisiert rationale/confidence/generated_at).
+    Gibt Anzahl geschriebener Kanten zurück.
     """
     if not rows:
         return 0
@@ -895,13 +932,96 @@ def upsert_potential_buyers(rows: list[dict]) -> int:
         try:
             db.table("potential_buyers").upsert(
                 row,
-                on_conflict="company_id,name",
+                on_conflict="target_company_id,buyer_company_id",
             ).execute()
             written += 1
         except Exception as e:
-            logger.warning("upsert_potential_buyers failed für %s: %s", row.get("name"), e)
-    logger.info("upsert_potential_buyers: %d/%d geschrieben", written, len(rows))
+            logger.warning("upsert_potential_buyers failed für %s: %s",
+                           row.get("buyer_company_id"), e)
+    logger.info("upsert_potential_buyers: %d/%d Kanten geschrieben", written, len(rows))
     return written
+
+
+def find_or_create_buyer_company(
+    *,
+    name: str,
+    ticker: str | None = None,
+    exchange: str | None = None,
+    headquarters: str | None = None,
+    founding_year: int | None = None,
+) -> dict | None:
+    """
+    BUYER-AS-COMPANY-01: Findet eine bestehende companies-Row über Ticker (Anker)
+    oder Name, oder legt eine neue listed-Company an (source='buyer_gen').
+
+    Ein Buyer ist per Generierungsregel + Resolver-Auto-Pick IMMER börsennotiert →
+    vereinfachter Insert (ticker+exchange gesetzt, ipo_status='listed'), keine
+    Lifecycle-/Private-Logik wie im company_detail-Cold-Path nötig.
+
+    Identitäts-Match: Ticker zuerst (case-insensitiv exakt), dann Name. Cross-
+    Listing-Kollisionen (gleicher Ticker, andere Börse) sind bei distinkten
+    Large-Caps selten — bekannte Einschränkung, kein Blocker.
+
+    Gibt die companies-Row zurück (inkl. market_cap_usd_bn) oder None bei Fehler.
+    """
+    db = get_supabase()
+    try:
+        if ticker:
+            hit = (db.table("companies").select("*")
+                   .ilike("ticker", ticker).limit(1).execute().data)
+            if hit:
+                return hit[0]
+        hit = (db.table("companies").select("*")
+               .ilike("name", name).limit(1).execute().data)
+        if hit:
+            return hit[0]
+    except Exception as e:
+        logger.warning("find_or_create_buyer_company lookup failed für %s: %s", name, e)
+
+    payload: dict = {
+        "name":              name,
+        "source":            "buyer_gen",
+        "enrichment_status": "pending",
+        "ipo_status":        "listed",   # is_listed (generated) folgt aus ticker IS NOT NULL
+    }
+    if ticker:        payload["ticker"]        = ticker
+    if exchange:      payload["exchange"]      = exchange
+    if headquarters:  payload["headquarters"]  = headquarters
+    if founding_year: payload["founding_year"] = founding_year
+
+    try:
+        res = db.table("companies").insert(payload).execute()
+        if res.data:
+            logger.info("find_or_create_buyer_company: neue Buyer-Company '%s' (%s)", name, ticker)
+            return res.data[0]
+    except Exception as e:
+        logger.warning("find_or_create_buyer_company insert failed für %s: %s", name, e)
+    return None
+
+
+def persist_company_financials(
+    company_id: str,
+    market_cap_usd_bn: float | None,
+    cash_usd_bn: float | None = None,
+    debt_ebitda: float | None = None,
+) -> None:
+    """
+    BUYER-AS-COMPANY-01: Schreibt Financials in die companies-SSOT-Spalten.
+    Nur Nicht-None-Werte (kein None-Overwrite vorhandener DB-Werte). Setzt
+    financials_updated_at. Quelle für Buyer-JOIN + (später) Target-Cache.
+    """
+    payload: dict = {}
+    if market_cap_usd_bn is not None: payload["market_cap_usd_bn"] = market_cap_usd_bn
+    if cash_usd_bn       is not None: payload["cash_usd_bn"]       = cash_usd_bn
+    if debt_ebitda       is not None: payload["debt_ebitda"]       = debt_ebitda
+    if not payload:
+        return
+    from datetime import datetime, timezone
+    payload["financials_updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        get_supabase().table("companies").update(payload).eq("id", company_id).execute()
+    except Exception as e:
+        logger.warning("persist_company_financials failed für %s: %s", company_id, e)
 
 
 def fetch_company_scores(company_id: str) -> dict | None:
