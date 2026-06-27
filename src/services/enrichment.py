@@ -108,6 +108,37 @@ class EnrichmentResult:
     )
 
 
+# IPO-STATUS-ENUM-01: EnrichmentResult.ipo_status ist intern ein binäres
+# Listed/Private-Signal aus der Wikipedia-Infobox (BUG-47, Zeile ~393).
+# Die DB-Spalte companies.ipo_status ist KEIN Boolean, sondern eine
+# IPO-Wahrscheinlichkeits-Gradiente für nicht-gelistete Companies:
+# {pre_ipo_low, pre_ipo_medium, pre_ipo_high, listed}. "private" ist dort
+# kein gültiger Wert → ALTER TYPE-Violation beim Insert/Update (S68,
+# _enrich_new_peer-Crash). Root Cause: zwei Konzepte teilen sich einen
+# Feldnamen. Diese Funktion ist die EINZIGE Stelle, die den internen
+# Enrichment-Wert auf den DB-Enum mappt — beide Write-Sites (peers.py,
+# company_detail.py) müssen sie nutzen statt enriched.ipo_status direkt
+# zu schreiben.
+def normalize_ipo_status_for_db(raw_ipo_status: str | None) -> str | None:
+    """
+    Mappt EnrichmentResult.ipo_status (Listed/Private-Binärsignal) auf einen
+    gültigen companies.ipo_status-Enum-Wert.
+
+    "listed"  → "listed" (deckungsgleich, durchlassen)
+    "private" → None (KEIN Schreiben) — wir haben aus Wikipedia nur das
+                Faktum "privat", keine Evidenz für IPO-Nähe. Eine
+                pre_ipo_*-Stufe zu erraten wäre Daten-Fabrikation
+                (verstößt gegen "kein LLM-Inferenz für Anzeigewerte"
+                und Verlustfreiheit-Prinzip: lieber NULL als falscher
+                Wert). Qualitative Private-Signale gehören ins separate
+                Freitext-Feld `ipo_potential`, nicht in diesen Enum.
+    Alles andere (None, unbekannte Werte) → None.
+    """
+    if raw_ipo_status == "listed":
+        return "listed"
+    return None
+
+
 # ─── Investor classifier ──────────────────────────────────────────────────────
 
 _VC_KW     = ["ventures", "venture", "capital", "partners", "fund", "equity", "growth", "invest"]

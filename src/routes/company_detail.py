@@ -57,6 +57,7 @@ from src.services.enrichment import (
     BundesanzeigerData,
     EnrichmentResult,
     _is_likely_german,
+    normalize_ipo_status_for_db,
 )
 from src.services.wikidata_resolver import resolve_entity, WikidataCandidate
 
@@ -2541,10 +2542,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             upsert_payload["website"]       = _enriched_website
         if _enriched_tags:
             upsert_payload["tags"]          = _enriched_tags
-        # BUG-47: ipo_status aus EnrichmentResult in DB schreiben
-        # Nur wenn Enrichment einen Wert liefert UND DB noch keinen hat
-        if enrichment.ipo_status and not company.get("ipo_status"):
-            upsert_payload["ipo_status"] = enrichment.ipo_status
+        # IPO-STATUS-ENUM-01 (vormals BUG-47): enrichment.ipo_status ist ein
+        # internes Listed/Private-Binärsignal, kein DB-Enum-Wert.
+        # normalize_ipo_status_for_db mappt "private" auf None statt eine
+        # pre_ipo_*-Stufe zu erraten (gleicher Bug wie peers.py::_enrich_new_peer,
+        # S68 — dort als Crash sichtbar geworden, hier bisher latent).
+        _ipo_status_for_db = normalize_ipo_status_for_db(enrichment.ipo_status)
+        if _ipo_status_for_db and not company.get("ipo_status"):
+            upsert_payload["ipo_status"] = _ipo_status_for_db
         # BUG-34 complete: Wikipedia-Titel als kanonischen Namen übernehmen
         # ("Linde" → "Linde plc", "SpaceX" → korrekte Schreibweise)
         # Nur wenn enrichment.name vom DB-Namen abweicht und plausibel ist

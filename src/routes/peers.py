@@ -399,7 +399,9 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
     """
     import re as _re
     try:
-        from src.services.enrichment import enrich_company, infer_category_industry
+        from src.services.enrichment import (
+            enrich_company, infer_category_industry, normalize_ipo_status_for_db,
+        )
         from src.integrations.supabase import upsert_company_enrichment
 
         # Peer-Row aus DB holen für Guards (ipo_status, ticker, category)
@@ -450,9 +452,12 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
             "tags":          enriched.tags if enriched.tags else None,
         }
 
-        # ipo_status: nur schreiben wenn Enrichment Wert hat und DB noch keinen
-        if enriched.ipo_status and not peer_record.get("ipo_status"):
-            upsert_payload["ipo_status"] = enriched.ipo_status
+        # IPO-STATUS-ENUM-01: enriched.ipo_status ist ein internes Listed/
+        # Private-Binärsignal, kein DB-Enum-Wert — normalize_ipo_status_for_db
+        # mappt "private" auf None statt eine pre_ipo_*-Stufe zu erraten.
+        _ipo_status_for_db = normalize_ipo_status_for_db(enriched.ipo_status)
+        if _ipo_status_for_db and not peer_record.get("ipo_status"):
+            upsert_payload["ipo_status"] = _ipo_status_for_db
 
         # Ticker + Exchange: nur für börsennotierte Companies
         _is_listed = (
