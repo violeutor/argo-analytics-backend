@@ -420,7 +420,10 @@ async def get_assessments(name: str):
             if e.response.status_code == 529:
                 logger.warning("Claude 529 overloaded for %s — using scores only", name)
             else:
-                logger.error("Claude narrative call failed for %s: %s", name, e)
+                logger.error(
+                    "Claude narrative call failed for %s: %s — body: %s",
+                    name, e, e.response.text[:500],
+                )
         except Exception as e:
             logger.warning("Claude narrative call failed for %s: %s — scores still returned", name, e)
 

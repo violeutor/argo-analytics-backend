@@ -298,7 +298,7 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
             )
 
         if resp.status_code != 200:
-            logger.warning("Claude Peer-Gen API %s", resp.status_code)
+            logger.warning("Claude Peer-Gen API %s — body: %s", resp.status_code, resp.text[:500])
             return [], {}
 
         raw = resp.json()["content"][0]["text"].strip()
