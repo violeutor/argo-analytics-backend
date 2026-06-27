@@ -471,6 +471,69 @@ async def fetch_competition_signals(sector: str, category: str) -> dict:
     }
 
 
+# ── PEER-IDENT-01 · Existenz-Check für Haiku-generierte Peer-Namen ───────────
+# Gleicher html.duckduckgo.com-Mechanismus wie oben (echtes SERP, kein
+# Instant-Answer-API-Lookup) — hier als reiner Existenz-Ja/Nein-Check statt
+# Fragmentierungs-Proxy. Fallback-Stufe NACH dem Wikidata-Resolve in
+# peers.py::_resolve_or_create_peer; greift v.a. bei kleinen/privaten
+# Companies, die Wikidata nicht kennt.
+
+async def check_entity_existence(name: str) -> tuple[bool, str]:
+    """
+    Prüft, ob ein Firmenname eine plausible echte Web-Präsenz hat — kein
+    Ranking, keine Disambiguierung, nur Treffer ja/nein. Zwei Stufen:
+
+      1. site:crunchbase.com "{name}" — ein Crunchbase-Eintrag ist ein
+         stärkeres Signal (kuratiert) als zufällige Presse-Erwähnung.
+      2. "{name}" company — generischer Fallback wenn (1) leer bleibt
+         (DDGs Indextiefe für einzelne Crunchbase-Seiten ist unklar).
+
+    Gibt (found, source) zurück — source ist direkt der identity_confidence-
+    Wert für den Aufrufer ("verified_ddg_crunchbase" | "verified_ddg_web" |
+    "unverified"). Kein Scraping von Crunchbase selbst — nur das, was DDG
+    bereits indexiert hat, genau wie bei _fetch_market_snippets.
+    """
+    if not name or not name.strip():
+        return False, "unverified"
+
+    queries = [
+        (f'site:crunchbase.com "{name}"', "verified_ddg_crunchbase"),
+        (f'"{name}" company', "verified_ddg_web"),
+    ]
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=10,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+            follow_redirects=True,
+        ) as client:
+            for q, source in queries:
+                try:
+                    resp = await client.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": q},
+                    )
+                    if resp.status_code == 200:
+                        hits = re.findall(
+                            r'class="result__snippet"[^>]*>([^<]{20,300})<',
+                            resp.text,
+                        )
+                        if hits:
+                            logger.debug(
+                                "check_entity_existence('%s'): Treffer via %s (%d Snippets)",
+                                name, source, len(hits),
+                            )
+                            return True, source
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.debug("check_entity_existence query failed ('%s'): %s", q[:50], e)
+    except Exception as e:
+        logger.debug("check_entity_existence failed für '%s': %s", name, e)
+
+    logger.info("check_entity_existence('%s'): kein Treffer in beiden Stufen → unverified", name)
+    return False, "unverified"
+
+
 def compute_competition_score(
     category: str,
     all_companies: list[dict],

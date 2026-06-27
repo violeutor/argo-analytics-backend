@@ -17,6 +17,7 @@ Pipeline:
   6. Peer-Daten aus DB aggregieren + zurückgeben
 """
 
+import asyncio
 import logging
 import json
 import re
@@ -337,6 +338,22 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
 
 # ── Peer auflösen / anlegen ───────────────────────────────────────────────────
 
+def _autopick_peer(result) -> "object | None":
+    """
+    PEER-IDENT-01 · Nicht-interaktiver Pick aus einem WikidataResolutionResult,
+    analog zu buyer_enrichment._autopick_listed — aber OHNE Listed-Zwang: ein
+    Peer darf (und ist meistens) privat sein, anders als ein Buyer. Nimmt den
+    direkten Treffer wenn vorhanden, sonst den ersten Kandidaten — bewusst
+    keine Disambiguierungs-Logik hier (DISAMBIG-REVIEW-01 ist der richtige,
+    eigenständige Ort dafür, nicht dieser stille Background-Call).
+    """
+    resolved = getattr(result, "resolved", None)
+    if resolved is not None:
+        return resolved
+    candidates = getattr(result, "candidates", None) or []
+    return candidates[0] if candidates else None
+
+
 async def _resolve_or_create_peer(
     db,
     peer_name: str,
@@ -346,7 +363,16 @@ async def _resolve_or_create_peer(
     """
     Gibt (UUID, is_new) zurück.
     is_new=True wenn der Peer neu in der DB angelegt wurde → Enrichment triggern.
-    Wenn nicht in DB: minimalen Row anlegen (Enrichment läuft im Background).
+
+    PEER-IDENT-01: Vor dem Insert wird die Identität geprüft statt der Haiku-
+    Behauptung blind zu vertrauen — Wikidata-Resolve (Auto-Pick, kein Modal,
+    KEIN Listed-Zwang, anders als bei Buyern) → bei Fehlschlag DDG-Existenz-
+    Check (Crunchbase-Site-Scope, dann generisch). Bleibt auch das leer, wird
+    TROTZDEM angelegt — nur als identity_confidence='unverified' geflaggt,
+    statt verworfen zu werden. Drop wie bei Buyern wäre hier verlustreich:
+    kleine/private Wettbewerber, die schlicht nicht indexiert sind, sind
+    trotzdem reale Companies — anders als ein unauflösbarer Buyer-Name, der
+    per Definition kein tauglicher Buyer ist.
     """
     # Exakter Match (case-insensitive)
     existing_id = name_to_id.get(peer_name.lower())
@@ -358,22 +384,77 @@ async def _resolve_or_create_peer(
         if peer_name.lower() in db_name or db_name in peer_name.lower():
             return db_id, False
 
-    # Nicht gefunden → minimal anlegen
+    # ── PEER-IDENT-01: Identität prüfen, bevor wir eine companies-Row anlegen ──
+    resolved_name:       str        = peer_name
+    resolved_ticker:     str | None = None
+    resolved_exchange:   str | None = None
+    resolved_hq:         str | None = None
+    resolved_founded:    int | None = None
+    identity_confidence: str        = "unverified"
+
+    try:
+        from src.services.wikidata_resolver import resolve_entity
+        async with httpx.AsyncClient(timeout=10.0) as _wd_client:
+            wd_result = await resolve_entity(peer_name, client=_wd_client)
+        picked = _autopick_peer(wd_result)
+        if picked is not None:
+            resolved_name     = getattr(picked, "display_name", None) or getattr(picked, "name", None) or peer_name
+            resolved_ticker   = getattr(picked, "ticker", None)
+            resolved_exchange = getattr(picked, "display_exchange", None)
+            resolved_hq       = getattr(picked, "headquarters", None)
+            _founded = getattr(picked, "founded_year", None)
+            try:
+                resolved_founded = int(_founded) if _founded else None
+            except (ValueError, TypeError):
+                resolved_founded = None
+            identity_confidence = "verified_wikidata"
+    except Exception as e:
+        logger.debug("PEER-IDENT-01 Wikidata-Resolve failed für '%s': %s", peer_name, e)
+
+    if identity_confidence == "unverified":
+        try:
+            from src.services.market_data_enrichment import check_entity_existence
+            found, source = await check_entity_existence(peer_name)
+            if found:
+                identity_confidence = source
+        except Exception as e:
+            logger.debug("PEER-IDENT-01 DDG-Existenz-Check failed für '%s': %s", peer_name, e)
+
+    if identity_confidence == "unverified":
+        logger.info(
+            "PEER-IDENT-01: '%s' weder via Wikidata noch DDG verifizierbar → "
+            "wird trotzdem angelegt, aber als unverified geflaggt (kein Drop)",
+            peer_name,
+        )
+
+    # Nicht in DB → anlegen (mit Resolve-Daten falls vorhanden + identity_confidence)
     for source_val in ("peer_generated", "manual"):
         try:
             payload = {
-                "name":            peer_name,
-                "source":          source_val,
-                "investment_path": "Beobachten",
+                "name":                resolved_name,
+                "source":              source_val,
+                "investment_path":     "Beobachten",
                 # Industrie vom Source-Company übernehmen als Startwert
-                "industry":        source_company.get("industry"),
-                "category":        source_company.get("category"),
-                "region":          source_company.get("region"),
+                "industry":            source_company.get("industry"),
+                "category":            source_company.get("category"),
+                "region":              source_company.get("region"),
+                "identity_confidence": identity_confidence,
             }
+            if resolved_ticker:
+                payload["ticker"] = resolved_ticker
+            if resolved_exchange:
+                payload["exchange"] = resolved_exchange
+            if resolved_hq:
+                payload["headquarters"] = resolved_hq
+            if resolved_founded:
+                payload["founding_year"] = resolved_founded
             result = db.table("companies").insert(payload).execute()
             if result.data:
                 new_id = result.data[0]["id"]
-                logger.info("Peer angelegt: %s → %s (source=%s)", peer_name, new_id, source_val)
+                logger.info(
+                    "Peer angelegt: %s → %s (source=%s, identity_confidence=%s)",
+                    resolved_name, new_id, source_val, identity_confidence,
+                )
                 return new_id, True
             break
         except Exception as e:
@@ -391,11 +472,14 @@ async def _resolve_or_create_peer(
 async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
     """
     R-21: Vollständiges Enrichment für Peer-Companies (neu oder ohne Score).
-    Stufe 1: Wikipedia + Crunchbase → vollständige Persistenz via upsert_company_enrichment
-             (identischer Pfad wie company_detail.py — tags, category, industry, ipo_status,
-             ticker, exchange, region werden korrekt geschrieben)
-    Stufe 2: TAM-Lookup + Market Data Enrichment (async, non-blocking)
-    Stufe 3: Scoring mit frischen Daten
+    Stufe 1:   Wikipedia + Crunchbase → vollständige Persistenz via upsert_company_enrichment
+               (identischer Pfad wie company_detail.py — tags, category, industry, ipo_status,
+               ticker, exchange, region werden korrekt geschrieben)
+    Stufe 1.5: FUND-PRIORITY-01 — Financials (market_cap/cash/debt_ebitda) via yfinance,
+               VOR TAM/Market/Scoring. Gated auf identity_confidence (PEER-IDENT-01) —
+               kein Financials-Call für frisch als 'unverified' geflaggte Peers.
+    Stufe 2:   TAM-Lookup + Market Data Enrichment (async, non-blocking)
+    Stufe 3:   Scoring mit frischen Daten
     """
     import re as _re
     try:
@@ -409,7 +493,11 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
         peer_row_res = db.table("companies").select("*").eq("id", peer_id).limit(1).execute()
         peer_record  = (peer_row_res.data or [{}])[0]
 
-        enriched = await enrich_company(peer_name, company_record=peer_record)
+        # PEER-IDENT-01: Falls das Gate einen kanonischen Namen aufgelöst hat
+        # (Wikidata-Resolve in _resolve_or_create_peer), ist der präziser als
+        # der rohe Haiku-Name — bessere Trefferquote bei der Wikipedia-Suche.
+        _lookup_name = peer_record.get("name") or peer_name
+        enriched = await enrich_company(_lookup_name, company_record=peer_record)
         if not enriched:
             logger.debug("_enrich_new_peer: kein Ergebnis für %s", peer_name)
             return
@@ -493,6 +581,63 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
 
     except Exception as e:
         logger.warning("_enrich_new_peer Enrichment failed für %s: %s", peer_name, e)
+
+    # ── FUND-PRIORITY-01 · Stufe 1.5: Financials VOR TAM/Market/Scoring ──────
+    # Quantitative Kerndaten sind die Berechnungsgrundlage für Size-Gate/Scoring
+    # (Prinzip Financial-Fundamentals-Priorität, S67) → deshalb hier, vor Stufe 2.
+    # Gated auf identity_confidence (PEER-IDENT-01): ein als 'unverified'
+    # geflaggter Peer bekommt noch keinen yfinance-Call spendiert. Legacy-Rows
+    # ohne den Wert (NULL, vor der Migration angelegt) werden NICHT blockiert —
+    # nur ein explizit geprüftes und leeres Ergebnis blockt.
+    # Eigener, frischer DB-Read statt Wiederverwendung der Stufe-1-Variablen
+    # (upsert_payload/enriched) — die könnten unbound sein, wenn Stufe 1 mitten
+    # in ihrem try-Block gescheitert ist (SNIPPETS-UNBOUND-01-Muster, hier
+    # bewusst nicht wiederholt).
+    try:
+        db = get_supabase()
+        _fin_row = db.table("companies").select(
+            "ticker, exchange, identity_confidence, market_cap_usd_bn"
+        ).eq("id", peer_id).limit(1).execute()
+        _fin_record = (_fin_row.data or [{}])[0]
+
+        _fin_ticker   = _fin_record.get("ticker")
+        _fin_exchange = _fin_record.get("exchange")
+        _fin_id_conf  = _fin_record.get("identity_confidence")
+
+        if _fin_id_conf == "unverified":
+            logger.debug(
+                "Peer %s: Financials-Fetch übersprungen (identity_confidence=unverified)",
+                peer_name,
+            )
+        elif _fin_ticker and not _fin_record.get("market_cap_usd_bn"):
+            from src.integrations.supabase import persist_company_financials
+            from src.services.buyer_enrichment import (
+                _fetch_company_financials_sync, _yahoo_ticker,
+            )
+
+            _yt = _yahoo_ticker(_fin_ticker, _fin_exchange)
+            if _yt:
+                fin = await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_company_financials_sync, _yt, _fin_exchange),
+                    timeout=12.0,
+                )
+                if fin.get("market_cap_usd_bn") is not None or fin.get("debt_ebitda") is not None:
+                    persist_company_financials(
+                        peer_id,
+                        fin.get("market_cap_usd_bn"),
+                        fin.get("cash_usd_bn"),
+                        fin.get("debt_ebitda"),
+                    )
+                    logger.info(
+                        "Peer %s Financials enriched (FUND-PRIORITY-01): mcap=%s cash=%s debt_ebitda=%s",
+                        peer_name, fin.get("market_cap_usd_bn"),
+                        fin.get("cash_usd_bn"), fin.get("debt_ebitda"),
+                    )
+
+    except asyncio.TimeoutError:
+        logger.warning("_enrich_new_peer Financials-Fetch Timeout für %s", peer_name)
+    except Exception as e:
+        logger.warning("_enrich_new_peer Financials-Fetch failed für %s: %s", peer_name, e)
 
     # ── R-21 Stufe 2: TAM + Market Data ──────────────────────────────────────
     # Non-blocking — Fehler hier stoppen nicht die Peer-Generierung
