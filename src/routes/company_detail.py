@@ -289,8 +289,6 @@ class CompanyDetailResponse(BaseModel):
     warnings: list[str]
     # SC-01–SC-13: Scoring Engine
     scores: dict | None = None      # ScoreResult.to_dict() — hero_path, rating, alle Sub-/Path-Scores
-    # Potential Buyers — für Tab 8 Investitionspfade
-    potential_buyers: list[dict] = []
 
 
 def _parse_year(value: str | None) -> int | None:
@@ -3478,10 +3476,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     for key in ("enablers", "contributors"):
                         vd_list.extend(vd_cached_now.get(key) or [])
 
-                # BUYER-MFR-01: Rohe Buyer durchreichen inkl. market_cap_usd_bn.
-                # MFR wird zentral in compute_all_scores via annotate_buyers_with_mfr
-                # berechnet. Der alte Pfad mappte b["mfr_confidence"] (existiert nicht
-                # auf potential_buyers) und verwarf market_cap_usd_bn → MFR unmöglich.
+                # BUYER-MFR-01 (korrigiert): Rohe Buyer durchreichen inkl. market_cap_usd_bn
+                # für compute_all_scores (SC-02/Enabler-Signatur). Die echte Per-Buyer-MFR
+                # lebt in scoring.py::compute_mfr() und füttert die scorings-Liste — NICHT
+                # eine "annotate_buyers_with_mfr" (existierte nie, war Phantom-Referenz,
+                # verursachte ImportError bei jedem Load). Totes potential_buyers-Response-
+                # Feld + Annotation-Versuch entfernt (S68) — Frontend rendert nur scorings.
                 buyers_raw = [
                     {
                         "name":              b.get("name"),
@@ -3535,17 +3535,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         except Exception as _sc_err:
             logger.warning("SC scoring failed for %s: %s", company_name, _sc_err)
 
-    # BUYER-MFR-01: Buyer für die Response mit MFR annotieren — dieselbe Logik
-    # wie im Scoring (annotate_buyers_with_mfr), damit Frontend-Anzeige und
-    # SC-02-Bonus garantiert dasselbe MFR zeigen. Eine Quelle.
-    _buyers_for_response = buyers or []
-    if _buyers_for_response:
-        try:
-            from src.services.valuation import annotate_buyers_with_mfr
-            _buyers_for_response = annotate_buyers_with_mfr(_buyers_for_response, company)
-        except Exception as _mfr_err:
-            logger.warning("BUYER-MFR-01: Response-Annotation fehlgeschlagen für %s: %s", company_name, _mfr_err)
-
     return CompanyDetailResponse(
         id=company.get("id"),    # FE-COMPANYID-01: company_id durchreichen für Watchlist + kpi-timeseries
         name=company_name,
@@ -3596,19 +3585,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         scores=scores_result,
         ma_aggregate=_ma_aggregate_meta,
         lens=_lens_meta,
-        potential_buyers=[
-            {
-                "name":                b.get("name"),
-                "ticker":              b.get("ticker"),
-                "exchange":            b.get("exchange"),
-                "market_cap_usd_bn":   b.get("market_cap_usd_bn"),
-                "strategic_rationale": b.get("strategic_rationale"),
-                "confidence":          b.get("confidence"),
-                "mfr":                 b.get("mfr"),         # BUYER-MFR-01: Feasible|Stretch|Unfeasible|Unknown
-                "mfr_ratio":           b.get("mfr_ratio"),   # Buyer-MktCap ÷ Target-Bewertung
-            }
-            for b in _buyers_for_response
-        ],
     )
 
 
