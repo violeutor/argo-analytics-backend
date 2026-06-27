@@ -708,6 +708,9 @@ async def enrich_market_data(
     # BUG-28: MD-B01 läuft unabhängig von TAM und Competitors.
     # Seiteninhalt statt Snippets — deutlich reichhaltigere Basis für Claude.
     market_details: dict = {}
+    snippets: list[str] = []   # SNIPPETS-UNBOUND-01: Default VOR try — sonst
+    # UnboundLocalError unten (Zeile len(snippets)), wenn _fetch_market_snippets
+    # selbst timeout't/wirft, bevor die Zuweisung im try-Block durchläuft.
     try:
         snippets = await asyncio.wait_for(
             _fetch_market_snippets(company_name, sector, category or ""),
