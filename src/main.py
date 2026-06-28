@@ -131,7 +131,7 @@ async def _cron_signal_engine():
 
 
 async def _cron_buyer_enrichment():
-    """R-23 — Buyer-Enrichment Cron, täglich 07:30 UTC (nach Scoring-Cron)."""
+    """R-23 — Buyer-Enrichment Cron, täglich 05:30 UTC (nach ticker_yf/EDGAR/yf_kpi, vor Scoring)."""
     try:
         from src.integrations.supabase import fetch_companies, fetch_potential_buyers
         from src.services.buyer_enrichment import is_cache_valid, enrich_buyers_for_company
@@ -233,12 +233,11 @@ async def _cron_ticker_yf():
 
 
 async def _cron_scoring():
-    """SC-01–SC-13 — Scoring-Engine Cron, täglich 07:30 UTC (nach Signal + Funding)."""
+    """SC-01–SC-13 — Scoring-Engine Cron, täglich 06:00 UTC (nach Signal/Funding/ticker_yf/EDGAR/yf_kpi/Buyer)."""
     try:
         from src.integrations.supabase import (
             fetch_companies, fetch_company_scores, upsert_company_scores,
             fetch_signals, fetch_value_drivers, fetch_market_data,
-            fetch_potential_buyers,
         )
         from src.services.score_calculator import compute_all_scores
 
@@ -254,7 +253,6 @@ async def _cron_scoring():
                 signals_raw   = fetch_signals(cid, limit=50)
                 vd_cached     = fetch_value_drivers(cid)
                 market_data   = fetch_market_data(cid)  # BUG-40: market_data fehlte im Cron
-                buyers        = fetch_potential_buyers(cid)  # BUYER-CRON-WIRE-01
                 vd_list: list[dict] = []
                 if vd_cached:
                     # value_drivers hat NUR enablers/contributors/etfs — kein "buyers".
@@ -267,7 +265,6 @@ async def _cron_scoring():
                     signals=signals_raw,
                     value_drivers=vd_list,
                     market_data=market_data,  # BUG-40
-                    buyers=buyers,            # BUYER-CRON-WIRE-01 — MFR-Annotation in compute_all_scores
                 )
                 if upsert_company_scores(cid, result.to_dict()):
                     written += 1
@@ -280,7 +277,7 @@ async def _cron_scoring():
 
 
 async def _cron_funding_enrichment():
-    """B-05 — Funding Enrichment Cron, täglich 06:30 UTC (nach Signal-Engine)."""
+    """B-05 — Funding Enrichment Cron, täglich 04:30 UTC (nach Signal-Engine)."""
     try:
         from src.services.funding_enrichment import run_funding_enrichment
 

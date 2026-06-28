@@ -1344,7 +1344,6 @@ def compute_all_scores(
     market_data:         dict | None       = None,
     signals:             list[dict] | None = None,
     ownership_entries:   list[dict] | None = None,
-    buyers:              list[dict] | None = None,   # SC02-REWORK-01: intern unbenutzt, siehe Docstring
     value_drivers:       list[dict] | None = None,
     funding_momentum:    dict | None       = None,   # SC-01: Momentum-Pfad für US Private
     headcount_snapshots: list[dict] | None = None,   # SC-01: optionaler CAGR-Bonus
@@ -1363,14 +1362,14 @@ def compute_all_scores(
         market_data:       Marktdaten-Dict (aus market_data_enrichment / /market Route)
         signals:           Signal-Liste (aus signals-Tabelle)
         ownership_entries: Ownership-Einträge (aus ownership_entries-Tabelle)
-        buyers:            SC02-REWORK-01: wird seit diesem Patch INTERN nicht mehr
-                            verwendet — compute_strategic_score/compute_enabler_score
-                            lesen jetzt aus ma_aggregate statt aus dieser Liste. Parameter
-                            bleibt in der Signatur, um company_detail.py/main.py (Cron)
-                            nicht anfassen zu müssen — bewusst nicht kaskadiert, da
-                            main.py hier nicht vorliegt. Kandidat für vollständige
-                            Entfernung in einer eigenen, kleinen Folge-Session.
         value_drivers:     Value Driver Einträge (aus value_drivers-Tabelle)
+
+    SC02-REWORK-01 (vollständig kaskadiert): `buyers`-Parameter entfernt.
+    Trug seit BUYER-AGG-01 keine Funktion mehr (compute_strategic_score/
+    compute_enabler_score lesen SRR/MFR/TR aus ma_aggregate bzw. berechnen TR
+    selbst) — main.py und company_detail.py reichten ihn trotzdem weiter mit
+    der Begründung "MFR-Annotation in compute_all_scores", die nie zutraf
+    (Phantom-Referenz, gleiches Muster wie BUYER-MFR-01).
 
     Returns:
         ScoreResult mit allen Scores, hero_path, rating, confidence, score_inputs.

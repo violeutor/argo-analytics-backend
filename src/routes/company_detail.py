@@ -3481,23 +3481,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     for key in ("enablers", "contributors"):
                         vd_list.extend(vd_cached_now.get(key) or [])
 
-                # BUYER-MFR-01 (korrigiert): Rohe Buyer durchreichen inkl. market_cap_usd_bn
-                # für compute_all_scores (SC-02/Enabler-Signatur). Die echte Per-Buyer-MFR
-                # lebt in scoring.py::compute_mfr() und füttert die scorings-Liste — NICHT
-                # eine "annotate_buyers_with_mfr" (existierte nie, war Phantom-Referenz,
-                # verursachte ImportError bei jedem Load). Totes potential_buyers-Response-
-                # Feld + Annotation-Versuch entfernt (S68) — Frontend rendert nur scorings.
-                buyers_raw = [
-                    {
-                        "name":              b.get("name"),
-                        "ticker":            b.get("ticker"),
-                        "exchange":          b.get("exchange"),
-                        "market_cap_usd_bn": b.get("market_cap_usd_bn"),
-                        "confidence":        b.get("confidence"),
-                    }
-                    for b in buyers
-                ]
-
                 sc_result = compute_all_scores(
                     company={
                         **company,
@@ -3509,7 +3492,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     market_data=market_data_cached or {},
                     signals=signals_raw,
                     ownership_entries=ownership_raw,
-                    buyers=buyers_raw,
                     value_drivers=vd_list,
                     # SC-01: Momentum-Pfad für US Private ohne Financials
                     funding_momentum=_funding_momentum_dict,
