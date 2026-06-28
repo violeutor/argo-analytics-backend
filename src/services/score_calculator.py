@@ -235,6 +235,30 @@ def _resolve_funding_stage(company: dict) -> str:
     return company.get("funding_stage") or ""
 
 
+def _compute_target_tech_readiness(company: dict, is_listed: bool) -> tuple[float, str]:
+    """
+    SC02-REWORK-01 (Folgearbeit): Target-intrinsische TechReadiness (buyer-
+    unabhängig) — gemeinsame Quelle für SC-02/ETF/Enabler, damit alle drei
+    dieselbe Berechnung wie die echte Buyer-Pipeline (company_detail.py)
+    nutzen, statt aus dem toten Feld company.get("tech_readiness") zu raten.
+
+    is_listed wird vom AUFRUFER übergeben, nicht hier neu bestimmt — compute_
+    etf_score hat eine bewusst abweichende Listed-Erkennung (BUG-44:
+    ipo_status-only, kein ticker-Fallback, weil Ticker auch bei privaten
+    Companies gesetzt sein kann). Würde dieser Helper _is_listed() intern
+    aufrufen, könnte er BUG-44 in der TR-Teilberechnung wieder einschleppen.
+    """
+    if is_listed:
+        return 0.5, "listed"
+    from src.pipelines.scoring import compute_auto_tech_readiness
+    return compute_auto_tech_readiness(
+        stage=company.get("funding_stage"),
+        category=company.get("category"),
+        funding_total_usd_mn=company.get("funding_total_usd_mn"),
+        funding_last_round=company.get("funding_last_round"),
+    )
+
+
 def _investor_tier(name: str, investor_type: str) -> int:
     name_lower = name.lower()
     for kw, tier in _INVESTOR_TIER_KW:
@@ -408,7 +432,7 @@ def compute_financial_score(
 
 # ── SC-02 · Strategic Score ────────────────────────────────────────────────────
 
-def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dict | None = None) -> tuple[float, dict]:
+def compute_strategic_score(company: dict, ma_aggregate: dict | None = None) -> tuple[float, dict]:
     """
     SC-02: Strategic Score (0–10).
 
@@ -427,15 +451,12 @@ def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dic
     Story", ma_score fragt "wie wahrscheinlich ist ein Exit über die
     realistischsten Käufer".
 
-    TechReadiness ist Target-intrinsisch (buyer-unabhängig) und steckt nicht
-    im Aggregat — wird wie in company_detail.py direkt über
-    compute_auto_tech_readiness() berechnet, statt aus einem toten Feld
-    (company.get("tech_readiness")) zu raten.
+    TechReadiness ist Target-intrinsisch (buyer-unabhängig) — _compute_target_
+    tech_readiness() statt aus einem toten Feld zu raten (gemeinsamer Helper
+    mit ETF/Enabler Score).
 
-    HINWEIS: `buyers`-Parameter bleibt aus Signatur-Kompatibilität erhalten,
-    ist aber seit BUYER-AGG-01 unbenutzt (Vorzustand, nicht durch diesen
-    Patch eingeführt) — SC02-REWORK-01-Folgearbeit, falls Signatur-Cleanup
-    gewünscht ist.
+    Signatur-Cleanup (SC02-REWORK-01-Folge): `buyers`-Parameter entfernt — war
+    seit BUYER-AGG-01 unbenutzt (Nebenbefund aus BUYER-MFR-01, S68).
 
     Gewichtung:
       SRR-Kategorie   0–3.5 Pkt  (bester Buyer-Match: Transformational++ … Low Strategic)
@@ -443,8 +464,6 @@ def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dic
       MFR-Signal      0–3.0 Pkt  (Feasibility DESSELBEN Buyer-Matches)
       Buyer Bonus     0–1.0 Pkt  (Anzahl realistischer Käufer aus Deal-Engine)
     """
-    from src.pipelines.scoring import compute_auto_tech_readiness
-
     inputs: dict = {}
     agg = ma_aggregate or {}
     contributors = agg.get("contributors") or []
@@ -460,17 +479,7 @@ def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dic
     srr_pts = _SRR_CATEGORY_SCORE.get(srr_cat, 1.0)
     mfr_pts = _MFR_SIGNAL_SCORE.get(mfr_sig, 0.5)
 
-    # TechReadiness: Target-intrinsisch — gleiche Berechnung wie company_detail.py,
-    # damit SC-02 und das tatsächliche Buyer-Scoring nicht divergieren.
-    if _is_listed(company):
-        tr, tr_confidence = 0.5, "listed"
-    else:
-        tr, tr_confidence = compute_auto_tech_readiness(
-            stage=company.get("funding_stage"),
-            category=company.get("category"),
-            funding_total_usd_mn=company.get("funding_total_usd_mn"),
-            funding_last_round=company.get("funding_last_round"),
-        )
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company))
     inputs["tech_readiness"]            = tr
     inputs["tech_readiness_confidence"] = tr_confidence
     tr_pts = tr * 3.5
@@ -867,6 +876,11 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
       Kategorie-Match   0 / 3.0 Pkt    (ETF-abgedeckte Sektoren)
       Explizite Drivers 0 / 2.0 Pkt    (ETF in value_drivers)
       TechReadiness     0–1.0 Pkt      (kleiner Relevanz-Bonus)
+
+    SC02-REWORK-01-Folge: TechReadiness kam bisher aus dem toten Feld
+    company.get("tech_readiness") (nie befüllt → immer 0.5-Default). Jetzt
+    über den gemeinsamen Helper berechnet — is_listed bleibt die LOKALE
+    BUG-44-Variante (ipo_status-only), nicht die allgemeine _is_listed().
     """
     inputs: dict = {}
     score = 0.0
@@ -875,9 +889,12 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
     is_listed = company.get("ipo_status") == "listed"
     category  = (company.get("category") or "").lower()
     industry  = (company.get("industry") or "").lower()
-    tr        = float(company.get("tech_readiness") or 0.5)
+    tr, tr_confidence = _compute_target_tech_readiness(company, is_listed)
 
-    inputs.update({"is_listed": is_listed, "category": category, "tech_readiness": tr})
+    inputs.update({
+        "is_listed": is_listed, "category": category,
+        "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
+    })
 
     # Listed Status
     if is_listed:
@@ -907,7 +924,6 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
 def compute_enabler_score(
     company: dict,
     value_drivers: list[dict],
-    buyers: list[dict],
 ) -> tuple[float, dict]:
     """
     Enabler Score (0–10): Stärke der Enabler/Supply-Chain-Rolle.
@@ -920,15 +936,24 @@ def compute_enabler_score(
       B2B-Industrie-Signal   0 / 2.0    (Hardware, Materials, Infra usw.)
       Enabler Driver Count   0–3.0 Pkt  (explizite Enabler-Value-Drivers)
       Dependency Score       0–2.0 Pkt  (Abhängigkeit der Käufer)
+
+    SC02-REWORK-01-Folge: `buyers`-Parameter entfernt — war unbenutzt
+    (identischer toter Parameter wie bei compute_strategic_score, Nebenbefund
+    aus BUYER-MFR-01, S68). TechReadiness kam bisher aus dem toten Feld
+    company.get("tech_readiness") — jetzt über den gemeinsamen Helper
+    berechnet (allgemeine _is_listed(), keine BUG-44-Sonderlogik nötig hier).
     """
     inputs: dict = {}
     score = 0.0
 
-    tr       = float(company.get("tech_readiness") or 0.5)
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company))
     industry = (company.get("industry") or "").lower()
     category = (company.get("category") or "").lower()
 
-    inputs.update({"tech_readiness": tr, "industry": industry})
+    inputs.update({
+        "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
+        "industry": industry,
+    })
 
     score += tr * 3.0
 
@@ -1319,7 +1344,7 @@ def compute_all_scores(
     market_data:         dict | None       = None,
     signals:             list[dict] | None = None,
     ownership_entries:   list[dict] | None = None,
-    buyers:              list[dict] | None = None,
+    buyers:              list[dict] | None = None,   # SC02-REWORK-01: intern unbenutzt, siehe Docstring
     value_drivers:       list[dict] | None = None,
     funding_momentum:    dict | None       = None,   # SC-01: Momentum-Pfad für US Private
     headcount_snapshots: list[dict] | None = None,   # SC-01: optionaler CAGR-Bonus
@@ -1338,7 +1363,13 @@ def compute_all_scores(
         market_data:       Marktdaten-Dict (aus market_data_enrichment / /market Route)
         signals:           Signal-Liste (aus signals-Tabelle)
         ownership_entries: Ownership-Einträge (aus ownership_entries-Tabelle)
-        buyers:            Buyer-Liste aus company response (competitors/buyers)
+        buyers:            SC02-REWORK-01: wird seit diesem Patch INTERN nicht mehr
+                            verwendet — compute_strategic_score/compute_enabler_score
+                            lesen jetzt aus ma_aggregate statt aus dieser Liste. Parameter
+                            bleibt in der Signatur, um company_detail.py/main.py (Cron)
+                            nicht anfassen zu müssen — bewusst nicht kaskadiert, da
+                            main.py hier nicht vorliegt. Kandidat für vollständige
+                            Entfernung in einer eigenen, kleinen Folge-Session.
         value_drivers:     Value Driver Einträge (aus value_drivers-Tabelle)
 
     Returns:
@@ -1347,7 +1378,6 @@ def compute_all_scores(
     mkt  = market_data or {}
     sigs = signals or []
     own  = ownership_entries or []
-    buy  = buyers or []
     vds  = value_drivers or []
 
     result     = ScoreResult()
@@ -1355,7 +1385,7 @@ def compute_all_scores(
 
     # ── Sub-Scores ──────────────────────────────────────────────────────────
     _run(result, "financial_score",    lambda: compute_financial_score(company, funding_momentum, headcount_snapshots), all_inputs, "financial",    "SC-01")
-    _run(result, "strategic_score",    lambda: compute_strategic_score(company, buy, ma_aggregate), all_inputs, "strategic",    "SC-02")
+    _run(result, "strategic_score",    lambda: compute_strategic_score(company, ma_aggregate),  all_inputs, "strategic",    "SC-02")
     _run(result, "market_score",       lambda: compute_market_score(mkt, company),           all_inputs, "market",       "SC-03")
     _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
     _run(result, "ownership_score",    lambda: compute_ownership_score(company, own),        all_inputs, "ownership",    "SC-08")
@@ -1375,7 +1405,7 @@ def compute_all_scores(
     _run(result, "ipo_score",          lambda: compute_ipo_score(company, sigs),             all_inputs, "ipo",          "IPO")
     _run(result, "ma_score",           lambda: compute_ma_score(company, ma_aggregate),      all_inputs, "ma",           "M&A")
     _run(result, "etf_score",          lambda: compute_etf_score(company, vds),              all_inputs, "etf",          "ETF")
-    _run(result, "enabler_score",      lambda: compute_enabler_score(company, vds, buy),     all_inputs, "enabler",      "Enabler")
+    _run(result, "enabler_score",      lambda: compute_enabler_score(company, vds),          all_inputs, "enabler",      "Enabler")
 
     # ── Composite + Hero ─────────────────────────────────────────────────────
     try:
