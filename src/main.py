@@ -89,6 +89,18 @@ async def _cron_rolling_refresh():
         logger.exception("Rolling Refresh FEHLER: %s", e)
 
 
+async def _cron_discovery():
+    """DISCOVERY-PREIPO-01 — Continuous-Discovery-Cron, täglich 03:45 UTC, vor Signal-Engine."""
+    try:
+        from src.services.discovery_engine import run_discovery_pipeline
+
+        logger.info("Discovery-Cron gestartet")
+        stats = await run_discovery_pipeline()
+        logger.info("Discovery-Cron fertig — %s", stats)
+    except Exception as e:
+        logger.exception("Discovery-Cron FEHLER: %s", e)
+
+
 async def _cron_signal_engine():
     """SE-01 + SE-14 — Signal-Engine Cron, täglich 04:00 UTC."""
     try:
@@ -385,13 +397,17 @@ async def lifespan(app):
     async def _schedule_cron():
         while True:
             now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-            # Nächste 04:00 UTC berechnen (vorher: 06:00 UTC)
-            target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            # Nächste 03:45 UTC berechnen (vorher: 04:00 UTC — DISCOVERY-PREIPO-01
+            # rückt 15min vor den Signal-Engine-Slot, damit neu entdeckte Companies
+            # noch am selben Tag für den 04:00-Lauf "warm" sind)
+            target = now.replace(hour=3, minute=45, second=0, microsecond=0)
             if target <= now:
                 target = target + __import__("datetime").timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
-            logger.info("Signal-Engine Cron: nächster Run in %.0f Minuten", wait_seconds / 60)
+            logger.info("Discovery-Cron: nächster Run in %.0f Minuten", wait_seconds / 60)
             await asyncio.sleep(wait_seconds)
+            await _cron_discovery()               # 03:45 UTC — Discovery (NEU)
+            await asyncio.sleep(15 * 60)
             await _cron_signal_engine()          # 04:00 UTC — Signal + Patents
             await asyncio.sleep(30 * 60)
             await _cron_funding_enrichment()     # 04:30 UTC — Funding

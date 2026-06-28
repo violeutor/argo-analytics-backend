@@ -161,6 +161,16 @@ def _extract_funding_amount(text: str) -> float | None:
     """
     B-05: Extrahiert Funding-Betrag aus Freitext → USD Mio.
     Beispiele: '$50 million' → 50.0 | '$1.2 billion' → 1200.0 | '€80 Mio.' → None (EUR skip)
+
+    EUR-Beträge bewusst weiterhin None hier — siehe _extract_eur_funding_amount()
+    direkt darunter. Keine Erweiterung dieser Funktion um EUR-Pattern: sie wird
+    an drei Stellen aufgerufen (Google News, TechCrunch, Claude-NER-Pass) und
+    überall direkt in funding_amount_usd_mn geschrieben — ein EUR-Treffer ohne
+    FX-Konvertierung würde dort stillschweigend als USD-Wert fehletikettiert
+    (Daten-Fabrikation, kein Fix). Eigenständige Funktion statt Erweiterung
+    hält den Blast-Radius auf den neuen Discovery-EU-News-Pfad beschränkt, der
+    seinen Floor ohnehin in EUR definiert (≥€5M, DISCOVERY-PREIPO-01) und daher
+    unkonvertiert bleiben soll.
     """
     m = _FUNDING_AMOUNT_RE.search(text)
     if not m:
@@ -176,15 +186,45 @@ def _extract_funding_amount(text: str) -> float | None:
     if unit in ("million", "mn", "m"):
         return round(val, 2)
     return None
-    """Parst RSS pubDate zu date — Fallback: heute."""
-    if not date_str:
-        return date.today()
-    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(date_str.strip(), fmt).date()
-        except ValueError:
-            continue
-    return date.today()
+
+
+# DISCOVERY-PREIPO-01 — EUR-Pendant, additiv und eigenständig (s. Docstring oben).
+# Unit-Präfixe: Mio./Million(en) = ×1, Mrd./Milliarde(n) = ×1000. Deutsches
+# Dezimalkomma wird vor float() in einen Punkt übersetzt; Tausendertrennzeichen
+# werden bei Funding-Beträgen dieser Größenordnung nicht erwartet (Scope-Grenze,
+# kein vollständiger DE-Zahlenparser).
+_EUR_FUNDING_AMOUNT_RE = re.compile(
+    r'€\s*([\d]+(?:[.,]\d+)?)\s*(milliarden|mrd\.?|millionen|mio\.?|m)\b'
+    r'|'
+    r'([\d]+(?:[.,]\d+)?)\s*(milliarden|mrd\.?|millionen|mio\.?)\s*(?:€|euro|eur)\b',
+    re.IGNORECASE
+)
+
+
+def _extract_eur_funding_amount(text: str) -> float | None:
+    """
+    DISCOVERY-PREIPO-01: EUR-Pendant zu _extract_funding_amount() — separate
+    Funktion statt Erweiterung der USD-Funktion (Begründung im Docstring dort).
+    Gibt den Betrag in EUR Mio. zurück, UNKONVERTIERT — der Discovery-Floor für
+    den kuratierten EU-News-Pfad ist in EUR definiert (≥€5M), keine FX-Quelle
+    im Scope dieses Builds.
+
+    Beispiele: '€80 Mio.' → 80.0 | '80 Millionen Euro' → 80.0 | '€1,2 Mrd.' → 1200.0
+    """
+    m = _EUR_FUNDING_AMOUNT_RE.search(text)
+    if not m:
+        return None
+    raw_num = (m.group(1) or m.group(3) or "").replace(",", ".")
+    unit    = (m.group(2) or m.group(4) or "").lower()
+    try:
+        val = float(raw_num)
+    except ValueError:
+        return None
+    if unit.startswith("mrd") or unit.startswith("milliarden"):
+        return round(val * 1000, 2)
+    if unit.startswith("mio") or unit.startswith("million"):
+        return round(val, 2)
+    return None
 
 
 def _normalize_name(name: str) -> str:
@@ -447,6 +487,44 @@ def _event_type_direction(event_type: EventType) -> tuple[Direction, SignalCateg
         "news":              ("neutral",  "general_news"),
     }
     return mapping.get(event_type, ("neutral", "general_news"))
+
+
+# SE16-INTENT-UPGRADE-01: Geteilte Klassifikation IPO-Completion vs. IPO-Intent.
+# Zwei Call-Sites: (1) run_signal_engine() unten — Bestands-Companies im
+# 04:00-UTC-Cron, (2) discovery_engine.py — neu entdeckte Companies beim Anlegen.
+# Eine Funktion, damit die Phrase-Listen nicht an zwei Stellen auseinanderlaufen.
+_IPO_COMPLETION_KW = (
+    "began trading", "started trading", "listed on", "debut", "ipo priced",
+    "börsengang abgeschlossen", "erstmals gehandelt",
+)
+# Intent: konservative Phrase-Liste analog zur Completion-Liste — bewusst kein
+# generisches "ipo"-Keyword-Match (das würde auch Completion-/Spekulations-News
+# treffen). Form-Präfix-Check (raw_title beginnt mit "S-1"/"S-11") ist das
+# präziseste Signal für EDGAR-Quellen; die Phrasen darunter greifen für
+# Nicht-EDGAR-Quellen (z.B. News-Pfad), wo raw_title kein Form-Präfix trägt.
+_IPO_INTENT_KW = (
+    "files for ipo", "filed for ipo", "s-1 filing", "s-1-antrag",
+    "s-11-antrag", "ipo-prozess gestartet", "ipo-antrag eingereicht",
+)
+
+
+def _classify_ipo_signal(raw_title: str | None) -> Literal["completion", "intent", "none"]:
+    """
+    SE16-INTENT-UPGRADE-01: Unterscheidet IPO-Completion (Listing abgeschlossen)
+    von IPO-Intent (S-1/S-11 eingereicht, Prozess gestartet, noch nicht gelistet).
+    Completion hat Priorität — ein abgeschlossenes Listing ist nie gleichzeitig
+    nur "Intent", auch falls beide Phrase-Sets zufällig im selben Titel matchen.
+    """
+    title = (raw_title or "").lower()
+    if any(k in title for k in _IPO_COMPLETION_KW):
+        return "completion"
+    # EDGAR-Form-Präfix: raw_title-Format ist "{form_type} — {entity}" (s. parse_edgar)
+    form_prefix = title.split("—")[0].strip()
+    if form_prefix in ("s-1", "s-11"):
+        return "intent"
+    if any(k in title for k in _IPO_INTENT_KW):
+        return "intent"
+    return "none"
 
 
 def _classify_event(title: str, description: str) -> EventType:
@@ -1787,32 +1865,54 @@ async def run_signal_engine(
             if ipo_events and cid:
                 # Neueste Event bestimmen
                 latest_ipo = max(ipo_events, key=lambda e: e.event_date)
-                raw_title  = (latest_ipo.raw_title or "").lower()
                 current_status = (company.get("ipo_status") or "").lower()
+                # current_status == "listed" ist der einzige Zustand, aus dem es
+                # kein Upgrade mehr geben soll (kein listed→listed, kein Downgrade).
+                already_listed   = current_status == "listed"
+                already_advanced = current_status.startswith("pre_ipo")
 
-                # SE-16: Nur auf 'listed' upgraden — 'pre_ipo' ist kein valider DB-Enum-Wert.
-                # Guard: Nur private Companies upgraden (kein listed→listed oder listed→downgrade).
-                # Klare Trading-Signale erforderlich: debut, ipo priced, started/began trading, listed on.
-                is_clear_listing = any(k in raw_title for k in (
-                    "began trading", "started trading", "listed on", "debut", "ipo priced",
-                    "börsengang abgeschlossen", "erstmals gehandelt",
-                ))
-                if is_clear_listing and current_status == "private":
+                signal_kind = _classify_ipo_signal(latest_ipo.raw_title)
+
+                # BUGFIX (beim SE16-INTENT-UPGRADE-01-Umbau gefunden, nicht gesucht):
+                # Der alte Guard prüfte `current_status == "private"`. Seit
+                # IPO-STATUS-ENUM-01 (S69) ist "private" aber kein gültiger Wert
+                # mehr in companies.ipo_status — normalize_ipo_status_for_db()
+                # mappt "private" auf None. current_status ist für jede nicht-
+                # gelistete Company also "" (aus `or ""`), nie "private" — der
+                # Completion-Upgrade-Pfad konnte seit S69 nie mehr greifen, ohne
+                # dass das aufgefallen wäre (Symptom wäre "kein Upgrade passiert",
+                # leicht mit "kein IPO-Ereignis" zu verwechseln). Guard jetzt auf
+                # "nicht bereits listed" — das war die eigentliche Absicht laut
+                # Kommentar ("kein listed→listed oder listed→downgrade").
+                if signal_kind == "completion" and not already_listed:
                     try:
                         from src.integrations.supabase import upsert_company_enrichment
                         upsert_company_enrichment(cid, {"ipo_status": "listed"})
                         logger.info(
-                            "SE-16: %s ipo_status private → listed (source=%s, title=%s)",
-                            cname, latest_ipo.source, latest_ipo.raw_title,
+                            "SE-16: %s ipo_status %s → listed (source=%s, title=%s)",
+                            cname, current_status or "—", latest_ipo.source, latest_ipo.raw_title,
                         )
                     except Exception as e:
                         logger.warning("SE-16: ipo_status update failed for %s: %s", cname, e)
+                elif signal_kind == "intent" and not already_listed and not already_advanced:
+                    # SE16-INTENT-UPGRADE-01: S-1/S-11-Intent auf eine Bestands-
+                    # Company → pre_ipo_high statt weiterhin NULL/unklar. Gleiche
+                    # Klassifikation wie beim Discovery-Neuanlegen (discovery_engine.py).
+                    try:
+                        from src.integrations.supabase import upsert_company_enrichment
+                        upsert_company_enrichment(cid, {"ipo_status": "pre_ipo_high"})
+                        logger.info(
+                            "SE16-INTENT-UPGRADE-01: %s ipo_status %s → pre_ipo_high (intent, title=%s)",
+                            cname, current_status or "—", latest_ipo.raw_title,
+                        )
+                    except Exception as e:
+                        logger.warning("SE16-INTENT-UPGRADE-01: ipo_status update failed for %s: %s", cname, e)
                 else:
-                    # IPO-Signal erkannt, aber kein Status-Update — nur loggen
+                    # Signal erkannt, aber kein Update nötig/sinnvoll — nur loggen
                     logger.info(
                         "SE-16: %s ipo_status-Signal erkannt, kein Update "
-                        "(current=%s, clear_listing=%s, title=%s)",
-                        cname, current_status or "—", is_clear_listing, latest_ipo.raw_title,
+                        "(current=%s, kind=%s, title=%s)",
+                        cname, current_status or "—", signal_kind, latest_ipo.raw_title,
                     )
 
             all_events.extend(company_events)
