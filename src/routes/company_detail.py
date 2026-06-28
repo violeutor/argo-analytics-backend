@@ -13,6 +13,7 @@ import asyncio
 import time
 import re
 import httpx
+from typing import Literal
 from src.config import settings
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel
@@ -498,6 +499,76 @@ _TR_WEIGHTS = {
     "rd_intensity": 0.10, "regulatory_readiness": 0.10,
     "strategic_coherence": 0.10,
 }
+
+
+# ── TR-MODAL-01: Pro-User TechReadiness-Override ─────────────────────────────
+
+def _compute_manual_tr_value(row: dict) -> float | None:
+    """
+    Gewichteter Durchschnitt der 7 User-Eingabe-Faktoren aus user_tr_overrides,
+    via _TR_WEIGHTS — dieselbe Gewichtung, die bereits für die Tab-8-Tooltip-
+    Anzeige (factor_weights=_TR_WEIGHTS) genutzt wird. So liefern Company-
+    Level-Scores (score_calculator.py) und Per-Buyer-Scores (Tab 8) aus
+    derselben Eingabe denselben Wert.
+
+    Gibt None zurück wenn nicht alle 7 Faktoren gesetzt sind (unvollständiger
+    Fragebogen) — Aufrufer fällt dann auf Auto-Berechnung zurück statt mit
+    Teildaten zu raten.
+    """
+    weighted = 0.0
+    total_w  = 0.0
+    for factor, weight in _TR_WEIGHTS.items():
+        v = row.get(factor)
+        if v is None:
+            return None
+        weighted += float(v) * weight
+        total_w  += weight
+    return weighted / total_w if total_w else None
+
+
+def _load_tr_override(user_id: str | None, company_id: str | None) -> dict | None:
+    """
+    Lädt den Pro-User-TR-Override (auto|manual|neutral) aus user_tr_overrides.
+
+    Rückgabe None bedeutet "kein Override aktiv" — Aufrufer (score_calculator.py
+    via company["_tr_override"]) fällt dann auf die bisherige Auto-Berechnung
+    zurück. Das gilt für: kein User/keine Company bekannt, keine Row, tr_mode=
+    'auto', ODER tr_mode='manual' mit unvollständigen Faktoren (Fail-Safe statt
+    Fail-Loud hier bewusst — ein kaputter Override darf den Company-Load nicht
+    blockieren, nur auf Auto zurückfallen; siehe except-Block).
+
+    Pro-User by design (Andreas-Entscheidung): Tabelle ist UNIQUE(user_id,
+    company_id) mit RLS — ein User-Override beeinflusst nie die Sicht anderer
+    User auf dieselbe Company.
+    """
+    if not user_id or not company_id:
+        return None
+    try:
+        r = (get_supabase().table("user_tr_overrides")
+             .select("tr_mode, tech_stack_fit, gtm_fit, integration_capacity, "
+                     "rd_intensity, capital_deployment_velocity, regulatory_readiness, "
+                     "strategic_coherence")
+             .eq("user_id", user_id).eq("company_id", company_id)
+             .limit(1).execute())
+        if not r.data:
+            return None
+        row  = r.data[0]
+        mode = row.get("tr_mode") or "auto"
+        if mode == "neutral":
+            return {"mode": "neutral", "value": 0.5}
+        if mode == "manual":
+            value = _compute_manual_tr_value(row)
+            if value is None:
+                logger.warning(
+                    "TR-MODAL-01: tr_mode=manual aber unvollständige Faktoren "
+                    "(user=%s, company=%s) — Fallback Auto", user_id, company_id,
+                )
+                return None
+            return {"mode": "manual", "value": value}
+        return None   # mode == "auto" → kein Override nötig
+    except Exception as e:
+        logger.debug("TR-MODAL-01: Override-Load failed (user=%s, company=%s): %s", user_id, company_id, e)
+        return None
 
 
 # ── BUG-13: Buyer-Relevanz-Filter ────────────────────────────────────────────
@@ -2123,6 +2194,15 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
 
     # 3. TAM — erst DB-Cache prüfen, dann scrapen, Ergebnis persistieren
     company_id = company.get("id")
+
+    # TR-MODAL-01: Pro-User-TR-Override laden. None = kein aktiver Override →
+    # _compute_target_tech_readiness() (score_calculator.py) fällt auf die
+    # bisherige Auto-Berechnung zurück, unverändertes Verhalten für jeden User
+    # ohne explizite Einstellung. **company spread (Step 11) übernimmt den
+    # Key automatisch — keine weitere Wiring nötig für den Score-Pfad.
+    _tr_override = _load_tr_override(getattr(_ctx, "user_id", None), company_id)
+    company["_tr_override"] = _tr_override
+
     tam_cached = fetch_tam_cache(company_id) if company_id else None
     if tam_cached and tam_cached.get("tam_2035_usd_bn"):
         tam = {
@@ -3305,7 +3385,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         logger.info("Scoring: %d company-spezifische Buyer für %s", len(buyers), company_name)
         scorings = []
 
-        if is_listed:
+        if _tr_override and _tr_override.get("value") is not None:
+            # TR-MODAL-01: gleiche Quelle wie score_calculator.py — Tab 8 und
+            # die Company-Level-Scores (SC-02/09/IPO/ETF/Enabler) zeigen damit
+            # garantiert denselben TR-Wert, wenn ein User-Override aktiv ist.
+            auto_tr       = float(_tr_override["value"])
+            tr_confidence = "user" if _tr_override["mode"] == "manual" else "neutral_user"
+            logger.info("User-TR-Override for %s: %.3f (mode=%s)", company_name, auto_tr, _tr_override["mode"])
+        elif is_listed:
             auto_tr = 0.5
             tr_confidence = "listed"
         else:
@@ -3452,6 +3539,14 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # 11. SC-01–SC-13 · Scores on-demand
     # Erst DB-Cache prüfen (computed_at < 24h → verwenden).
     # Sonst: compute_all_scores() + in Background cachen.
+    #
+    # TR-MODAL-01: company_scores ist NICHT pro User gecacht (Key=company_id,
+    # global für alle User). Ein aktiver manual/neutral-Override gehört NIE in
+    # diesen Cache — sonst sähe User B den TR-Override von User A für bis zu
+    # 24h. Auto-User (Default, kein Override) sind hiervon unberührt: für sie
+    # bleibt der Cache-Pfad exakt wie vorher.
+    _tr_override_active = bool(_tr_override and _tr_override.get("mode") in ("manual", "neutral"))
+
     scores_result: dict | None = None
     if company_id:
         try:
@@ -3463,6 +3558,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     cached_scores["computed_at"].replace("Z", "+00:00")
                 )
                 _cache_fresh = _age < timedelta(hours=24)
+
+            if _tr_override_active:
+                _cache_fresh = False   # nie aus dem globalen Cache lesen bei aktivem Override
 
             if _cache_fresh:
                 scores_result = cached_scores
@@ -3503,14 +3601,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 )
                 scores_result = sc_result.to_dict()
 
-                # Async-cachen ohne Response zu blockieren
-                _sc_dict_snapshot = scores_result
-                async def _cache_scores_bg():
-                    try:
-                        upsert_company_scores(company_id, _sc_dict_snapshot)
-                    except Exception as _e:
-                        logger.warning("Score cache write failed for %s: %s", company_name, _e)
-                background_tasks.add_task(_cache_scores_bg)
+                if not _tr_override_active:
+                    # Async-cachen ohne Response zu blockieren — nur für Auto-User.
+                    _sc_dict_snapshot = scores_result
+                    async def _cache_scores_bg():
+                        try:
+                            upsert_company_scores(company_id, _sc_dict_snapshot)
+                        except Exception as _e:
+                            logger.warning("Score cache write failed for %s: %s", company_name, _e)
+                    background_tasks.add_task(_cache_scores_bg)
+                else:
+                    logger.info(
+                        "TR-MODAL-01: Score-Cache-Write übersprungen für %s "
+                        "(aktiver User-Override, mode=%s)",
+                        company_name, _tr_override["mode"],
+                    )
                 logger.info(
                     "Scores computed for %s — hero=%s(%.1f) rating=%s conf=%s",
                     company_name,
@@ -3573,6 +3678,117 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         ma_aggregate=_ma_aggregate_meta,
         lens=_lens_meta,
     )
+
+
+class TrOverrideRequest(BaseModel):
+    tr_mode: Literal["auto", "manual", "neutral"]
+    tech_stack_fit: float | None = None
+    gtm_fit: float | None = None
+    integration_capacity: float | None = None
+    rd_intensity: float | None = None
+    capital_deployment_velocity: float | None = None
+    regulatory_readiness: float | None = None
+    strategic_coherence: float | None = None
+
+
+def _resolve_company_id_for_override(sb, name: str) -> str:
+    rows = sb.table("companies").select("id").ilike("name", name).limit(1).execute()
+    if not rows.data:
+        raise HTTPException(status_code=404, detail=f"Company '{name}' not found")
+    return rows.data[0]["id"]
+
+
+@router.get("/company/{name}/tr-override")
+async def get_tr_override(name: str, authorization: str | None = Header(default=None)):
+    """
+    TR-MODAL-01: liest den aktuellen Pro-User-TR-Override für diese Company.
+    Kein Override vorhanden → tr_mode='auto' mit leeren Faktoren (Frontend-
+    Default-Zustand für den Modal, kein Fehler).
+    """
+    _ctx = resolve_user_context(authorization)
+    user_id = getattr(_ctx, "user_id", None) if _ctx else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    sb = get_supabase()
+    company_id = _resolve_company_id_for_override(sb, name)
+
+    r = (sb.table("user_tr_overrides")
+         .select("tr_mode, tech_stack_fit, gtm_fit, integration_capacity, "
+                 "rd_intensity, capital_deployment_velocity, regulatory_readiness, "
+                 "strategic_coherence, updated_at")
+         .eq("user_id", user_id).eq("company_id", company_id)
+         .limit(1).execute())
+
+    if not r.data:
+        return {
+            "company_id": company_id, "tr_mode": "auto",
+            "tech_stack_fit": None, "gtm_fit": None, "integration_capacity": None,
+            "rd_intensity": None, "capital_deployment_velocity": None,
+            "regulatory_readiness": None, "strategic_coherence": None,
+            "updated_at": None,
+        }
+    row = r.data[0]
+    row["company_id"] = company_id
+    return row
+
+
+@router.put("/company/{name}/tr-override")
+async def set_tr_override(
+    name: str,
+    body: TrOverrideRequest,
+    authorization: str | None = Header(default=None),
+):
+    """
+    TR-MODAL-01: speichert den Pro-User-TR-Override (auto|manual|neutral).
+
+    Bei tr_mode='manual' müssen alle 7 Faktoren gesetzt sein → sonst 422.
+    Bewusst Fail-Loud hier, anders als beim Read-Pfad (_load_tr_override in
+    diesem Modul, der bei unvollständigen Faktoren leise auf Auto zurückfällt):
+    der User tippt aktiv etwas ein, ein unvollständiges Manual-Save soll er
+    sofort sehen, nicht erst beim nächsten Company-Load als stillen Fallback.
+    """
+    _ctx = resolve_user_context(authorization)
+    user_id = getattr(_ctx, "user_id", None) if _ctx else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if body.tr_mode == "manual":
+        factors = [
+            body.tech_stack_fit, body.gtm_fit, body.integration_capacity,
+            body.rd_intensity, body.capital_deployment_velocity,
+            body.regulatory_readiness, body.strategic_coherence,
+        ]
+        if any(f is None for f in factors):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "tr_mode=manual erfordert alle 7 Faktoren (tech_stack_fit, gtm_fit, "
+                    "integration_capacity, rd_intensity, capital_deployment_velocity, "
+                    "regulatory_readiness, strategic_coherence)."
+                ),
+            )
+
+    sb = get_supabase()
+    company_id = _resolve_company_id_for_override(sb, name)
+
+    from datetime import datetime, timezone
+    payload = {
+        "user_id": user_id, "company_id": company_id, "tr_mode": body.tr_mode,
+        "tech_stack_fit": body.tech_stack_fit, "gtm_fit": body.gtm_fit,
+        "integration_capacity": body.integration_capacity, "rd_intensity": body.rd_intensity,
+        "capital_deployment_velocity": body.capital_deployment_velocity,
+        "regulatory_readiness": body.regulatory_readiness,
+        "strategic_coherence": body.strategic_coherence,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sb.table("user_tr_overrides").upsert(payload, on_conflict="user_id,company_id").execute()
+
+    logger.info(
+        "TR-MODAL-01: Override gespeichert company_id=%s user=%s mode=%s",
+        company_id, user_id, body.tr_mode,
+    )
+    return {"status": "ok", "tr_mode": body.tr_mode}
 
 
 # ── UX-01: Enrichment Status Endpoint ────────────────────────────────────────

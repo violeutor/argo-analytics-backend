@@ -235,10 +235,14 @@ def _resolve_funding_stage(company: dict) -> str:
     return company.get("funding_stage") or ""
 
 
-def _compute_target_tech_readiness(company: dict, is_listed: bool) -> tuple[float, str]:
+def _compute_target_tech_readiness(
+    company: dict,
+    is_listed: bool,
+    tr_override: dict | None = None,
+) -> tuple[float, str]:
     """
     SC02-REWORK-01 (Folgearbeit): Target-intrinsische TechReadiness (buyer-
-    unabhängig) — gemeinsame Quelle für SC-02/ETF/Enabler, damit alle drei
+    unabhängig) — gemeinsame Quelle für SC-02/09/IPO/ETF/Enabler, damit alle
     dieselbe Berechnung wie die echte Buyer-Pipeline (company_detail.py)
     nutzen, statt aus dem toten Feld company.get("tech_readiness") zu raten.
 
@@ -247,7 +251,22 @@ def _compute_target_tech_readiness(company: dict, is_listed: bool) -> tuple[floa
     ipo_status-only, kein ticker-Fallback, weil Ticker auch bei privaten
     Companies gesetzt sein kann). Würde dieser Helper _is_listed() intern
     aufrufen, könnte er BUG-44 in der TR-Teilberechnung wieder einschleppen.
+
+    TR-MODAL-01: tr_override ist company.get("_tr_override") — vom AUFRUFER
+    (company_detail.py) aus user_tr_overrides geladen und bereits in einen
+    einzelnen Float reduziert (manual: gewichteter Faktor-Durchschnitt via
+    _TR_WEIGHTS; neutral: fix 0.5). Override hat Vorrang vor Listed-Status
+    UND Auto-Berechnung — ein User, der bewusst "neutral" wählt, will auch
+    bei einer listed Company exakt 0.5 sehen (identisch zur bisherigen
+    Listed-Konvention, aber jetzt explizit User-Wahl statt impliziter Regel).
+    confidence-Strings matchen TechReadinessDetail.confidence im Frontend
+    (page.tsx: "listed | auto_low | auto_medium | auto_high | user").
     """
+    if tr_override and tr_override.get("mode") in ("manual", "neutral"):
+        value = tr_override.get("value")
+        if value is not None:
+            return float(value), ("user" if tr_override["mode"] == "manual" else "neutral_user")
+
     if is_listed:
         return 0.5, "listed"
     from src.pipelines.scoring import compute_auto_tech_readiness
@@ -479,7 +498,7 @@ def compute_strategic_score(company: dict, ma_aggregate: dict | None = None) -> 
     srr_pts = _SRR_CATEGORY_SCORE.get(srr_cat, 1.0)
     mfr_pts = _MFR_SIGNAL_SCORE.get(mfr_sig, 0.5)
 
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company))
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
     inputs["tech_readiness"]            = tr
     inputs["tech_readiness_confidence"] = tr_confidence
     tr_pts = tr * 3.5
@@ -719,12 +738,18 @@ def compute_value_driver_score(
     Dependency Score und Market Position reflektieren die tatsächliche Supply-Chain-Stärke.
     Eine Series-A Company mit kritischen Enablerabhängigkeiten schlägt eine
     Series-C Company mit commodity Enablers — wie in der Realität.
+
+    TR-MODAL-01-Folge: nutzte bisher company.get("tech_readiness") — das tote
+    Feld, das nie befüllt wird (immer 0.5-Default), exakt dasselbe Muster wie
+    zuvor in SC-02/ETF/Enabler (SC02-REWORK-01). Jetzt über den gemeinsamen
+    Helper, inkl. User-Override-Unterstützung.
     """
     inputs: dict = {}
     score = 0.5   # Baseline
 
-    tr = float(company.get("tech_readiness") or 0.5)
-    inputs["tech_readiness"] = tr
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
+    inputs["tech_readiness"]            = tr
+    inputs["tech_readiness_confidence"] = tr_confidence
     score += tr * 1.5   # Stage-Proxy: unterstützend, nicht dominant (war: 3.0)
 
     vds = value_drivers or []
@@ -768,6 +793,11 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
       IPO Signals     0–3.0 Pkt  (je ipo_progress Signal +1.0)
       Stage Base      0–2.7 Pkt  (×0.3 aus _STAGE_IPO_SCORE)
       ipo_potential   0–2.0 Pkt  (Hoch/Mittel/Niedrig)
+
+    TR-MODAL-01-Folge: nutzte bisher company.get("tech_readiness") — das tote
+    Feld, das nie befüllt wird (immer 0.5-Default), exakt dasselbe Muster wie
+    zuvor in SC-02/ETF/Enabler (SC02-REWORK-01). Jetzt über den gemeinsamen
+    Helper, inkl. User-Override-Unterstützung.
     """
     inputs: dict = {}
 
@@ -776,11 +806,11 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
         return 0.0, inputs
 
     stage         = _resolve_funding_stage(company)
-    tr            = float(company.get("tech_readiness") or 0.5)
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
     ipo_potential = company.get("ipo_potential") or ""
     ipo_status    = company.get("ipo_status") or ""
 
-    inputs.update({"funding_stage": stage, "tech_readiness": tr,
+    inputs.update({"funding_stage": stage, "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
                    "ipo_potential": ipo_potential, "ipo_status": ipo_status})
 
     stage_base  = _stage_match(stage, _STAGE_IPO_SCORE)
@@ -889,7 +919,7 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
     is_listed = company.get("ipo_status") == "listed"
     category  = (company.get("category") or "").lower()
     industry  = (company.get("industry") or "").lower()
-    tr, tr_confidence = _compute_target_tech_readiness(company, is_listed)
+    tr, tr_confidence = _compute_target_tech_readiness(company, is_listed, company.get("_tr_override"))
 
     inputs.update({
         "is_listed": is_listed, "category": category,
@@ -946,7 +976,7 @@ def compute_enabler_score(
     inputs: dict = {}
     score = 0.0
 
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company))
+    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
     industry = (company.get("industry") or "").lower()
     category = (company.get("category") or "").lower()
 
