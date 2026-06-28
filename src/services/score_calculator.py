@@ -135,22 +135,24 @@ _STAGE_MA_SCORE: dict[str, float] = {
     "bootstrap":  7.0,   # Owner-managed = klassisches Akquisitions-Target
 }
 
-# SRR → Score-Beitrag
-_SRR_SCORE: dict[str | None, float] = {
-    "high":   3.5,
-    "medium": 2.5,
-    "low":    1.5,
-    "none":   0.5,
-    None:     1.0,
+# SC02-REWORK-01: Echte SRR-Kategorien aus der Per-Buyer-Engine (scoring.py).
+# Ersetzt die alte _SRR_SCORE-Tabelle, die auf "high"/"medium"/"low" gekeyt
+# war — Strings, die compute_srr() nie produziert (echte Werte: siehe unten).
+_SRR_CATEGORY_SCORE: dict[str | None, float] = {
+    "Transformational++": 3.5,
+    "Transformational":   2.5,
+    "High Strategic":     1.5,
+    "Low Strategic":      0.5,
+    None:                 1.0,   # kein Buyer-Scoring verfügbar (noch nicht angereichert)
 }
 
-# MFR → Score-Beitrag
-_MFR_SCORE: dict[str | None, float] = {
-    "Feasible":  3.0,
-    "Watch":     2.0,
-    "Unlikely":  1.0,
-    "None":      0.0,
-    None:        0.5,
+# SC02-REWORK-01: Echte MFR-Signale aus der Per-Buyer-Engine (scoring.py).
+# Ersetzt die alte _MFR_SCORE-Tabelle ("Unlikely" statt "Overstretch").
+_MFR_SIGNAL_SCORE: dict[str | None, float] = {
+    "Feasible":    3.0,
+    "Watch":       2.0,
+    "Overstretch": 0.5,
+    None:          0.5,
 }
 
 # Investor-Tier-Lookup (keyword → 1–3)
@@ -410,38 +412,71 @@ def compute_strategic_score(company: dict, buyers: list[dict], ma_aggregate: dic
     """
     SC-02: Strategic Score (0–10).
 
-    Breiter als ma_score: strategische Attraktivität für M&A, Partnerschaften
-    UND Peer-Positionierung. Behält eigene SRR/TR/MFR-Gewichtung.
+    SC02-REWORK-01: SRR/MFR werden jetzt aus dem ECHTEN Deal-Aggregat der
+    Per-Buyer-Engine gelesen (ma_aggregate["contributors"][0] — der bestplatzierte
+    Buyer-Match nach deal_success_score) statt aus nicht-existenten Company-
+    Feldern (company.get("srr")/mfr_confidence — alter toter Pfad, lieferte
+    immer den Default, UND war auf Strings gekeyt, die die Engine nie liefert).
 
-    Inputs: srr, mfr_confidence, tech_readiness, feasible_buyer_count (aus Aggregat).
+    Bewusst contributors[0] für BEIDE Werte — nicht "bestes SRR von Buyer X" +
+    "bestes MFR von Buyer Y" gemischt, sonst entsteht ein Komposit, das zu
+    keinem realen Käufer passt.
+
+    Breiter als ma_score gedacht (Top-3-Mittelwert, wahrscheinlichkeits-
+    gewichtet): SC-02 fragt "gibt es ÜBERHAUPT eine strategisch starke
+    Story", ma_score fragt "wie wahrscheinlich ist ein Exit über die
+    realistischsten Käufer".
+
+    TechReadiness ist Target-intrinsisch (buyer-unabhängig) und steckt nicht
+    im Aggregat — wird wie in company_detail.py direkt über
+    compute_auto_tech_readiness() berechnet, statt aus einem toten Feld
+    (company.get("tech_readiness")) zu raten.
+
+    HINWEIS: `buyers`-Parameter bleibt aus Signatur-Kompatibilität erhalten,
+    ist aber seit BUYER-AGG-01 unbenutzt (Vorzustand, nicht durch diesen
+    Patch eingeführt) — SC02-REWORK-01-Folgearbeit, falls Signatur-Cleanup
+    gewünscht ist.
 
     Gewichtung:
-      SRR             0–3.5 Pkt  (Strategische Relevanz)
-      TechReadiness   0–3.5 Pkt  (Technologische Reife)
-      MFR             0–3.0 Pkt  (Buyer Feasibility)
+      SRR-Kategorie   0–3.5 Pkt  (bester Buyer-Match: Transformational++ … Low Strategic)
+      TechReadiness   0–3.5 Pkt  (Target-intrinsisch)
+      MFR-Signal      0–3.0 Pkt  (Feasibility DESSELBEN Buyer-Matches)
       Buyer Bonus     0–1.0 Pkt  (Anzahl realistischer Käufer aus Deal-Engine)
-
-    HINWEIS: SRR/MFR werden hier weiter aus Company-Feldern gelesen (Legacy).
-    Der feasible-Count kommt jetzt aus dem echten Deal-Aggregat (BUYER-AGG-01)
-    statt aus nicht-existentem b["mfr"]. Vollständige SC-02-Neuausrichtung auf
-    die Per-Buyer-Engine ist eine offene Produktentscheidung (SC02-REWORK-01).
     """
+    from src.pipelines.scoring import compute_auto_tech_readiness
+
     inputs: dict = {}
+    agg = ma_aggregate or {}
+    contributors = agg.get("contributors") or []
+    top = contributors[0] if contributors else {}
 
-    srr = company.get("srr") or company.get("strategic_relevance_rating")
-    mfr = company.get("mfr_confidence")
-    tr  = float(company.get("tech_readiness") or 0.5)
+    srr_cat = top.get("srr_category")
+    mfr_sig = top.get("mfr_signal")
 
-    inputs["srr"]            = srr
-    inputs["mfr"]            = mfr
-    inputs["tech_readiness"] = tr
+    inputs["srr_category"] = srr_cat
+    inputs["mfr_signal"]   = mfr_sig
+    inputs["top_buyer"]    = top.get("buyer")
 
-    srr_pts = _SRR_SCORE.get(srr, 1.0)
-    mfr_pts = _MFR_SCORE.get(mfr, 0.5)
-    tr_pts  = tr * 3.5
+    srr_pts = _SRR_CATEGORY_SCORE.get(srr_cat, 1.0)
+    mfr_pts = _MFR_SIGNAL_SCORE.get(mfr_sig, 0.5)
 
-    # Buyer Bonus aus echtem Deal-Aggregat (feasible_count), nicht aus b["mfr"]
-    feasible_count = (ma_aggregate or {}).get("feasible_count", 0)
+    # TechReadiness: Target-intrinsisch — gleiche Berechnung wie company_detail.py,
+    # damit SC-02 und das tatsächliche Buyer-Scoring nicht divergieren.
+    if _is_listed(company):
+        tr, tr_confidence = 0.5, "listed"
+    else:
+        tr, tr_confidence = compute_auto_tech_readiness(
+            stage=company.get("funding_stage"),
+            category=company.get("category"),
+            funding_total_usd_mn=company.get("funding_total_usd_mn"),
+            funding_last_round=company.get("funding_last_round"),
+        )
+    inputs["tech_readiness"]            = tr
+    inputs["tech_readiness_confidence"] = tr_confidence
+    tr_pts = tr * 3.5
+
+    # Buyer Bonus aus echtem Deal-Aggregat (feasible_count) — unverändert seit BUYER-AGG-01
+    feasible_count = agg.get("feasible_count", 0)
     buyer_bonus = min(1.0, feasible_count * 0.25)
     inputs["feasible_buyers"] = feasible_count
 
