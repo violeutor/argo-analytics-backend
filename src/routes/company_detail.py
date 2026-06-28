@@ -3578,12 +3578,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
 # ── UX-01: Enrichment Status Endpoint ────────────────────────────────────────
 
 @router.get("/company/{name}/status")
-async def get_enrichment_status(name: str):
+async def get_enrichment_status(name: str, authorization: str | None = Header(default=None)):
     """
     UX-01: Gibt pro Tab zurück ob Daten vorhanden sind (ready) oder noch ausstehen (pending).
     Wird vom Frontend alle 3s gepolllt bis alle relevanten Tabs ready sind.
     Kein Heavy-Fetch — nur DB-Checks auf Existenz, keine Berechnungen.
+
+    AUTH-GATE-EXTEND-01: gleiches Gate wie /company/{name} (AUTH-GATE-01) —
+    kein gültiger User → 401. Kein Tier-Check (kein Free-Tier im Produkt),
+    reine Auth-Konsistenz: dieser Endpoint war bisher unauthentifiziert
+    pollbar, während der Haupt-Endpoint schon dicht war.
     """
+    _ctx = resolve_user_context(authorization)
+    if _ctx is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     sb = get_supabase()
 
     # Company laden
@@ -3660,13 +3669,20 @@ async def get_enrichment_status(name: str):
 
 
 @router.get("/company/{name}/scores")
-async def get_company_scores(name: str):
+async def get_company_scores(name: str, authorization: str | None = Header(default=None)):
     """
     UX-PEER-01: Lightweight Score-Endpoint für Frontend-Polling.
     Liest nur company_scores aus DB — kein Heavy-Fetch, kein Recalculate.
     Liefert composite_score, financial_score, market_score, rating.
     <50ms. Wird vom Peer-Score-Poller alle 5s gecallt.
+
+    AUTH-GATE-EXTEND-01: gleiches Gate wie /company/{name}/status — kein
+    gültiger User → 401, kein Tier-Check.
     """
+    _ctx = resolve_user_context(authorization)
+    if _ctx is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     sb = get_supabase()
 
     rows = sb.table("companies").select("id").ilike("name", name).limit(1).execute()
