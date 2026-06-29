@@ -143,25 +143,16 @@ _STAGE_MA_SCORE: dict[str, float] = {
     "bootstrap":  7.0,   # Owner-managed = klassisches Akquisitions-Target
 }
 
-# SC02-REWORK-01: Echte SRR-Kategorien aus der Per-Buyer-Engine (scoring.py).
-# Ersetzt die alte _SRR_SCORE-Tabelle, die auf "high"/"medium"/"low" gekeyt
-# war — Strings, die compute_srr() nie produziert (echte Werte: siehe unten).
-_SRR_CATEGORY_SCORE: dict[str | None, float] = {
-    "Transformational++": 3.5,
-    "Transformational":   2.5,
-    "High Strategic":     1.5,
-    "Low Strategic":      0.5,
-    None:                 1.0,   # kein Buyer-Scoring verfügbar (noch nicht angereichert)
-}
-
-# SC02-REWORK-01: Echte MFR-Signale aus der Per-Buyer-Engine (scoring.py).
-# Ersetzt die alte _MFR_SCORE-Tabelle ("Unlikely" statt "Overstretch").
-_MFR_SIGNAL_SCORE: dict[str | None, float] = {
-    "Feasible":    3.0,
-    "Watch":       2.0,
-    "Overstretch": 0.5,
-    None:          0.5,
-}
+# SC02-MA-UNIFY-01 (S76): _SRR_CATEGORY_SCORE + _MFR_SIGNAL_SCORE entfernt.
+# SC-02 las bisher die String-Labels (srr_category/mfr_signal) des besten Buyers
+# und bog sie in zwei separat kalibrierte Punktetabellen — eine zweite
+# Aggregations-Logik neben der echten Per-Buyer-Engine (scoring.py). M&A Score
+# nutzte parallel den kontinuierlichen deal_success_score (srr_norm × mfr_norm ×
+# tr.value). Zwei Namen, eine Grundgröße, unterschiedlich aggregiert → nicht
+# nachvollziehbar. Jetzt lesen BEIDE deal_success_score direkt, nur auf
+# unterschiedlicher Aggregationsstufe (SC-02: bester Buyer; M&A: Top-3-Mittel).
+# TR ist in deal_success_score bereits enthalten (multiplikativ) — kein
+# separates tr_pts×3.5 mehr in SC-02. Siehe compute_strategic_score.
 
 # Investor-Tier-Lookup (keyword → 1–3)
 _INVESTOR_TIER_KW: list[tuple[str, int]] = [
@@ -294,47 +285,17 @@ def _resolve_funding_stage(company: dict) -> str:
     return "listed" if stage == "public" else stage
 
 
-def _compute_target_tech_readiness(
-    company: dict,
-    is_listed: bool,
-    tr_override: dict | None = None,
-) -> tuple[float, str]:
-    """
-    SC02-REWORK-01 (Folgearbeit): Target-intrinsische TechReadiness (buyer-
-    unabhängig) — gemeinsame Quelle für SC-02/09/IPO/ETF/Enabler, damit alle
-    dieselbe Berechnung wie die echte Buyer-Pipeline (company_detail.py)
-    nutzen, statt aus dem toten Feld company.get("tech_readiness") zu raten.
-
-    is_listed wird vom AUFRUFER übergeben, nicht hier neu bestimmt — compute_
-    etf_score hat eine bewusst abweichende Listed-Erkennung (BUG-44:
-    ipo_status-only, kein ticker-Fallback, weil Ticker auch bei privaten
-    Companies gesetzt sein kann). Würde dieser Helper _is_listed() intern
-    aufrufen, könnte er BUG-44 in der TR-Teilberechnung wieder einschleppen.
-
-    TR-MODAL-01: tr_override ist company.get("_tr_override") — vom AUFRUFER
-    (company_detail.py) aus user_tr_overrides geladen und bereits in einen
-    einzelnen Float reduziert (manual: gewichteter Faktor-Durchschnitt via
-    _TR_WEIGHTS; neutral: fix 0.5). Override hat Vorrang vor Listed-Status
-    UND Auto-Berechnung — ein User, der bewusst "neutral" wählt, will auch
-    bei einer listed Company exakt 0.5 sehen (identisch zur bisherigen
-    Listed-Konvention, aber jetzt explizit User-Wahl statt impliziter Regel).
-    confidence-Strings matchen TechReadinessDetail.confidence im Frontend
-    (page.tsx: "listed | auto_low | auto_medium | auto_high | user").
-    """
-    if tr_override and tr_override.get("mode") in ("manual", "neutral"):
-        value = tr_override.get("value")
-        if value is not None:
-            return float(value), ("user" if tr_override["mode"] == "manual" else "neutral_user")
-
-    if is_listed:
-        return 0.5, "listed"
-    from src.pipelines.scoring import compute_auto_tech_readiness
-    return compute_auto_tech_readiness(
-        stage=company.get("funding_stage"),
-        category=company.get("category"),
-        funding_total_usd_mn=company.get("funding_total_usd_mn"),
-        funding_last_round=company.get("funding_last_round"),
-    )
+# SC02-MA-UNIFY-01 + TR-CONSISTENCY-AUDIT-01 (S76): _compute_target_tech_readiness()
+# ENTFERNT. War der gemeinsame Company-Level-TR-Helper für SC-02/09/IPO/ETF/
+# Enabler. Nach diesem Block hat KEIN Score in dieser Datei mehr eine
+# TechReadiness-Komponente:
+#   - SC-02 liest deal_success_score direkt (TR multiplikativ enthalten, kommt
+#     aus dem Per-Buyer-Loop in company_detail.py / scoring.py)
+#   - IPO Score: TR raus (TR-STAGE-OVERLAP-01, S75)
+#   - ETF / Enabler / Value Driver: TR raus (TR-CONSISTENCY-AUDIT-01, S76)
+# TechReadiness lebt damit AUSSCHLIESSLICH in der Per-Buyer-Engine (scoring.py),
+# wo sie als Buyer↔Target-Fit-Signal hingehört. Der User-Override (_tr_override)
+# fließt dort über AnalyzeRequest.tech_readiness_override ein, nicht mehr hier.
 
 
 def _investor_tier(name: str, investor_type: str) -> int:
@@ -514,60 +475,73 @@ def compute_strategic_score(company: dict, ma_aggregate: dict | None = None) -> 
     """
     SC-02: Strategic Score (0–10).
 
-    SC02-REWORK-01: SRR/MFR werden jetzt aus dem ECHTEN Deal-Aggregat der
-    Per-Buyer-Engine gelesen (ma_aggregate["contributors"][0] — der bestplatzierte
-    Buyer-Match nach deal_success_score) statt aus nicht-existenten Company-
-    Feldern (company.get("srr")/mfr_confidence — alter toter Pfad, lieferte
-    immer den Default, UND war auf Strings gekeyt, die die Engine nie liefert).
+    SC02-MA-UNIFY-01 (S76): Liest jetzt die EINE kontinuierliche Grundgröße der
+    Per-Buyer-Engine — deal_success_score (= srr_norm × mfr_norm × tr.value,
+    scoring.py) — direkt, statt die String-Labels (srr_category/mfr_signal) in
+    eine zweite, separat kalibrierte Punktetabelle zu biegen. Dieselbe Rohgröße
+    wie compute_ma_score, nur andere Aggregationsstufe:
+      SC-02      = deal_success_score des BESTEN Buyers      → "gibt es überhaupt
+                   eine strategisch starke Story?"
+      M&A Score  = Top-3-Mittel der deal_success_scores       → "wie wahrscheinlich
+                   ist ein Exit über die realistischsten Käufer?"
+    Damit ist die Zahl für den User nachvollziehbar (eine Quelle, zwei
+    Aggregationen) statt zweier zufällig ähnlicher Kategorie-Lookups.
 
-    Bewusst contributors[0] für BEIDE Werte — nicht "bestes SRR von Buyer X" +
-    "bestes MFR von Buyer Y" gemischt, sonst entsteht ein Komposit, das zu
-    keinem realen Käufer passt.
+    TechReadiness ist in deal_success_score bereits multiplikativ enthalten —
+    KEIN separates tr_pts × 3.5 mehr (das war die SC02-REWORK-01-Logik, jetzt
+    abgelöst). TR-STAGE-OVERLAP-01 hat dieselbe Doppelzählungs-Lehre für den
+    IPO Score gezogen; hier ist die saubere Lösung die gemeinsame Basisgröße,
+    nicht ein additiver TR-Summand.
 
-    Breiter als ma_score gedacht (Top-3-Mittelwert, wahrscheinlichkeits-
-    gewichtet): SC-02 fragt "gibt es ÜBERHAUPT eine strategisch starke
-    Story", ma_score fragt "wie wahrscheinlich ist ein Exit über die
-    realistischsten Käufer".
+    Hinweis zum Wertebereich: Auto-TR cappt bei 0.92 (scoring.py), d.h. der
+    deal_success-Anteil erreicht im Auto-Modus nominal max 9.2 von 10 — der
+    Buyer-Bonus (0–1.0) füllt den Rest. Bei manuellem User-Override (TR bis 1.0)
+    sind volle 10 erreichbar. Das ist Absicht, kein Deckelungs-Bug.
 
-    TechReadiness ist Target-intrinsisch (buyer-unabhängig) — _compute_target_
-    tech_readiness() statt aus einem toten Feld zu raten (gemeinsamer Helper
-    mit ETF/Enabler Score).
+    contributors[0] trägt deal_success_score (company_detail.py::_ma_aggregate_meta).
+    Kein Buyer-Aggregat (noch nicht angereichert / kein tauglicher Käufer) →
+    konservativer Sockel statt 0, damit eine Company ohne Buyer-Scoring nicht
+    fälschlich als strategisch wertlos erscheint.
 
-    Signatur-Cleanup (SC02-REWORK-01-Folge): `buyers`-Parameter entfernt — war
-    seit BUYER-AGG-01 unbenutzt (Nebenbefund aus BUYER-MFR-01, S68).
+    Signatur-Cleanup (SC02-REWORK-01-Folge): `buyers`-Parameter bereits entfernt.
 
     Gewichtung:
-      SRR-Kategorie   0–3.5 Pkt  (bester Buyer-Match: Transformational++ … Low Strategic)
-      TechReadiness   0–3.5 Pkt  (Target-intrinsisch)
-      MFR-Signal      0–3.0 Pkt  (Feasibility DESSELBEN Buyer-Matches)
-      Buyer Bonus     0–1.0 Pkt  (Anzahl realistischer Käufer aus Deal-Engine)
+      Deal-Success (bester Buyer)   0–9.2/10 Pkt  (× 10, TR multiplikativ enthalten)
+      Buyer Bonus                   0–1.0 Pkt     (Anzahl realistischer Käufer)
     """
     inputs: dict = {}
     agg = ma_aggregate or {}
     contributors = agg.get("contributors") or []
     top = contributors[0] if contributors else {}
 
-    srr_cat = top.get("srr_category")
-    mfr_sig = top.get("mfr_signal")
+    top_dss = top.get("deal_success_score")
+    inputs["top_buyer"]           = top.get("buyer")
+    inputs["top_deal_success"]    = top_dss
+    inputs["srr_category"]        = top.get("srr_category")   # nur Anzeige/Tooltip
+    inputs["mfr_signal"]          = top.get("mfr_signal")     # nur Anzeige/Tooltip
 
-    inputs["srr_category"] = srr_cat
-    inputs["mfr_signal"]   = mfr_sig
-    inputs["top_buyer"]    = top.get("buyer")
+    if top_dss is None:
+        # Kein Buyer-Scoring verfügbar (Mega-Cap/listed → kein Aggregat per
+        # Acquirability-Gate; oder Buyer-Enrichment noch nicht gelaufen).
+        # Stage-sensitiver konservativer Sockel statt platt — analog zum
+        # no-buyer-Fallback in compute_ma_score, damit eine private Company
+        # ohne fertiges Buyer-Enrichment nicht kurzzeitig auf einen
+        # Einheitswert fällt (SC-02 fließt mit 20% in den Composite).
+        stage = _resolve_funding_stage(company)
+        stage_pts = _stage_match(stage, _STAGE_MA_SCORE) * 0.15   # 0..1.275
+        score = 1.5 + stage_pts
+        inputs["funding_stage"] = stage
+        inputs["fallback"] = "no_buyer_aggregate"
+        return _safe_round(score), inputs
 
-    srr_pts = _SRR_CATEGORY_SCORE.get(srr_cat, 1.0)
-    mfr_pts = _MFR_SIGNAL_SCORE.get(mfr_sig, 0.5)
-
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
-    inputs["tech_readiness"]            = tr
-    inputs["tech_readiness_confidence"] = tr_confidence
-    tr_pts = tr * 3.5
+    deal_pts = float(top_dss) * 10.0
 
     # Buyer Bonus aus echtem Deal-Aggregat (feasible_count) — unverändert seit BUYER-AGG-01
     feasible_count = agg.get("feasible_count", 0)
     buyer_bonus = min(1.0, feasible_count * 0.25)
     inputs["feasible_buyers"] = feasible_count
 
-    score = srr_pts + mfr_pts + tr_pts + buyer_bonus
+    score = deal_pts + buyer_bonus
     return _safe_round(score), inputs
 
 
@@ -784,32 +758,28 @@ def compute_value_driver_score(
     """
     SC-09: Value Driver Score (0–10). Höher = stärkere strukturelle Vorteile.
 
-    Inputs: value_drivers (dependency_score, market_position, type), tech_readiness.
+    Inputs: value_drivers (dependency_score, market_position, type).
 
-    Gewichtung:
-      Dependency Score   0–4.0 Pkt  (Kernmetrik — tatsächliche Enabler-Qualität)
+    Gewichtung (TR-CONSISTENCY-AUDIT-01, S76 — TechReadiness entfernt):
+      Dependency Score   0–5.5 Pkt  (Kernmetrik — tatsächliche Enabler-Qualität)
       Market Position    0–2.0 Pkt  (Leader/Dominant Einträge)
       Driver Count       0–2.0 Pkt  (Anzahl identifizierter Value Drivers)
-      TechReadiness      0–1.5 Pkt  (Stage-Proxy — unterstützend, nicht dominant)
       Baseline           0.5  Pkt   (immer)
 
-    Rationale: TechReadiness ist ein Stage-Proxy, keine echte Enabler-Qualität.
-    Dependency Score und Market Position reflektieren die tatsächliche Supply-Chain-Stärke.
-    Eine Series-A Company mit kritischen Enablerabhängigkeiten schlägt eine
-    Series-C Company mit commodity Enablers — wie in der Realität.
+    Rationale: Dependency Score und Market Position reflektieren die tatsächliche
+    Supply-Chain-Stärke. Eine Series-A Company mit kritischen Enablerabhängig-
+    keiten schlägt eine Series-C Company mit commodity Enablers — wie in der
+    Realität.
 
-    TR-MODAL-01-Folge: nutzte bisher company.get("tech_readiness") — das tote
-    Feld, das nie befüllt wird (immer 0.5-Default), exakt dasselbe Muster wie
-    zuvor in SC-02/ETF/Enabler (SC02-REWORK-01). Jetzt über den gemeinsamen
-    Helper, inkl. User-Override-Unterstützung.
+    TR-CONSISTENCY-AUDIT-01 (S76): TechReadiness ENTFERNT (war tr × 1.5,
+    bereits S34 von 3.0 runtergewichtet mit der Begründung "Stage-Proxy, keine
+    echte Enabler-Qualität" — dieselbe Logik führt jetzt konsequent zur
+    Entfernung). Die 1.5 Pkt auf Dependency umverteilt (4.0→5.5), die laut
+    eigener Doku die echte Qualitätsmetrik ist. _compute_target_tech_readiness()
+    wird hier nicht mehr aufgerufen.
     """
     inputs: dict = {}
     score = 0.5   # Baseline
-
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
-    inputs["tech_readiness"]            = tr
-    inputs["tech_readiness_confidence"] = tr_confidence
-    score += tr * 1.5   # Stage-Proxy: unterstützend, nicht dominant (war: 3.0)
 
     vds = value_drivers or []
     if not vds:
@@ -820,19 +790,19 @@ def compute_value_driver_score(
     score += min(2.0, len(vds) * 0.4)
     inputs["driver_count"] = len(vds)
 
-    # Dependency Score Durchschnitt (0–4) — Kernmetrik
+    # Dependency Score Durchschnitt (0–5.5) — Kernmetrik
     dep_vals = [float(d["dependency_score"]) for d in vds if d.get("dependency_score") is not None]
     if dep_vals:
         avg_dep = sum(dep_vals) / len(dep_vals)
-        score += avg_dep * 4.0   # war: 3.0 — Dependency ist die echte Qualitätsmetrik
+        score += avg_dep * 5.5   # war: 4.0 — TR-Gewicht (1.5) auf die echte Qualitätsmetrik umverteilt
         inputs["avg_dependency_score"] = round(avg_dep, 2)
 
-    # Market Position Bonus (0–2.0) — erhöht von 1.5 auf 2.0
+    # Market Position Bonus (0–2.0)
     strong = sum(
         1 for d in vds
         if (d.get("market_position") or "").lower() in ("leader", "market leader", "dominant", "monopol", "quasi-monopol")
     )
-    score += min(2.0, strong * 0.75)   # war: min(1.5, ...)
+    score += min(2.0, strong * 0.75)
     inputs["strong_positions"] = strong
 
     return _safe_round(score), inputs
@@ -978,12 +948,16 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
       Listed Status     0 / 2 / 5 Pkt  (listed = direkt trackbar)
       Kategorie-Match   0 / 3.0 Pkt    (ETF-abgedeckte Sektoren)
       Explizite Drivers 0 / 2.0 Pkt    (ETF in value_drivers)
-      TechReadiness     0–1.0 Pkt      (kleiner Relevanz-Bonus)
 
-    SC02-REWORK-01-Folge: TechReadiness kam bisher aus dem toten Feld
-    company.get("tech_readiness") (nie befüllt → immer 0.5-Default). Jetzt
-    über den gemeinsamen Helper berechnet — is_listed bleibt die LOKALE
-    BUG-44-Variante (ipo_status-only), nicht die allgemeine _is_listed().
+    TR-CONSISTENCY-AUDIT-01 (S76): TechReadiness ENTFERNT (war tr × 1.0).
+    ETF-Trackbarkeit ist eine Frage von Listed-Status + Sektor-Coverage —
+    TechReadiness beantwortet hier inhaltlich die falsche Frage (Kategorienfehler,
+    dieselbe Lehre wie TR-STAGE-OVERLAP-01 für den IPO Score). Bewusst NICHT
+    umverteilt — der freigewordene Punkt wird nicht künstlich auf andere
+    Komponenten geschoben, der nominale Max sinkt von 10.0 auf 10.0 (war faktisch
+    7+TR; die TR-Entfernung senkt den realen Range leicht, das ist gewollt und
+    wird beim Hero-Path-Test sichtbar). _compute_target_tech_readiness() wird hier
+    nicht mehr aufgerufen.
     """
     inputs: dict = {}
     score = 0.0
@@ -992,11 +966,9 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
     is_listed = company.get("ipo_status") == "listed"
     category  = (company.get("category") or "").lower()
     industry  = (company.get("industry") or "").lower()
-    tr, tr_confidence = _compute_target_tech_readiness(company, is_listed, company.get("_tr_override"))
 
     inputs.update({
         "is_listed": is_listed, "category": category,
-        "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
     })
 
     # Listed Status
@@ -1020,7 +992,6 @@ def compute_etf_score(company: dict, value_drivers: list[dict]) -> tuple[float, 
         score += 2.0
         inputs["explicit_etf_drivers"] = len(etf_vds)
 
-    score += tr * 1.0   # kleiner TechReadiness-Bonus
     return _safe_round(score), inputs
 
 
@@ -1034,33 +1005,35 @@ def compute_enabler_score(
     Hoch für: B2B-Industrien, viele Enabler-Value-Drivers, hohe Dependency Scores,
               quasi-monopolistische Marktposition.
 
-    Gewichtung:
-      TechReadiness          0–3.0 Pkt  (Core-Tech = wichtiger Enabler)
-      B2B-Industrie-Signal   0 / 2.0    (Hardware, Materials, Infra usw.)
+    Gewichtung (TR-CONSISTENCY-AUDIT-01, S76 — TechReadiness entfernt):
+      Baseline               0.5  Pkt   (als Enabler klassifiziert)
+      B2B-Industrie-Signal   0 / 3.0    (Hardware, Materials, Infra usw.)
       Enabler Driver Count   0–3.0 Pkt  (explizite Enabler-Value-Drivers)
-      Dependency Score       0–2.0 Pkt  (Abhängigkeit der Käufer)
+      Dependency Score       0–3.5 Pkt  (Abhängigkeit der Käufer — Kernmetrik)
 
-    SC02-REWORK-01-Folge: `buyers`-Parameter entfernt — war unbenutzt
-    (identischer toter Parameter wie bei compute_strategic_score, Nebenbefund
-    aus BUYER-MFR-01, S68). TechReadiness kam bisher aus dem toten Feld
-    company.get("tech_readiness") — jetzt über den gemeinsamen Helper
-    berechnet (allgemeine _is_listed(), keine BUG-44-Sonderlogik nötig hier).
+    TR-CONSISTENCY-AUDIT-01 (S76): TechReadiness ENTFERNT (war tr × 3.0, das
+    höchste TR-Gewicht außerhalb SC-02). Im Auto-Modus war TR ein reiner
+    Stage-Proxy; im Manual-Override buyer-fit-geprägt (TR-FIELDNAME-HYGIENE-01) —
+    in beiden Fällen beantwortet TR hier nicht die Enabler-Frage ("wie kritisch
+    ist diese Tech als Infrastruktur"). Die freigewordenen 3.0 Pkt bewusst auf
+    die inhaltlich tragenden Komponenten umverteilt (NICHT auf TR-Ersatz):
+    B2B-Signal 2.0→3.0 (verlässlichstes Enabler-Indiz), Dependency 2.0→3.5
+    (echte Kernmetrik der Käufer-Abhängigkeit), + 0.5 Baseline. Range bleibt
+    0–10. _compute_target_tech_readiness() wird hier nicht mehr aufgerufen.
+
+    Signatur-Cleanup (SC02-REWORK-01-Folge): `buyers`-Parameter bereits entfernt.
     """
     inputs: dict = {}
-    score = 0.0
+    score = 0.5   # Baseline: als Enabler-Kandidat überhaupt betrachtet
 
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
     industry = (company.get("industry") or "").lower()
     category = (company.get("category") or "").lower()
 
     inputs.update({
-        "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
         "industry": industry,
     })
 
-    score += tr * 3.0
-
-    # B2B-Industrie (0–2)
+    # B2B-Industrie (0–3) — verlässlichstes strukturelles Enabler-Indiz
     _B2B_KW = (
         "semiconductor", "industrial", "software", "saas", "deep tech",
         "materials", "infrastructure", "chemicals", "components",
@@ -1068,7 +1041,7 @@ def compute_enabler_score(
         "electrolysis", "hydrogen", "grid", "storage", "carbon",
     )
     if any(kw in industry or kw in category for kw in _B2B_KW):
-        score += 2.0
+        score += 3.0
         inputs["b2b_signal"] = True
     else:
         inputs["b2b_signal"] = False
@@ -1082,11 +1055,11 @@ def compute_enabler_score(
     score += min(3.0, len(enabler_vds) * 1.0)
     inputs["enabler_driver_count"] = len(enabler_vds)
 
-    # Dependency Score (0–2)
+    # Dependency Score (0–3.5) — Kernmetrik der Käufer-Abhängigkeit
     dep_vals = [float(d["dependency_score"]) for d in enabler_vds if d.get("dependency_score") is not None]
     if dep_vals:
         avg_dep = sum(dep_vals) / len(dep_vals)
-        score += avg_dep * 2.0
+        score += avg_dep * 3.5
         inputs["avg_dependency"] = round(avg_dep, 2)
 
     return _safe_round(score), inputs

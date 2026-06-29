@@ -172,6 +172,76 @@ def compute_auto_tech_readiness(
     return tr, confidence
 
 
+# ── TR-Faktor-Split: intrinsisch (company) + relational (pro Buyer) ────────────
+# TR-SPLIT-01 (S76): Die 7 TR-Faktoren teilen sich konzeptionell in zwei Gruppen
+# (TR-FIELDNAME-HYGIENE-01 hatte das benannt):
+#   intrinsisch (Target-Eigenschaft, buyer-unabhängig):
+#       rd_intensity (0.10), regulatory_readiness (0.10),
+#       capital_deployment_velocity (0.15)  → Summe 0.35
+#   relational (Buyer↔Target-Fit, variiert pro Buyer):
+#       tech_stack_fit (0.20), gtm_fit (0.15), integration_capacity (0.20),
+#       strategic_coherence (0.10)           → Summe 0.65
+#
+# Datenfluss (Option-3-Entscheidung, Andreas S76):
+#   - MANUELLER Override: User-Wert überschreibt den GESAMTEN TR-Wert (beide
+#     Gruppen), voller 100%-Effekt, instant. Split greift hier NICHT — der
+#     User sagt "nimm meinen Wert ganz". Verarbeitet in company_detail.py
+#     (unverändert), nicht hier.
+#   - AUTO-Modus: intrinsischer Anteil = Output von compute_auto_tech_readiness()
+#     (pragmatischer Zuschnitt für diesen Block — die saubere Faktor-für-Faktor-
+#     Trennung im Auto-Modus kommt mit dem Kalibrierungs-Ticket); relationaler
+#     Anteil = compute_auto_tech_readiness_relational() pro Buyer.
+#
+# Relationaler Anteil ist in diesem Block ein NEUTRALER PLATZHALTER (0.5) — die
+# echte Ableitung aus Mcap-Ratio / source_type ist bewusst NICHT hier kalibriert
+# (Diagnose vor Aktionismus: Struktur und Kalibrierung nicht in einem Zug
+# vermischen). Folgeticket: TR-RELATIONAL-CALIBRATION-01.
+
+_TR_INTRINSIC_WEIGHT = 0.35
+_TR_RELATIONAL_WEIGHT = 0.65
+
+
+def compute_auto_tech_readiness_relational(
+    buyer_market_cap_usd_bn: float | None = None,
+    target_funding_usd_mn: float | None = None,
+    source_type: str | None = None,
+) -> tuple[float, str]:
+    """
+    Relationaler TR-Anteil (Buyer↔Target-Fit), variiert pro Buyer.
+
+    TR-SPLIT-01 (S76): VORERST NEUTRALER PLATZHALTER (0.5). Die Parameter sind
+    bereits in der Signatur, damit die Aufrufstelle (company_detail.py) sie
+    durchreichen kann, ohne bei der Kalibrierung erneut angefasst zu werden —
+    aber sie werden hier noch NICHT ausgewertet. Echte Ableitung (z.B. große
+    Buyer-Mcap relativ zum Target → höhere integration_capacity; source_type
+    supply_chain/peer/sector → unterschiedliche strategic_coherence) ist das
+    Folgeticket TR-RELATIONAL-CALIBRATION-01.
+
+    Returns (value: float, confidence: str).
+    """
+    # TODO(TR-RELATIONAL-CALIBRATION-01): Ableitung aus buyer_market_cap_usd_bn /
+    # target_funding_usd_mn / source_type. Bis dahin neutral.
+    return 0.5, "neutral_relational"
+
+
+def combine_tech_readiness(intrinsic: float, relational: float) -> float:
+    """
+    TR-SPLIT-01 (S76): Kombiniert intrinsischen (company-konstanten) und
+    relationalen (pro-Buyer) TR-Anteil nach den Auto-Modus-Gewichten
+    (0.35 / 0.65). Nur für den AUTO-Pfad — der manuelle Override umgeht diese
+    Kombination komplett (s. Modul-Kommentar oben).
+
+    Solange der relationale Anteil neutral (0.5) ist, dämpft die 0.65-Gewichtung
+    den sichtbaren Effekt des intrinsischen Anteils — das ist gewollt und
+    verschwindet, sobald TR-RELATIONAL-CALIBRATION-01 den relationalen Teil
+    pro Buyer echt berechnet.
+    """
+    return round(
+        intrinsic * _TR_INTRINSIC_WEIGHT + relational * _TR_RELATIONAL_WEIGHT,
+        4,
+    )
+
+
 # ── SRR ──────────────────────────────────────────────────────────────────────
 
 def compute_srr(tam_usd_bn: float, buyer_market_cap_usd_bn: float) -> SRRResult:

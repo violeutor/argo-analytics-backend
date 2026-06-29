@@ -48,7 +48,13 @@ from src.services.market_data_enrichment import (
     enrich_market_data_sync_wrapper,
 )
 from src.services.value_drivers_enrichment import enrich_value_drivers
-from src.pipelines.scoring import compute_scores, compute_auto_tech_readiness, sort_scorings_by_lens
+from src.pipelines.scoring import (
+    compute_scores,
+    compute_auto_tech_readiness,
+    compute_auto_tech_readiness_relational,
+    combine_tech_readiness,
+    sort_scorings_by_lens,
+)
 from src.services.auth_context import resolve_user_context
 from src.models.schemas import AnalyzeRequest
 from src.services.enrichment import (
@@ -3361,24 +3367,35 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         logger.info("Scoring: %d company-spezifische Buyer für %s", len(buyers), company_name)
         scorings = []
 
+        # TR-SPLIT-01 (S76): Drei TR-Modi, unterschiedlich verortet —
+        #   manual/neutral Override + listed: EIN company-konstanter Wert, voll
+        #     durchgereicht an jeden Buyer (unverändert, Option-3-Entscheidung:
+        #     der manuelle User-Wert überschreibt TR ganz, kein Split).
+        #   auto: intrinsischer Anteil hier EINMAL berechnet (company-konstant),
+        #     relationaler Anteil PRO BUYER in der Schleife unten (variiert).
+        _tr_mode_fixed: float | None = None   # gesetzt = company-konstant, kein Split
+        _tr_intrinsic: float | None = None    # gesetzt = Auto-Split aktiv
         if _tr_override and _tr_override.get("value") is not None:
-            # TR-MODAL-01: gleiche Quelle wie score_calculator.py — Tab 8 und
-            # die Company-Level-Scores (SC-02/09/IPO/ETF/Enabler) zeigen damit
-            # garantiert denselben TR-Wert, wenn ein User-Override aktiv ist.
-            auto_tr       = float(_tr_override["value"])
-            tr_confidence = "user" if _tr_override["mode"] == "manual" else "neutral_user"
-            logger.info("User-TR-Override for %s: %.3f (mode=%s)", company_name, auto_tr, _tr_override["mode"])
+            # TR-MODAL-01: gleiche Quelle wie score_calculator.py-Pfad früher —
+            # Tab 8 und die Company-Level-Scores zeigen denselben TR-Wert bei
+            # aktivem User-Override. Voller 100%-Effekt, kein Split (Option 3).
+            _tr_mode_fixed = float(_tr_override["value"])
+            tr_confidence  = "user" if _tr_override["mode"] == "manual" else "neutral_user"
+            logger.info("User-TR-Override for %s: %.3f (mode=%s)", company_name, _tr_mode_fixed, _tr_override["mode"])
         elif is_listed:
-            auto_tr = 0.5
-            tr_confidence = "listed"
+            _tr_mode_fixed = 0.5
+            tr_confidence  = "listed"
         else:
-            auto_tr, tr_confidence = compute_auto_tech_readiness(
+            # Auto-Modus: intrinsischer Anteil company-konstant (pragmatischer
+            # Zuschnitt — Output der bestehenden Auto-Funktion = intrinsischer
+            # Teil, s. TR-SPLIT-01 in scoring.py). Relationaler Anteil pro Buyer.
+            _tr_intrinsic, tr_confidence = compute_auto_tech_readiness(
                 stage=company.get("funding_stage"),
                 category=company.get("category"),
                 funding_total_usd_mn=company.get("funding_total_usd_mn"),
                 funding_last_round=company.get("funding_last_round"),
             )
-            logger.info("Auto-TR for %s: %.3f (confidence=%s)", company_name, auto_tr, tr_confidence)
+            logger.info("Auto-TR (intrinsic) for %s: %.3f (confidence=%s)", company_name, _tr_intrinsic, tr_confidence)
 
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
@@ -3396,6 +3413,20 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 if _debt_ebitda is None:
                     _debt_ebitda = 0.0           # 0 → keine debt-Korrektur (1c)
 
+                # TR-SPLIT-01: pro-Buyer-TR. Fixed-Modus (manual/neutral/listed)
+                # → konstant. Auto-Modus → intrinsisch (konstant) kombiniert mit
+                # relationalem Anteil (variiert pro Buyer, vorerst neutral 0.5 —
+                # TR-RELATIONAL-CALIBRATION-01).
+                if _tr_mode_fixed is not None:
+                    buyer_tr = _tr_mode_fixed
+                else:
+                    _rel, _ = compute_auto_tech_readiness_relational(
+                        buyer_market_cap_usd_bn=float(mcap),
+                        target_funding_usd_mn=company.get("funding_total_usd_mn"),
+                        source_type=buyer.get("source_type"),
+                    )
+                    buyer_tr = combine_tech_readiness(_tr_intrinsic, _rel)
+
                 req = AnalyzeRequest(
                     company_name=company_name,
                     buyer_name=buyer["name"],
@@ -3406,7 +3437,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
                     target_stage=company.get("funding_stage") or "series_b",
                     target_vertical=company.get("industry"),   # VALUATION-SSOT-01 Vertical-Korrektur
-                    tech_readiness_override=auto_tr,
+                    tech_readiness_override=buyer_tr,
                 )
                 scores = compute_scores(req)
                 scorings.append(ScoringDetail(
@@ -3417,7 +3448,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     mfr_value=scores.mfr.value,
                     mfr_signal=scores.mfr.signal,
                     tech_readiness=TechReadinessDetail(
-                        overall=auto_tr,
+                        overall=buyer_tr,
                         inputs_provided=tr_confidence == "user",
                         factors=scores.tech_readiness.factor_scores,
                         factor_weights=_TR_WEIGHTS,
@@ -3516,11 +3547,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # Erst DB-Cache prüfen (computed_at < 24h → verwenden).
     # Sonst: compute_all_scores() + in Background cachen.
     #
-    # TR-MODAL-01: company_scores ist NICHT pro User gecacht (Key=company_id,
-    # global für alle User). Ein aktiver manual/neutral-Override gehört NIE in
-    # diesen Cache — sonst sähe User B den TR-Override von User A für bis zu
-    # 24h. Auto-User (Default, kein Override) sind hiervon unberührt: für sie
-    # bleibt der Cache-Pfad exakt wie vorher.
+    # TR-MODAL-01 / SC02-MA-UNIFY-01 (S76): company_scores ist NICHT pro User
+    # gecacht (Key=company_id, global). Ein aktiver manual/neutral-Override
+    # gehört NIE in diesen Cache — sonst sähe User B den TR-Override von User A
+    # für bis zu 24h.
+    # WICHTIG — geänderte Wirkkette seit S76: Nach SC02-MA-UNIFY-01 + TR-
+    # CONSISTENCY-AUDIT-01 liest KEIN Company-Level-Score mehr TR direkt. Der
+    # Override wirkt jetzt ausschließlich INDIREKT: Override → Buyer-Loop (oben)
+    # → ma_aggregate → SC-02 (deal_success_score). SC-02 ist Teil von
+    # company_scores → der Cache-Bypass bleibt zwingend notwendig, nur über
+    # einen anderen Pfad als vor S76. Auto-User (Default): unverändert gecacht
+    # (der Auto-Split ist deterministisch, kein user-spezifischer Input).
     _tr_override_active = bool(_tr_override and _tr_override.get("mode") in ("manual", "neutral"))
 
     scores_result: dict | None = None
