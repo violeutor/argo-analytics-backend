@@ -845,18 +845,44 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     IPO Score (0–10): Attraktivität des IPO-Pfads.
 
     0.0 für bereits gelistete Companies (IPO abgeschlossen).
-    Hoch für: S-1 gefilter, viele IPO-Signale, hohes ipo_potential, hohe TechReadiness.
+    Hoch für: belastbare/viele IPO-Signale, fortgeschrittene Funding-Stage,
+    bei aktivem User-Override zusätzlich echte TechReadiness-Einschätzung.
 
-    Gewichtung:
-      TechReadiness   0–3.0 Pkt
-      IPO Signals     0–3.0 Pkt  (je ipo_progress Signal +1.0)
-      Stage Base      0–2.7 Pkt  (×0.3 aus _STAGE_IPO_SCORE)
-      ipo_potential   0–2.0 Pkt  (Hoch/Mittel/Niedrig)
+    TR-STAGE-OVERLAP-01 (S75): TechReadiness im Auto-Modus komplett raus.
+    compute_auto_tech_readiness() ist für private Companies selbst stage-/
+    funding-abgeleitet — stage_base und TR×3.0 hingen am selben Grundsignal
+    unter zwei Namen, bis zu 3.0 von ~10 Pkt waren Stage-Information doppelt
+    gezählt. Präzedenzfall: SC-09 hatte dasselbe Problem, S34 auf TR×1.5
+    reduziert statt entfernt — hier komplett raus, weil IPO Score (anders als
+    SC-09) bereits stage_base als eigene, vollwertige Stage-Dimension hat.
+    Ausnahme: ein ECHTER User-Override (TR-MODAL-01, tr_confidence=="user",
+    der geführte 7-Faktoren-Fragebogen) ist kein Stage-Proxy mehr, sondern
+    unabhängiges Signal — bleibt drin, mit reduziertem Gewicht (1.5 statt
+    3.0). "neutral"-Override (tr_confidence=="neutral_user") zählt bewusst
+    NICHT — der Modus existiert explizit für varianzfreie Vergleiche (fix
+    0.5, kein echtes Signal) und würde dem eigenen Zweck widersprechen, wenn
+    er trotzdem in die Score-Summe einginge.
 
-    TR-MODAL-01-Folge: nutzte bisher company.get("tech_readiness") — das tote
-    Feld, das nie befüllt wird (immer 0.5-Default), exakt dasselbe Muster wie
-    zuvor in SC-02/ETF/Enabler (SC02-REWORK-01). Jetzt über den gemeinsamen
-    Helper, inkl. User-Override-Unterstützung.
+    ipo_potential-Bucket (0–2.0 Pkt) UND S-1-Status-Boost (0–1.5 Pkt) raus —
+    beide strukturell tot in der aktuellen Pipeline: ipo_status kann "s-1"
+    nie enthalten (Enum seit migration_003 nur listed/pre_ipo_*/NULL, s.
+    LISTED-STATUS-REVIEW-01), ipo_potential wird seit der Migration nirgends
+    mehr geschrieben (verifiziert gegen company_detail.py/signal_engine.py/
+    main.py — nicht gegen enrichment.py/peers.py, daher "nirgends gesehen",
+    nicht "nirgends im System").
+
+    Signal-Gewichtung NEU (vorher pauschal 1.0/Signal, Cap 3.0 — keine
+    Differenzierung nach Quelle/Belastbarkeit):
+      EDGAR-Quelle (S-1/S-11, harte Filing-Evidenz)     1.5 Pkt / Signal
+      Andere Quellen (News/TechCrunch, Keyword-Match)   0.75 Pkt / Signal
+      Cap 5.0 (vorher 3.0) — füllt einen Teil des durch TR-Entfernung
+      freigewordenen Spielraums, ohne den Stage-Doppel-Zähl-Fehler zu
+      reproduzieren. Kalibrierung (1.5/0.75/Cap 5.0) ist ein Vorschlag,
+      keine harte Ableitung — bei Bedarf anpassen.
+
+    Neue nominale Maximalwerte: 7.7 (Auto-Modus, kein Override) bzw. 9.2
+    (mit aktivem User-Override) — vorher 10.0, aber faktisch nie erreichbar
+    (zwei der vier Komponenten tot). Realistischer als der alte Nominalwert.
     """
     inputs: dict = {}
 
@@ -864,37 +890,31 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
         inputs["note"] = "already_listed"
         return 0.0, inputs
 
-    stage         = _resolve_funding_stage(company)
+    stage = _resolve_funding_stage(company)
     tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
-    ipo_potential = company.get("ipo_potential") or ""
-    ipo_status    = company.get("ipo_status") or ""
 
-    inputs.update({"funding_stage": stage, "tech_readiness": tr, "tech_readiness_confidence": tr_confidence,
-                   "ipo_potential": ipo_potential, "ipo_status": ipo_status})
+    inputs.update({"funding_stage": stage, "tech_readiness": tr, "tech_readiness_confidence": tr_confidence})
 
-    stage_base  = _stage_match(stage, _STAGE_IPO_SCORE)
-    tr_pts      = tr * 3.0
+    stage_base = _stage_match(stage, _STAGE_IPO_SCORE)
+
+    # TR-STAGE-OVERLAP-01: nur ein echter (manueller) User-Override zählt —
+    # weder Auto-Stage-Proxy noch "neutral" (s. Docstring).
+    tr_counted = tr_confidence == "user"
+    tr_pts     = (tr * 1.5) if tr_counted else 0.0
+    inputs["tr_counted"] = tr_counted
 
     ipo_sigs = [
         s for s in (signals or [])
         if s.get("signal_category") == "ipo_progress"
         or s.get("event_type") == "ipo_status_change"
     ]
-    signal_pts = min(3.0, len(ipo_sigs) * 1.0)
-    inputs["ipo_signals"] = len(ipo_sigs)
+    edgar_sigs = [s for s in ipo_sigs if s.get("source") == "edgar"]
+    other_sigs = [s for s in ipo_sigs if s.get("source") != "edgar"]
+    signal_pts = min(5.0, len(edgar_sigs) * 1.5 + len(other_sigs) * 0.75)
+    inputs["ipo_signals"]       = len(ipo_sigs)
+    inputs["ipo_signals_edgar"] = len(edgar_sigs)
 
-    potential_pts = (
-        2.0 if ipo_potential in ("Hoch", "High") else
-        1.5 if ipo_potential == "Mittel-hoch" else
-        1.0 if ipo_potential in ("Mittel", "Medium") else
-        0.0
-    )
-
-    # ipo_status boost: S-1 gefilter = konkreter Schritt
-    status_boost = 1.5 if "s-1" in ipo_status.lower() else 0.0
-    inputs["status_boost"] = status_boost
-
-    score = stage_base * 0.3 + tr_pts + signal_pts + potential_pts + status_boost
+    score = stage_base * 0.3 + signal_pts + tr_pts
     return _safe_round(score), inputs
 
 
