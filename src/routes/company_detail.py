@@ -41,7 +41,7 @@ from src.integrations.supabase import (
     fetch_headcount_snapshots,
 )
 from src.services.supply_chain import get_supply_chain, COMPANY_TAGS
-from src.services.score_calculator import compute_all_scores
+from src.services.score_calculator import compute_all_scores, _is_listed as _resolve_is_listed
 from src.services.tam import get_tam
 from src.services.market_data_enrichment import (
     enrich_market_data,
@@ -333,36 +333,12 @@ def _parse_headcount(value: str | None) -> int | None:
 
 
 # ── is_listed logic (B-05) ────────────────────────────────────────────────────
-
-def _resolve_is_listed(company: dict) -> bool:
-    """
-    Robust listing detection — v2.3 (COL-ISLISTED-01).
-
-    Vorrang: companies.is_listed (generated column) wenn im dict vorhanden.
-    Fallback: Ableitung aus den Quellspalten — für Code-Pfade die ein
-    company-dict ohne is_listed-Feld haben (z.B. Teilprojektionen im Select).
-
-    Listed wenn:
-      1. is_listed (DB generated column)  — bevorzugt, Single Source of Truth
-      2. ipo_status == 'listed'           (kanonisch, migration_003)
-      3. ipo_potential == 'IPO erfolgt'   (Legacy: Ticker-Resultat, flippt false→true)
-      4. ticker gesetzt                   (eigener Ticker = selbst börsennotiert)
-
-    NOTE: investment_path == 'IPO' deliberately NOT used here —
-    that value means pre-IPO candidate, not yet listed.
-    """
-    # DB-Spalte hat Vorrang — generated column, garantiert konsistent
-    _col = company.get("is_listed")
-    if _col is not None:
-        return bool(_col)
-    # Fallback: aus Quellspalten ableiten (dict ohne is_listed-Projektion)
-    if company.get("ipo_status") == "listed":
-        return True
-    if company.get("ipo_potential") == "IPO erfolgt":
-        return True
-    if company.get("ticker"):
-        return True
-    return False
+# LISTED-STATUS-REVIEW-01 (S75): _resolve_is_listed() war hier eine eigene
+# Kopie der Listed-Erkennung, parallel zu score_calculator.py::_is_listed()
+# (mit nachweisbarer Divergenz — siehe REQUESTS/MODUL06). Jetzt ein reiner
+# Import-Alias (siehe Import-Block oben) — score_calculator.py ist die einzige
+# verbleibende Implementierung, beide Module nutzen sie unter ihrem jeweils
+# gewohnten lokalen Namen. Keine Call-Site in dieser Datei musste sich ändern.
 
 
 # DISAMBIG-03: Rechtsform-Heuristik als unabhängige zweite Schicht.

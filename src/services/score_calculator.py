@@ -110,27 +110,35 @@ from src.taxonomy import (
 )
 
 # IPO-Attraktivität je Funding Stage (raw base)
+# STAGE-FORMAT-MISMATCH-01 (S75): Keys auf Underscore-Format umgestellt
+# (DB-Konvention companies.funding_stage), vorher Leerzeichen-Keys, die nie
+# gegen den echten DB-Wert matchten. series_d_plus hat bewusst keinen eigenen
+# Key — _stage_match() (longest-match-Substring) faellt auf "series_d" zurueck,
+# identischer Score wie series_d. Eigene Kalibrierung waere TR-STAGE-OVERLAP-01-
+# Folgearbeit, nicht Teil dieses Format-Fixes.
 _STAGE_IPO_SCORE: dict[str, float] = {
-    "s-1 filed":  9.0,
-    "pre-ipo":    8.0,
-    "series d":   6.5,
-    "series c":   5.5,
-    "series b":   4.0,
-    "series a":   3.0,
+    "s_1_filed":  9.0,
+    "pre_ipo":    8.0,
+    "series_d":   6.5,
+    "series_c":   5.5,
+    "series_b":   4.0,
+    "series_a":   3.0,
     "seed":       2.0,
     "bootstrap":  1.5,
-    "listed":     0.0,   # bereits public → IPO-Pfad abgeschlossen
+    "listed":     0.0,   # bereits gelistet → IPO-Pfad abgeschlossen
 }
 
 # M&A-Attraktivität je Stage (Series A–C = Sweet Spot für Acqui-Hire + Strategic)
+# STAGE-FORMAT-MISMATCH-01 (S75): Keys auf Underscore-Format, siehe Begründung
+# bei _STAGE_IPO_SCORE.
 _STAGE_MA_SCORE: dict[str, float] = {
     "seed":       6.0,
-    "series a":   7.5,
-    "series b":   8.5,
-    "series c":   7.5,
-    "series d":   6.0,
-    "pre-ipo":    4.5,   # zu nah am Börsengang → M&A unwahrscheinlicher
-    "s-1 filed":  2.5,
+    "series_a":   7.5,
+    "series_b":   8.5,
+    "series_c":   7.5,
+    "series_d":   6.0,
+    "pre_ipo":    4.5,   # zu nah am Börsengang → M&A unwahrscheinlicher
+    "s_1_filed":  2.5,
     "listed":     2.0,   # möglich aber teuer (Public-to-Private)
     "bootstrap":  7.0,   # Owner-managed = klassisches Akquisitions-Target
 }
@@ -214,25 +222,76 @@ def _stage_match(stage: str, mapping: dict[str, float]) -> float:
 
 def _is_listed(company: dict) -> bool:
     """
-    Robuste Listed-Erkennung — prüft ticker UND ipo_status.
-    Verhindert false-negatives wenn Ticker noch nicht in DB steht
-    (z.B. kurz nach IPO-Eintrag vor erstem Enrichment-Lauf).
+    Robuste Listed-Erkennung — v3 (LISTED-STATUS-REVIEW-01, S75).
+
+    Jetzt die EINZIGE Implementierung im Backend — company_detail.py's
+    `_resolve_is_listed()` importiert diese Funktion (Alias), statt eine
+    eigene Kopie zu pflegen. Identische Prüfreihenfolge:
+
+      1. companies.is_listed (generated column, COL-ISLISTED-01) — bevorzugt,
+         Single Source of Truth, garantiert konsistent.
+      2. ipo_status == "listed"            (kanonisch, migration_003)
+      3. ipo_potential == "IPO erfolgt"    (Legacy-Fallback. DB-Check S75:
+         0 Zeilen mit ipo_potential='IPO erfolgt' UND ipo_status≠'listed' —
+         Fallback aktuell nie scharf, bleibt aber für Teilprojektionen ohne
+         is_listed-Spalte bzw. künftige Altdaten-Importe stehen.)
+      4. ticker gesetzt                    (eigener Ticker = selbst börsennotiert)
+
+    Vorher prüfte diese Funktion drei zusätzliche ipo_status-Werte ("public",
+    "ipo_erfolgt", "ipo erfolgt"), die seit IPO-STATUS-ENUM-01 (S69) strukturell
+    nie mehr in companies.ipo_status stehen können (Typ-Kommentar in
+    company_detail.py: ipo_status ∈ {listed, pre_ipo_high, pre_ipo_medium,
+    pre_ipo_low, NULL}) — toter Code, jetzt entfernt. Sie las außerdem nie die
+    is_listed-Spalte und nie ipo_potential — echte Divergenz zu
+    company_detail.py's bisheriger Eigenimplementierung war dadurch möglich
+    (Company mit ipo_potential="IPO erfolgt", aber noch ohne Ticker und ohne
+    migriertem ipo_status — aktuell laut DB-Check 0 Fälle, aber strukturell
+    nicht ausgeschlossen).
     """
-    if bool(company.get("ticker")):
+    _col = company.get("is_listed")
+    if _col is not None:
+        return bool(_col)
+    if company.get("ipo_status") == "listed":
         return True
-    ipo_status = (company.get("ipo_status") or "").lower()
-    return ipo_status in ("listed", "public", "ipo_erfolgt", "ipo erfolgt")
+    if company.get("ipo_potential") == "IPO erfolgt":
+        return True
+    if company.get("ticker"):
+        return True
+    return False
 
 
 def _resolve_funding_stage(company: dict) -> str:
     """
     BUG-51: Normalisiert funding_stage für alle Score-Funktionen.
     Listed Companies haben keine Venture-Runden in DB → funding_stage wäre NULL.
-    Fix: ipo_status == 'listed' → 'public' direkt setzen, unabhängig von funding_rounds.
+    Fix: ipo_status == 'listed' → 'listed' direkt setzen, unabhängig von funding_rounds.
+
+    STAGE-FORMAT-MISMATCH-01 (S75): Zwei Fixes am Single Chokepoint, alle
+    Aufrufer profitieren automatisch:
+    1) Rückgabewert ist jetzt durchgängig Underscore-normalisiert (DB-Konvention,
+       z.B. "series_b") statt den Rohwert unverändert durchzureichen. Vorher
+       matchte das zufällig gegen Leerzeichen-Keys in den Konsumenten, nie
+       gegen den echten DB-Wert.
+    2) "public" → "listed" — sämtliche Lookup-Tabellen (inkl. der Underscore-
+       Tabellen in compute_dimension_risks) keyen auf "listed", nie auf
+       "public". Nebeneffekt: behebt denselben Mismatch auch für SC-10
+       (compute_dimension_risks fiel für gelistete Companies bisher auf den
+       5.0/5.0/0.50-Default zurück statt die "listed"-Einträge zu nutzen —
+       war in der S74-Diagnose als "NICHT SC-10 betroffen" eingestuft; das
+       gilt weiterhin für den Series-A–D-Bug, aber nicht für diesen zweiten,
+       public/listed-Teilbug).
+    Randfall beim Test gegen das DB-Sample gefunden: 3 Companies haben
+    funding_stage="public" als Rohwert (nicht aus _is_listed() abgeleitet).
+    Falls bei diesen ticker/ipo_status NICHT gesetzt sind, würde _is_listed()
+    False liefern und der Rohwert "public" unverändert durchfallen — selbe
+    Lücke wie oben, nur über den anderen Pfad. Defensiv mitgefangen, ohne
+    Kenntnis ob der Fall in der Live-DB tatsächlich auftritt (nicht verifiziert,
+    nur abgesichert).
     """
     if _is_listed(company):
-        return "public"
-    return company.get("funding_stage") or ""
+        return "listed"
+    stage = (company.get("funding_stage") or "").lower().replace(" ", "_").replace("-", "_")
+    return "listed" if stage == "public" else stage
 
 
 def _compute_target_tech_readiness(
@@ -430,10 +489,10 @@ def compute_financial_score(
     stage = _resolve_funding_stage(company)
     inputs["funding_stage"] = stage
     stage_pts = (
-        2.0 if any(s in stage.lower() for s in ["series d", "series e", "pre-ipo", "growth"]) else
-        1.5 if "series c" in stage.lower() else
-        1.0 if "series b" in stage.lower() else
-        0.5 if "series a" in stage.lower() else
+        2.0 if any(s in stage.lower() for s in ["series_d", "series_e", "pre_ipo", "growth"]) else
+        1.5 if "series_c" in stage.lower() else
+        1.0 if "series_b" in stage.lower() else
+        0.5 if "series_a" in stage.lower() else
         0.5 if "seed" in stage.lower() else
         1.5 if "bootstrap" in stage.lower() else   # Bootstrapped → profitabel
         1.5 if any(s in stage.lower() for s in ["listed", "public"]) else       # listed/public = hat Kapitalmarkttest bestanden
@@ -631,10 +690,10 @@ def compute_risk_score(
     stage_lower = stage.lower()
     stage_risk = (
         2.0 if "seed" in stage_lower else
-        1.5 if "series a" in stage_lower else
-        1.0 if "series b" in stage_lower else
-        0.5 if "series c" in stage_lower else
-        0.3 if any(s in stage_lower for s in ["series d", "pre-ipo"]) else
+        1.5 if "series_a" in stage_lower else
+        1.0 if "series_b" in stage_lower else
+        0.5 if "series_c" in stage_lower else
+        0.3 if any(s in stage_lower for s in ["series_d", "pre_ipo"]) else
         0.1 if any(s in stage_lower for s in ["listed", "public"]) else
         1.0   # unbekannt
     )

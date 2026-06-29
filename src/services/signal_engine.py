@@ -41,6 +41,12 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+# LISTED-STATUS-REVIEW-01 (S75): kanonische Listed-Erkennung statt eigener
+# ticker-only-Shortcuts (vorher zwei Stellen, siehe check_absence_signals +
+# run_signal_engine). Kein zirkulärer Import — score_calculator.py importiert
+# nichts aus signal_engine.py.
+from src.services.score_calculator import _is_listed
+
 logger = logging.getLogger(__name__)
 
 # ── Typen ─────────────────────────────────────────────────────────────────────
@@ -1597,7 +1603,7 @@ def check_absence_signals(
     events: list[SignalEvent] = []
     today = date.today()
     industry = (company.get("industry") or "").lower()
-    is_listed = bool(company.get("ticker"))
+    is_listed = _is_listed(company)
     region    = company.get("region", "")
 
     # BUG-01: Cooldown-Set — überspringe Kategorien die in letzten 30d bereits emittiert
@@ -1709,8 +1715,14 @@ async def run_signal_engine(
     Aufgerufen von main.py _cron_signal_engine().
 
     Args:
-        companies:            Liste von Company-Dicts (id, name, ticker, exchange,
-                              last_signal_date, industry, region, headcount, revenue_usd_mn)
+        companies:            Liste von Company-Dicts — main.py's _cron_signal_engine()
+                              nutzt fetch_companies(limit=500), denselben vollen Fetch wie
+                              der Scoring-Cron. KEINE enge Projektion — ipo_status/
+                              ipo_potential/is_listed sind verfügbar (LISTED-STATUS-REVIEW-01,
+                              S75: diese Liste war vorher unvollständig dokumentiert als nur
+                              id/name/ticker/exchange/last_signal_date/industry/region/
+                              headcount/revenue_usd_mn — das sah wie eine bewusste enge
+                              Projektion aus, war aber nur eine illustrative Teilliste).
         ownership_map:        {company_id: [ownership_entries]} — aktueller DB-Stand
         absence_cooldown_map: {company_id: {'ownership', 'headcount', ...}} —
                               BUG-01: Absence-Kategorien die in letzten 30d bereits emittiert
@@ -1745,7 +1757,7 @@ async def run_signal_engine(
             cid    = company.get("id", "")
             cname  = company.get("name", "")
             ticker = company.get("ticker")
-            is_listed = bool(ticker)
+            is_listed = _is_listed(company)
 
             last_signal_raw = company.get("last_signal_date")
             last_signal_date: date | None = None
