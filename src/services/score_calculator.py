@@ -845,23 +845,28 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     IPO Score (0–10): Attraktivität des IPO-Pfads.
 
     0.0 für bereits gelistete Companies (IPO abgeschlossen).
-    Hoch für: belastbare/viele IPO-Signale, fortgeschrittene Funding-Stage,
-    bei aktivem User-Override zusätzlich echte TechReadiness-Einschätzung.
+    Hoch für: belastbare/viele IPO-Signale, fortgeschrittene Funding-Stage.
 
-    TR-STAGE-OVERLAP-01 (S75): TechReadiness im Auto-Modus komplett raus.
-    compute_auto_tech_readiness() ist für private Companies selbst stage-/
-    funding-abgeleitet — stage_base und TR×3.0 hingen am selben Grundsignal
-    unter zwei Namen, bis zu 3.0 von ~10 Pkt waren Stage-Information doppelt
-    gezählt. Präzedenzfall: SC-09 hatte dasselbe Problem, S34 auf TR×1.5
-    reduziert statt entfernt — hier komplett raus, weil IPO Score (anders als
-    SC-09) bereits stage_base als eigene, vollwertige Stage-Dimension hat.
-    Ausnahme: ein ECHTER User-Override (TR-MODAL-01, tr_confidence=="user",
-    der geführte 7-Faktoren-Fragebogen) ist kein Stage-Proxy mehr, sondern
-    unabhängiges Signal — bleibt drin, mit reduziertem Gewicht (1.5 statt
-    3.0). "neutral"-Override (tr_confidence=="neutral_user") zählt bewusst
-    NICHT — der Modus existiert explizit für varianzfreie Vergleiche (fix
-    0.5, kein echtes Signal) und würde dem eigenen Zweck widersprechen, wenn
-    er trotzdem in die Score-Summe einginge.
+    TR-STAGE-OVERLAP-01 (S75, nachgeschärft): TechReadiness vollständig raus
+    — auch der User-Override-Zweig aus dem ersten Fix-Versuch. Ursprünglich
+    nur als Stage-Redundanz-Problem diagnostiziert (Auto-TR ist für private
+    Companies selbst stage-/funding-abgeleitet, doppelte Zählung mit
+    stage_base). Zweiter, wichtigerer Befund beim Nachschärfen: TR beantwortet
+    hier die FALSCHE Frage, unabhängig davon ob der Wert Stage-Proxy oder
+    echter User-Override ist. TRs eigentliches, gewichtsmäßig dominantes
+    Zuhause ist SC-02 Strategic Score (TR×3.5, Formel `srr_pts + mfr_pts +
+    tr_pts + buyer_bonus` — das produktseitige "SRR×MFR×TechReadiness" liegt
+    konzeptionell hier, nicht im IPO Score). TR ist auch dort als "target-
+    intrinsisch" dokumentiert, aber im selben Atemzug mit SRR/MFR verrechnet
+    (beide klar buyer-relativ, "bestplatzierter Buyer-Match") — TR beantwortet
+    strukturell "wie attraktiv ist dieses Tech als Akquisitionsziel", nicht
+    "ist diese Company börsenreif". Ein Börsengang ist gerade der Pfad, der
+    KEINEN Buyer voraussetzt — TechReadiness in diesem buyer-fit-geprägten
+    Sinne hat hier keine inhaltliche Entsprechung, auch nicht über einen
+    "echten" manuellen Wert. Bleibt für SC-02 (sowie SC-09/ETF/Enabler mit
+    geringerem Gewicht, ungeprüft) bestehen — siehe TR-CONSISTENCY-AUDIT-01,
+    das jetzt auch die inhaltliche Passungsfrage für diese drei mit klären
+    sollte, nicht nur die technische Gewichts-Spreizung.
 
     ipo_potential-Bucket (0–2.0 Pkt) UND S-1-Status-Boost (0–1.5 Pkt) raus —
     beide strukturell tot in der aktuellen Pipeline: ipo_status kann "s-1"
@@ -871,18 +876,15 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     main.py — nicht gegen enrichment.py/peers.py, daher "nirgends gesehen",
     nicht "nirgends im System").
 
-    Signal-Gewichtung NEU (vorher pauschal 1.0/Signal, Cap 3.0 — keine
+    Signal-Gewichtung (vorher pauschal 1.0/Signal, Cap 3.0 — keine
     Differenzierung nach Quelle/Belastbarkeit):
       EDGAR-Quelle (S-1/S-11, harte Filing-Evidenz)     1.5 Pkt / Signal
       Andere Quellen (News/TechCrunch, Keyword-Match)   0.75 Pkt / Signal
-      Cap 5.0 (vorher 3.0) — füllt einen Teil des durch TR-Entfernung
-      freigewordenen Spielraums, ohne den Stage-Doppel-Zähl-Fehler zu
-      reproduzieren. Kalibrierung (1.5/0.75/Cap 5.0) ist ein Vorschlag,
-      keine harte Ableitung — bei Bedarf anpassen.
+      Cap 5.0 (vorher 3.0) — Kalibrierung, kein Hard-Fact, anpassbar.
 
-    Neue nominale Maximalwerte: 7.7 (Auto-Modus, kein Override) bzw. 9.2
-    (mit aktivem User-Override) — vorher 10.0, aber faktisch nie erreichbar
-    (zwei der vier Komponenten tot). Realistischer als der alte Nominalwert.
+    Neuer nominaler Maximalwert: 7.7 (vorher 10.0, faktisch nie erreichbar —
+    drei der ursprünglich vier Komponenten waren tot oder kategorial fehl am
+    Platz).
     """
     inputs: dict = {}
 
@@ -891,17 +893,9 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
         return 0.0, inputs
 
     stage = _resolve_funding_stage(company)
-    tr, tr_confidence = _compute_target_tech_readiness(company, _is_listed(company), company.get("_tr_override"))
-
-    inputs.update({"funding_stage": stage, "tech_readiness": tr, "tech_readiness_confidence": tr_confidence})
+    inputs["funding_stage"] = stage
 
     stage_base = _stage_match(stage, _STAGE_IPO_SCORE)
-
-    # TR-STAGE-OVERLAP-01: nur ein echter (manueller) User-Override zählt —
-    # weder Auto-Stage-Proxy noch "neutral" (s. Docstring).
-    tr_counted = tr_confidence == "user"
-    tr_pts     = (tr * 1.5) if tr_counted else 0.0
-    inputs["tr_counted"] = tr_counted
 
     ipo_sigs = [
         s for s in (signals or [])
@@ -914,7 +908,7 @@ def compute_ipo_score(company: dict, signals: list[dict]) -> tuple[float, dict]:
     inputs["ipo_signals"]       = len(ipo_sigs)
     inputs["ipo_signals_edgar"] = len(edgar_sigs)
 
-    score = stage_base * 0.3 + signal_pts + tr_pts
+    score = stage_base * 0.3 + signal_pts
     return _safe_round(score), inputs
 
 
