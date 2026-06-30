@@ -33,6 +33,7 @@ from src.integrations.supabase import (
     fetch_company_by_name,
     fetch_companies,
 )
+from src.services.score_calculator import _is_listed as _resolve_is_listed
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["peers"])
@@ -63,6 +64,8 @@ class PeerCompany(BaseModel):
     website: str | None = None
     ticker: str | None = None
     exchange: str | None = None
+    # PEER-ISLISTED-FIELD-01: kanonische Quelle statt Frontend-Ableitung aus ipo_status
+    is_listed: bool | None = None
     # Benchmark-Felder (berechnet)
     stage_normalized: str | None = None
     # Argo Scores (aus company_scores)
@@ -750,7 +753,7 @@ def _fetch_peers_by_ids(db, ids: list[str]) -> list[dict]:
             "id, name, category, industry, region, headquarters, founding_year, "
             "headcount, funding_total_usd_mn, funding_stage, funding_last_round, "
             "ipo_status, ipo_potential, investment_path, revenue_usd_mn, "
-            "description, website, ticker, exchange, summary"
+            "description, website, ticker, exchange, summary, is_listed"
         ).in_("id", ids).execute()
         rows = result.data or []
     except Exception as e:
@@ -827,6 +830,10 @@ def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> Pe
         website=row.get("website"),
         ticker=row.get("ticker"),
         exchange=row.get("exchange"),
+        # PEER-ISLISTED-FIELD-01: kanonische _is_listed()-Logik statt roher Spalte
+        # (respektiert den Bayer/Monsanto-Schutzfall: explizites is_listed=False
+        # schlägt einen evtl. noch gesetzten historischen Ticker)
+        is_listed=_resolve_is_listed(row),
         stage_normalized=_STAGE_LABEL.get(raw_stage, raw_stage) or None,
         composite_score=row.get("composite_score"),
         rating=row.get("rating"),
