@@ -99,6 +99,11 @@ from src.services.signal_engine import (
     _normalize_name,
     _extract_eur_funding_amount,
 )
+# DEALCOMPS-TRANSACTIONS-01: dieselbe Sektor-/Stage-Taxonomie wie
+# compute_target_valuation() — Comp-Transaktionen muessen gegen denselben
+# Bucket-Schluessel klassifiziert werden, den die spaetere EXIT_ADJUSTMENT-
+# Kalibrierung verwendet, sonst passt keine Zeile zur anderen.
+from src.services.valuation import VERTICAL_DELTA, STAGE_MULT
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +141,20 @@ _GNEWS_BASE = "https://news.google.com/rss/search"
 
 _CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 _CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+# DEALCOMPS-TRANSACTIONS-01 (S78): bewusst SCHMALERER Item-Filter als
+# signal_engine.py's _8K_MA_ITEMS ({1.01,2.01,2.02,5.02,8.01} — dort fuer
+# allgemeine M&A-SIGNALE gedacht). Hier zaehlt nur, was tatsaechlich einen
+# Kaufpreis/eine Transaktion belegt: 1.01 = Entry into Material Definitive
+# Agreement (Vertragsabschluss), 2.01 = Completion of Acquisition (Closing).
+# 2.02/5.02/8.01 sind Earnings/Exec-Wechsel/Sonstiges — fuer Comps nur Rauschen.
+_8K_COMPTX_ITEMS = {"1.01", "2.01"}
+_8K_ITEM_RE = re.compile(r"Item\s+(\d\.\d{2})\b", re.IGNORECASE)
+
+COMPTX_DAILY_CAP = 20   # hoeher als DAILY_CAP_PER_POT=2 -- hier keine Company-
+                        # Qualitaetsverwaesserung wie bei IPO-Intent/Funding,
+                        # mehr Vergleichstransaktionen sind fuer die spaetere
+                        # EXIT_ADJUSTMENT-Kalibrierung schlicht mehr Stichprobe.
 
 
 # ── Hilfsfunktionen: EDGAR Full-Index ────────────────────────────────────────
@@ -551,6 +570,167 @@ async def _extract_company_from_news(client: httpx.AsyncClient, title: str, desc
         return None
 
 
+# ── DEALCOMPS-TRANSACTIONS-01: 8-K Volltext + Deal-Extraktion ───────────────
+
+async def _fetch_filing_text(client: httpx.AsyncClient, file_name: str) -> str | None:
+    """
+    Holt die komplette Submission als Rohtext. SEC bestaetigt offiziell
+    (sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data):
+    form.idx 'File Name' zeigt direkt auf die ".txt"-Datei mit der "raw text
+    version of the complete disseminated filing content" — keine zweite
+    Index-Auflösung noetig, gleicher Pfad wird schon fuer S-1/Form-D-Zeilen
+    aus form.idx gelesen. Enthaelt SGML/HTML-Markup, ungestrippt — Stripping
+    passiert separat in _strip_filing_markup(), getrennt von der Item-Erkennung
+    (die braucht den Rohtext, "Item 1.01" steht oft in einer Tag-Struktur).
+    """
+    url = f"https://www.sec.gov/Archives/{file_name}"
+    try:
+        resp = await client.get(url, headers=_SEC_HEADERS, timeout=15.0)
+        await asyncio.sleep(_SEC_MIN_DELAY_S)
+        if resp.status_code != 200:
+            logger.debug("Filing-Text HTTP %s — %s", resp.status_code, url)
+            return None
+        return resp.text
+    except Exception as e:
+        logger.debug("Filing-Text Fetch fehlgeschlagen für %s: %s — %r", url, type(e).__name__, e)
+        return None
+
+
+def _8k_item_numbers(filing_text: str) -> set[str]:
+    """
+    Item-Nummern per Regex aus dem 8-K-Rohtext — bewusst KEIN efts.sec.gov-
+    Call fuer das 'items'-Feld, obwohl laut SEC-Webmaster-FAQ offiziell
+    real (anders als total_offering_amount, s. FORMD-DIRECT-XML-01). Grund:
+    Filing-Text wird fuer die Deal-Extraktion sowieso gebraucht — ein
+    zweiter API-Call nur fuers Item-Vorfiltern waere eine zusaetzliche
+    Abhaengigkeit ohne Nutzen. Items stehen immer im Kopfbereich vor den
+    Exhibits, 20k Zeichen Suchfenster reicht mit Marge.
+    """
+    return set(_8K_ITEM_RE.findall(filing_text[:20000]))
+
+
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+_ENTITY_STRIP_RE = re.compile(r"&[a-zA-Z]+;")
+
+
+def _strip_filing_markup(filing_text: str, max_chars: int = 4000) -> str:
+    """
+    Grobe SGML/HTML-Bereinigung fuer den Haiku-Kontext — kein vollstaendiger
+    Parser noetig (gleiche "minimum viable"-Linie wie an anderen Stellen
+    des Moduls). Deal-Beschreibung + Item-Ueberschriften stehen vor den
+    Exhibits, daher reicht ein Fenster aus dem oberen Teil des Dokuments.
+    """
+    body = filing_text[:20000]
+    body = _TAG_STRIP_RE.sub(" ", body)
+    body = _ENTITY_STRIP_RE.sub(" ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return body[:max_chars]
+
+
+async def _extract_deal_details(
+    client: httpx.AsyncClient,
+    filing_text_clean: str,
+    items: set[str],
+    filing_date: str,
+) -> dict | None:
+    """
+    Extrahiert Käufer/Ziel/Preis/Sektor/Funding-Snapshot aus einem bereits
+    auf Items 1.01/2.01 vorgefilterten 8-K-Filing-Text. Industrie- und
+    Stage-Werte werden gegen dieselbe Taxonomie wie valuation.py validiert
+    (VERTICAL_DELTA/STAGE_MULT) — kein drittes Vokabular, sonst passt die
+    spaetere EXIT_ADJUSTMENT-Kalibrierung nicht zu den Buckets aus
+    compute_target_valuation().
+    """
+    headers = _claude_headers()
+    if not headers:
+        return None
+    vertical_keys = ", ".join(VERTICAL_DELTA.keys())
+    stage_keys = ", ".join(STAGE_MULT.keys())
+    prompt = (
+        f"SEC-8-K-Filing-Auszug (Items: {', '.join(sorted(items))}, Datum {filing_date}):\n"
+        f"{filing_text_clean}\n\n"
+        f"Das ist ein Filing zu einer Unternehmensübernahme. Extrahiere NUR was "
+        f"explizit im Text steht — nichts erraten oder schätzen. Antworte NUR mit "
+        f"einem JSON-Objekt mit genau diesen Feldern:\n"
+        f'{{"acquirer_name": "<Name oder null>", "target_name": "<Name oder null>", '
+        f'"deal_price_usd_mn": <Zahl oder null>, "deal_date": "<YYYY-MM-DD oder null>", '
+        f'"industry": "<genau einer von [{vertical_keys}] oder null>", '
+        f'"target_funding_total_usd_mn_at_sale": <Zahl oder null — NUR falls der Text '
+        f'die bisherige Funding-Historie des Targets explizit nennt>, '
+        f'"target_funding_stage_at_sale": "<genau einer von [{stage_keys}] oder null>"}}\n'
+        f'Falls kein klar benanntes Target oder kein erkennbarer Kaufpreis im Text steht: '
+        f'{{"acquirer_name": null}}.'
+    )
+    try:
+        resp = await client.post(
+            _CLAUDE_API_URL, headers=headers,
+            json={"model": _CLAUDE_MODEL, "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]},
+            timeout=20.0,
+        )
+        if resp.status_code != 200:
+            logger.debug("Deal-Extraktion Claude HTTP %s", resp.status_code)
+            return None
+        import json as _json
+        raw = resp.json()["content"][0]["text"].strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+        parsed = _json.loads(raw)
+        if not parsed.get("acquirer_name") or not parsed.get("target_name"):
+            return None
+        # Taxonomie-Validierung: Haiku haelt sich i.d.R. an die Vorgabe, aber
+        # nicht garantiert — ein ungueltiger Wert wird zu None statt einem
+        # stillen Fehlwert in einer Spalte, die spaeter als harter Bucket-Key
+        # dient (EXIT_ADJUSTMENT[industry][stage]).
+        if parsed.get("industry") not in VERTICAL_DELTA:
+            parsed["industry"] = None
+        if parsed.get("target_funding_stage_at_sale") not in STAGE_MULT:
+            parsed["target_funding_stage_at_sale"] = None
+        return parsed
+    except Exception as e:
+        logger.debug("Deal-Extraktion fehlgeschlagen: %s — %r", type(e).__name__, e)
+        return None
+
+
+async def _lookup_company_by_name(name: str) -> dict | None:
+    """
+    Duenne Wrapper-Funktion, bewusst getrennt vom direkten Import im
+    Orchestrator: macht die Abhaengigkeit von einer NOCH NICHT EXISTIERENDEN
+    supabase.py-Funktion (fetch_company_by_name) an einer Stelle sichtbar
+    und faengt das fehlende Funktion sauber statt mit ImportError im Cron ab.
+    supabase.py lag mir beim Schreiben nicht vor — TODO vor Deploy: dort
+    ergaenzen (Name-Match gegen companies.name, gleiche Normalisierung wie
+    _normalize_name() hier im Modul, sonst False-Negatives durch Rechtsform-
+    Suffixe wie 'Inc.'/'GmbH').
+    """
+    try:
+        from src.integrations.supabase import fetch_company_by_name
+        return fetch_company_by_name(name)
+    except ImportError:
+        logger.warning(
+            "fetch_company_by_name fehlt noch in supabase.py — Snapshot-Capture "
+            "für '%s' übersprungen, target_company_id bleibt leer", name,
+        )
+        return None
+
+
+async def _insert_comparable_transaction(row: dict) -> None:
+    """
+    Gleiche Lage wie _lookup_company_by_name — insert_comparable_transaction
+    muss noch in supabase.py ergänzt werden. Upsert-Key: (source, source_url),
+    s. schema_patch_comparable_transactions.sql.
+    """
+    try:
+        from src.integrations.supabase import insert_comparable_transaction
+        insert_comparable_transaction(row)
+    except ImportError:
+        logger.warning(
+            "insert_comparable_transaction fehlt noch in supabase.py — "
+            "Transaktion '%s' nicht geschrieben (lieber laut scheitern als "
+            "stiller Datenverlust)", row.get("target_name"),
+        )
+
+
+
+
 # ── Identitäts-Gate (1:1 Reuse aus PEER-IDENT-01) ────────────────────────────
 
 def _autopick(result) -> "object | None":
@@ -682,6 +862,10 @@ async def run_discovery_pipeline() -> dict:
         # am EUR-Floor oder an der Claude-Haiku-Namensextraktion scheitert —
         # vorher beides im selben "funding_seen=0" nicht unterscheidbar.
         "eu_news_seen": 0, "eu_news_rejected_floor": 0, "eu_news_rejected_extraction": 0,
+        # DEALCOMPS-TRANSACTIONS-01: dritter Topf, kein DAILY_CAP_PER_POT-Limit
+        # (eigene Decke COMPTX_DAILY_CAP, andere Logik s. dort).
+        "comp_tx_seen": 0, "comp_tx_written": 0,
+        "comp_tx_rejected_no_item": 0, "comp_tx_rejected_extraction": 0,
     }
     new_signals: list[SignalEvent] = []
 
@@ -827,6 +1011,85 @@ async def run_discovery_pipeline() -> dict:
                         funding_amount_usd_mn=cand.get("funding_amount_usd_mn"),
                     ))
             stats["funding_written"] += 1
+
+        # ── Vergleichbare-Transaktionen-Topf: EDGAR 8-K Items 1.01/2.01 ──────
+        # DEALCOMPS-TRANSACTIONS-01: kein known_normalized-Dedupe wie bei den
+        # anderen Töpfen — eine Comp-Transaktion referenziert kein neues
+        # Company-Discovery-Objekt, sondern eine Sektor-Referenz (Andreas, S78:
+        # "eher Referenz innerhalb eines Sektors als fest an einer Company").
+        # DEALCOMPS-BACKFILL-01 (Company-Nachholung für unbekannte Targets)
+        # ist hier bewusst NICHT mitgebaut — eigenes, separat zu spezifizierendes
+        # Ticket, kein Vermischen von Schema-Aufbau und Backfill-Logik.
+        edgar_8k = await _fetch_edgar_daily_index(client, forms={"8-K"})
+        stats["comp_tx_seen"] = len(edgar_8k)
+
+        for row in edgar_8k:
+            if stats["comp_tx_written"] >= COMPTX_DAILY_CAP:
+                break
+
+            filing_text = await _fetch_filing_text(client, row["file_name"])
+            if not filing_text:
+                continue
+
+            items = _8k_item_numbers(filing_text)
+            if not (items & _8K_COMPTX_ITEMS):
+                stats["comp_tx_rejected_no_item"] += 1
+                continue
+
+            clean_text = _strip_filing_markup(filing_text)
+            deal = await _extract_deal_details(client, clean_text, items, row["date_filed"])
+            if not deal:
+                stats["comp_tx_rejected_extraction"] += 1
+                continue
+
+            deal_price = deal.get("deal_price_usd_mn")
+            if deal_price is None:
+                # Ohne Preis kein Comp — der einzige zwingende Wert (Andreas,
+                # S78: "Kaufpreise reichen, um Transaktionen abzubilden").
+                stats["comp_tx_rejected_extraction"] += 1
+                continue
+
+            deal_date = deal.get("deal_date") or row["date_filed"]
+
+            # Snapshot-Versuch: existiert das Target schon bei uns? Dann den
+            # AKTUELLEN DB-Stand einfrieren (8-K liegt nah am Deal-Close —
+            # s. Snapshot-Diskussion S78). Sonst bleibt, was Haiku ggf. direkt
+            # aus dem Filing-Text gezogen hat (oder None — zwei Praezisions-
+            # stufen in derselben Tabelle, kein Alles-oder-nichts).
+            target_funding_total = deal.get("target_funding_total_usd_mn_at_sale")
+            target_funding_stage = deal.get("target_funding_stage_at_sale")
+            target_company_id    = None
+
+            existing_target = await _lookup_company_by_name(deal["target_name"])
+            if existing_target:
+                target_company_id    = existing_target.get("id")
+                target_funding_total = existing_target.get("funding_total_usd_mn") or target_funding_total
+                target_funding_stage = existing_target.get("funding_stage") or target_funding_stage
+
+            if DRY_RUN:
+                logger.info(
+                    "[DRY-RUN] Vergleichbare Transaktion erkannt: '%s' → '%s', "
+                    "$%.1fM, %s, Sektor=%s, Snapshot=%s — würde geschrieben "
+                    "(target_company_id=%s)",
+                    deal.get("acquirer_name"), deal["target_name"], deal_price,
+                    deal_date, deal.get("industry") or "—",
+                    "ja" if (target_funding_total and target_funding_stage) else "nein",
+                    target_company_id or "kein Match",
+                )
+            else:
+                await _insert_comparable_transaction({
+                    "target_name": deal["target_name"],
+                    "target_company_id": target_company_id,
+                    "acquirer_name": deal.get("acquirer_name"),
+                    "industry": deal.get("industry"),
+                    "deal_price_usd_mn": deal_price,
+                    "deal_date": deal_date,
+                    "source": "edgar_8k",
+                    "source_url": f"https://www.sec.gov/Archives/{row['file_name']}",
+                    "target_funding_total_usd_mn_at_sale": target_funding_total,
+                    "target_funding_stage_at_sale": target_funding_stage,
+                })
+            stats["comp_tx_written"] += 1
 
     if new_signals and not DRY_RUN:
         written = upsert_signals([e.to_dict() for e in new_signals])
