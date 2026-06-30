@@ -192,10 +192,10 @@ def compute_auto_tech_readiness(
 #     Trennung im Auto-Modus kommt mit dem Kalibrierungs-Ticket); relationaler
 #     Anteil = compute_auto_tech_readiness_relational() pro Buyer.
 #
-# Relationaler Anteil ist in diesem Block ein NEUTRALER PLATZHALTER (0.5) — die
-# echte Ableitung aus Mcap-Ratio / source_type ist bewusst NICHT hier kalibriert
-# (Diagnose vor Aktionismus: Struktur und Kalibrierung nicht in einem Zug
-# vermischen). Folgeticket: TR-RELATIONAL-CALIBRATION-01.
+# Relationaler Anteil: S76 neutraler Platzhalter (0.5) → S77 Mcap-Ratio-Basis
+# (Option 1) + Sektor-Overlap-Bonus (Option 3), beide in
+# compute_auto_tech_readiness_relational(). source_type (Option 2) verworfen —
+# zugrunde liegende Query führt diese Spalte nicht.
 
 _TR_INTRINSIC_WEIGHT = 0.35
 _TR_RELATIONAL_WEIGHT = 0.65
@@ -204,24 +204,62 @@ _TR_RELATIONAL_WEIGHT = 0.65
 def compute_auto_tech_readiness_relational(
     buyer_market_cap_usd_bn: float | None = None,
     target_funding_usd_mn: float | None = None,
-    source_type: str | None = None,
+    buyer_category: str | None = None,
+    buyer_industry: str | None = None,
+    target_category: str | None = None,
+    target_industry: str | None = None,
 ) -> tuple[float, str]:
     """
     Relationaler TR-Anteil (Buyer↔Target-Fit), variiert pro Buyer.
 
-    TR-SPLIT-01 (S76): VORERST NEUTRALER PLATZHALTER (0.5). Die Parameter sind
-    bereits in der Signatur, damit die Aufrufstelle (company_detail.py) sie
-    durchreichen kann, ohne bei der Kalibrierung erneut angefasst zu werden —
-    aber sie werden hier noch NICHT ausgewertet. Echte Ableitung (z.B. große
-    Buyer-Mcap relativ zum Target → höhere integration_capacity; source_type
-    supply_chain/peer/sector → unterschiedliche strategic_coherence) ist das
-    Folgeticket TR-RELATIONAL-CALIBRATION-01.
+    TR-RELATIONAL-CALIBRATION-01 (S77):
+      Basis (Option 1) — Mcap-Ratio-Proxy. Größerer Buyer relativ zum Target →
+      mehr unterstellte Integrationskapazität/GTM-Reichweite. Bewusst konservativ
+      gebuckett (0.35–0.75, NIE 0/1-Extreme) — ein Single-Input-Größenproxy misst
+      Kapazität, nicht echten Tech-Fit, soll deshalb nicht overconfident wirken
+      (gleiche Vorsicht wie beim entfernten Stage-Proxy, TR-CONSISTENCY-AUDIT-01).
+
+      Bonus (Option 3) — Sektor-Overlap. Buyer und Target sind beide companies-
+      Rows (BUYER-AS-COMPANY-01) mit derselben category/industry-Taxonomie, daher
+      direkt vergleichbar ohne neue Keyword-Heuristik. Bei Match (category ODER
+      industry, case-insensitive) +0.10 auf die Bucket-Basis, Decke bei 0.80 statt
+      0.75 — ein bestätigter inhaltlicher Treffer verdient mehr Konfidenz als die
+      Größen-Heuristik allein, aber weiterhin kein Vollausschlag.
+
+      `source_type` bewusst entfernt (S77-Befund): die zugrunde liegende
+      potential_buyers-Query selektiert keine source_type-Spalte — der Parameter
+      lieferte strukturell immer None, kein Datenproblem zum "Verifizieren",
+      sondern eine nicht existierende Quelle.
+
+    Fehlende Mcap/Funding-Inputs → neutral 0.5 (bestehende Konvention),
+    UNABHÄNGIG vom Sektor-Match — ohne Größenbasis kein Bonus, sonst würde ein
+    reiner Sektor-Treffer ohne jede Größeneinordnung overconfident wirken.
 
     Returns (value: float, confidence: str).
     """
-    # TODO(TR-RELATIONAL-CALIBRATION-01): Ableitung aus buyer_market_cap_usd_bn /
-    # target_funding_usd_mn / source_type. Bis dahin neutral.
-    return 0.5, "neutral_relational"
+    if not buyer_market_cap_usd_bn or not target_funding_usd_mn:
+        return 0.5, "neutral_relational"
+
+    target_funding_usd_bn = target_funding_usd_mn / 1000
+    ratio = buyer_market_cap_usd_bn / target_funding_usd_bn
+
+    if ratio < 10:
+        base, label = 0.35, "auto_relational_mcap_low"
+    elif ratio < 100:
+        base, label = 0.50, "auto_relational_mcap_mid"
+    elif ratio < 1000:
+        base, label = 0.65, "auto_relational_mcap_high"
+    else:
+        base, label = 0.75, "auto_relational_mcap_mega"
+
+    sector_match = (
+        (buyer_category and target_category and buyer_category.strip().lower() == target_category.strip().lower())
+        or (buyer_industry and target_industry and buyer_industry.strip().lower() == target_industry.strip().lower())
+    )
+    if sector_match:
+        return min(base + 0.10, 0.80), f"{label}_sector_match"
+
+    return base, label
 
 
 def combine_tech_readiness(intrinsic: float, relational: float) -> float:

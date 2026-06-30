@@ -3423,7 +3423,10 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     _rel, _ = compute_auto_tech_readiness_relational(
                         buyer_market_cap_usd_bn=float(mcap),
                         target_funding_usd_mn=company.get("funding_total_usd_mn"),
-                        source_type=buyer.get("source_type"),
+                        buyer_category=buyer.get("category"),
+                        buyer_industry=buyer.get("industry"),
+                        target_category=company.get("category"),
+                        target_industry=company.get("industry"),
                     )
                     buyer_tr = combine_tech_readiness(_tr_intrinsic, _rel)
 

@@ -907,9 +907,12 @@ def fetch_potential_buyers(company_id: str) -> list[dict]:
     """
     BUYER-AS-COMPANY-01: Gibt die Buyer-KANTEN eines Targets zurück, gejoint mit
     der jeweiligen Buyer-companies-Row. Liefert die Legacy-Dict-Form
-    (name/ticker/exchange/market_cap_usd_bn/cash_usd_bn/debt_ebitda/
-    strategic_rationale/confidence/generated_at), damit der Scoring-Pfad in
-    company_detail.py unverändert weiterläuft.
+    (name/ticker/exchange/market_cap_usd_bn/cash_usd_bn/debt_ebitda/category/
+    industry/strategic_rationale/confidence/generated_at), damit der Scoring-Pfad
+    in company_detail.py unverändert weiterläuft.
+
+    category/industry seit S77 (TR-RELATIONAL-CALIBRATION-01, Option 3) — Sektor-
+    Overlap Buyer↔Target für den relationalen TechReadiness-Anteil.
 
     Financials kommen aus companies (SSOT), name/ticker/exchange ebenfalls;
     strategic_rationale + confidence + generated_at sind Kanten-Eigenschaften.
@@ -929,7 +932,7 @@ def fetch_potential_buyers(company_id: str) -> list[dict]:
             return []
 
         comp_rows = (db.table("companies").select(
-            "id, name, ticker, exchange, market_cap_usd_bn, cash_usd_bn, debt_ebitda"
+            "id, name, ticker, exchange, market_cap_usd_bn, cash_usd_bn, debt_ebitda, category, industry"
         ).in_("id", buyer_ids).execute().data) or []
         comp_by_id = {c["id"]: c for c in comp_rows}
 
@@ -946,6 +949,8 @@ def fetch_potential_buyers(company_id: str) -> list[dict]:
                 "market_cap_usd_bn":   c.get("market_cap_usd_bn"),
                 "cash_usd_bn":         c.get("cash_usd_bn"),
                 "debt_ebitda":         c.get("debt_ebitda"),
+                "category":            c.get("category"),    # TR-RELATIONAL-CALIBRATION-01: Sektor-Overlap
+                "industry":            c.get("industry"),    # TR-RELATIONAL-CALIBRATION-01: Sektor-Overlap
                 "strategic_rationale": e.get("strategic_rationale"),
                 "confidence":          e.get("confidence"),
                 "generated_at":        e.get("generated_at"),
