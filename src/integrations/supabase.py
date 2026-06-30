@@ -187,6 +187,30 @@ def fetch_company_by_name(name: str) -> dict | None:
 
 # ── Comparable Transactions (DEALCOMPS-TRANSACTIONS-01, S78) ──────────────────
 
+def fetch_calibration_eligible_transactions() -> list[dict]:
+    """
+    VALUATION-MULTIPLE-01 (S78): liefert nur Zeilen mit vollständigem
+    Snapshot (industry + target_funding_total_usd_mn_at_sale +
+    target_funding_stage_at_sale alle gesetzt) — s. comparable_transactions-
+    Tabellenkommentar zur Kalibrierungsfähigkeits-Definition. Genutzt von
+    src/services/valuation_calibration.py, NICHT von valuation.py selbst
+    (das bleibt DB-frei, s. dortiger Moduldocstring).
+    """
+    db = get_supabase()
+    try:
+        result = db.table("comparable_transactions").select(
+            "industry, target_funding_stage_at_sale, "
+            "target_funding_total_usd_mn_at_sale, deal_price_usd_mn"
+        ).not_.is_("industry", "null") \
+         .not_.is_("target_funding_stage_at_sale", "null") \
+         .not_.is_("target_funding_total_usd_mn_at_sale", "null") \
+         .execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("fetch_calibration_eligible_transactions failed: %s", e)
+        return []
+
+
 def insert_comparable_transaction(row: dict) -> bool:
     """
     Schreibt eine vergleichbare M&A-Transaktion. Duplikat-sicher via UNIQUE

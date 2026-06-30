@@ -90,6 +90,72 @@ VERTICAL_DELTA: dict[str, float] = {
 _VERTICAL_DELTA_DEFAULT = 1.0
 
 
+# ── EXIT_ADJUSTMENT (VALUATION-MULTIPLE-01, S78) ──────────────────────────────
+# Dritte, optionale Multiplikator-Schicht oben auf funding_x_stage —
+# korrigiert die Funding-Runden-implizite Bewertung (was VCs für einen
+# Minderheitsanteil zahlen) in Richtung dessen, was ein M&A-Käufer für die
+# GANZE Company tatsächlich gezahlt hat (Kontrollübernahme, oft systematisch
+# abweichend — Down-Rounds bei Exits sind keine Ausnahme). Siehe Diskussion
+# S78: valuation.py bleibt bewusst der Goldstandard für die Funding-implizite
+# Schätzung, EXIT_ADJUSTMENT ist eine zusätzliche, transparente Korrektur
+# obendrauf — kein Ersatz, beide Werte koexistieren in der API-Response.
+#
+# LEER bei Einführung (S78) — befüllt erst durch echte Kalibrierung gegen
+# comparable_transactions (s. src/services/valuation_calibration.py),
+# Mindeststichprobe n≥5 pro (industry, stage)-Bucket. Bis dahin liefert
+# exit_adjustment() für JEDEN Bucket den neutralen Default 1.0 — die
+# Funding-Bewertung bleibt unverändert sichtbar, kein erfundener Exit-Wert
+# aus zu wenig Daten. Format identisch zu VERTICAL_DELTA (verschachteltes
+# Dict aus Übersichtlichkeit: {industry: {stage: factor}}), Schlüssel
+# IDENTISCH zu VERTICAL_DELTA/STAGE_MULT — kein drittes Vokabular.
+EXIT_ADJUSTMENT: dict[str, dict[str, float]] = {}
+_EXIT_ADJUSTMENT_DEFAULT = 1.0
+_EXIT_ADJUSTMENT_MIN_SAMPLE = 5   # gleiche Vorsicht wie _MIN_POOL beim Buyer-Pool
+
+
+def exit_adjustment(industry: str | None, funding_stage: str | None) -> float:
+    """
+    Lookup mit Default 1.0 (neutral) — fällt sauber zurück, kein Bruch,
+    solange EXIT_ADJUSTMENT leer oder der Bucket nicht kalibriert ist.
+    """
+    industry_key = (industry or "").lower().strip()
+    stage_key = (funding_stage or "").lower().strip().replace(" ", "_").replace("-", "_")
+    stage_key = _STAGE_ALIASES.get(stage_key, stage_key)
+    return EXIT_ADJUSTMENT.get(industry_key, {}).get(stage_key, _EXIT_ADJUSTMENT_DEFAULT)
+
+
+def compute_exit_adjusted_valuation(company: dict) -> dict:
+    """
+    VALUATION-MULTIPLE-01: erweitert compute_target_valuation() um die
+    EXIT_ADJUSTMENT-Schicht — NUR für method='funding_x_stage' relevant
+    (Listed-Companies haben bereits eine echte market_cap, keine Korrektur
+    nötig/sinnvoll). Gibt IMMER beide Werte zurück (value_usd_mn = Basis,
+    exit_adjusted_value_usd_mn = korrigiert) — Frontend zeigt beide
+    nebeneinander (Andreas, S78: "Est. Valuation" + "M&A Multiple" als
+    zwei Kacheln, nicht eine ersetzt die andere).
+
+    is_calibrated=False bedeutet: exit_adjustment_factor ist der neutrale
+    Default 1.0, exit_adjusted_value_usd_mn == value_usd_mn (keine
+    Information verloren, aber auch keine erfundene Korrektur).
+    """
+    base = compute_target_valuation(company)
+    if base["method"] != "funding_x_stage" or base["value_usd_mn"] is None:
+        return {**base, "exit_adjustment_factor": None,
+                "exit_adjusted_value_usd_mn": base["value_usd_mn"], "is_calibrated": False}
+
+    industry = company.get("industry")
+    stage = company.get("funding_stage")
+    factor = exit_adjustment(industry, stage)
+    is_calibrated = factor != _EXIT_ADJUSTMENT_DEFAULT
+
+    return {
+        **base,
+        "exit_adjustment_factor": factor,
+        "exit_adjusted_value_usd_mn": round(base["value_usd_mn"] * factor, 2),
+        "is_calibrated": is_calibrated,
+    }
+
+
 # ── FX -> USD (statische Fallback-Kurse, grob jaehrlich nachziehen) ───────────
 # Nur Groessenordnung fuer Tiers - keine Live-Rates (Scheingenauigkeit vermeiden).
 _FX_TO_USD: dict[str, float] = {
