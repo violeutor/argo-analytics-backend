@@ -1160,6 +1160,44 @@ _EDGAR_FORM_MAP: dict[str, EventType] = {
 # 8-K Item-Nummern die echte M&A / wesentliche Events indizieren
 _8K_MA_ITEMS = {"1.01", "2.01", "2.02", "5.02", "8.01"}
 
+_SEC_USER_AGENT_SE = "ArgoAnalytics/1.0 (research; contact@argo-analytics.io)"
+
+
+async def _fetch_form_d_amount_signal(
+    client: httpx.AsyncClient, cik: str, accession_no_dashes: str,
+) -> float | None:
+    """
+    SIGNALENGINE-FORMD-AMOUNT-01 (S78): total_offering_amount existiert
+    NICHT im efts.sec.gov-_source-Schema (gleicher Fund wie FORMD-DIRECT-
+    XML-01 in discovery_engine.py — verifiziert gegen die offizielle SEC-
+    API-Doku) — direkter Fetch der primary_doc.xml der Filing statt des
+    toten Feldes. Bewusst hier dupliziert statt aus discovery_engine.py
+    importiert: dortige Funktion ist mit Unterstrich modul-intern markiert,
+    beide Module liegen nebeneinander in src/services/ — gleiches Argument
+    wie bei _autopick in discovery_engine.py (dort wortgleich aus peers.py
+    dupliziert, ~15 Zeilen, kein Cross-Layer-Import noetig).
+    """
+    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/primary_doc.xml"
+    try:
+        resp = await client.get(url, headers={"User-Agent": _SEC_USER_AGENT_SE}, timeout=12.0)
+        await asyncio.sleep(0.15)
+        if resp.status_code != 200:
+            return None
+        root = ET.fromstring(resp.text)
+        for el in root.iter():
+            tag = el.tag.split("}")[-1]
+            if tag == "totalOfferingAmount" and el.text:
+                try:
+                    return round(float(el.text.strip()) / 1_000_000, 2)
+                except (ValueError, TypeError):
+                    continue
+    except Exception as e:
+        logger.debug(
+            "Form D primary_doc.xml Fetch fehlgeschlagen (signal_engine): %s — %r",
+            type(e).__name__, e,
+        )
+    return None
+
 
 async def parse_edgar(
     company_id: str,
@@ -1237,27 +1275,36 @@ async def parse_edgar(
                 ev_date = date.today()
 
             # Korrekter Filing-Link via accession number
-            acc_clean   = accession.replace("-", "")
+            # SIGNALENGINE-FORMD-AMOUNT-01 (S78): file_num ist NICHT die CIK
+            # (SEC "File Number" = Wertpapier-Registrierungsnummer, z.B.
+            # "001-12345" — anderes Feld als die CIK, _source fragt cik auch
+            # gar nicht ab). CIK steckt bereits in der Accession-Number selbst
+            # (erste 10 Ziffern vor dem ersten Bindestrich = Filer-CIK, feste
+            # EDGAR-Konvention) — kein zusätzliches Feld/Fetch nötig. Betraf
+            # ALLE Formtypen hier, nicht nur Form D — beim Form-D-Amount-Fix
+            # gefunden, nicht gezielt gesucht.
+            acc_clean = accession.replace("-", "")
+            cik_from_accession = (accession.split("-")[0].lstrip("0") or "0") if accession else None
             filing_url  = (
                 f"https://www.sec.gov/Archives/edgar/data/"
-                f"{src.get('file_num', '').replace('-', '')}/{acc_clean}/{accession}-index.htm"
-                if accession else None
+                f"{cik_from_accession}/{acc_clean}/{accession}-index.htm"
+                if accession and cik_from_accession else None
             )
-            # Fallback: EDGAR-Suche nach file_num
+            # Fallback: EDGAR-Suche nach file_num (hier korrekt — der
+            # browse-edgar-Endpoint nimmt tatsächlich die File-Number, anders
+            # als der Archives-Pfad oben, der die CIK braucht)
             if not filing_url and src.get("file_num"):
                 filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={src['file_num']}"
 
             summary = _edgar_summary(form_type, entity, ev_date)
 
-            # B-05: Form D → Funding-Betrag aus total_offering falls vorhanden
+            # B-05/SIGNALENGINE-FORMD-AMOUNT-01 (S78): total_offering_amount
+            # aus efts.sec.gov existiert strukturell nicht (s. Funktions-
+            # Docstring von _fetch_form_d_amount_signal) — direkter Fetch
+            # der primary_doc.xml statt des toten Feldes.
             funding_amount = None
-            if form_type in ("D", "D/A"):
-                total_offering = src.get("total_offering_amount")
-                if total_offering:
-                    try:
-                        funding_amount = round(float(total_offering) / 1_000_000, 2)
-                    except (ValueError, TypeError):
-                        pass
+            if form_type in ("D", "D/A") and accession and cik_from_accession:
+                funding_amount = await _fetch_form_d_amount_signal(client, cik_from_accession, acc_clean)
 
             events.append(SignalEvent(
                 company_id=company_id,
