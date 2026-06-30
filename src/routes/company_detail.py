@@ -48,6 +48,7 @@ from src.services.market_data_enrichment import (
     enrich_market_data_sync_wrapper,
 )
 from src.services.value_drivers_enrichment import enrich_value_drivers
+from src.services.valuation import compute_target_valuation   # FRONTEND-VALUATION-SSOT-DRIFT-01
 from src.pipelines.scoring import (
     compute_scores,
     compute_auto_tech_readiness,
@@ -142,6 +143,21 @@ class FundingMomentum(BaseModel):
     lead_investors:             list[str] = []      # dedupliziert über alle Runden
     stage_progression:          list[str] = []      # ["Seed", "Series A", "Series B"]
     momentum_score:             float | None = None # 0–10, ersetzt Stage-Proxy in SC-01
+
+
+class TargetValuationDetail(BaseModel):
+    """
+    FRONTEND-VALUATION-SSOT-DRIFT-01: direkte Durchreichung von
+    valuation.py::compute_target_valuation() — bisher rechnete page.tsx
+    "Est. Valuation" mit einer eigenen, abweichenden lokalen Stage-Tabelle
+    (Frontend-alt-Spalte aus VALUATION-SSOT-01, nie auf die Backend-SSOT
+    umgestellt). Scoring-Pfad (scoring.py/AnalyzeRequest) nutzte die SSOT
+    schon länger — dieses Feld schließt die Lücke für den Response-Pfad.
+    """
+    value_usd_mn:    float | None = None
+    method:          str = "none"   # 'market_cap' | 'funding_x_stage' | 'none'
+    stage_mult:      float | None = None
+    vertical_delta:  float | None = None
 
 
 class FundamentalsData(BaseModel):
@@ -274,6 +290,7 @@ class CompanyDetailResponse(BaseModel):
     funding_stage: str | None
     funding_rounds: list[FundingRoundItem]
     funding_momentum: FundingMomentum | None = None   # nur für private Companies
+    target_valuation: TargetValuationDetail | None = None   # FRONTEND-VALUATION-SSOT-DRIFT-01
     # Ownership
     ownership: list[OwnershipItem]
     # Fundamentals
@@ -3397,6 +3414,17 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             )
             logger.info("Auto-TR (intrinsic) for %s: %.3f (confidence=%s)", company_name, _tr_intrinsic, tr_confidence)
 
+        # FRONTEND-VALUATION-SSOT-DRIFT-01: company-konstant, unabhängig vom
+        # Buyer (gleiche Logik-Stelle wie der TR-Intrinsic-Wert oben) — EINE
+        # Berechnung statt der bisherigen lokalen page.tsx-Stage-Tabelle.
+        _target_valuation = compute_target_valuation(company)
+        target_valuation_obj = TargetValuationDetail(
+            value_usd_mn=_target_valuation["value_usd_mn"],
+            method=_target_valuation["method"],
+            stage_mult=_target_valuation["stage_mult"],
+            vertical_delta=_target_valuation["vertical_delta"],
+        )
+
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
             if not mcap:
@@ -3678,6 +3706,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         funding_stage=company.get("funding_stage"),
         funding_rounds=funding_rounds,
         funding_momentum=_funding_momentum_obj,
+        target_valuation=target_valuation_obj,
         ownership=ownership,
         fundamentals=fundamentals,
         scorings=scorings,
