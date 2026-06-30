@@ -33,12 +33,15 @@ nie gelockert um die Zahl zu erreichen:
 
   Funding-Topf:
     (c) EDGAR Form D/D-A — gleicher Index-Mechanismus wie (a). WICHTIG: die
-                            Indexdatei selbst enthält KEINEN Betrag — total_
-                            offering_amount kommt erst aus einem zweiten,
-                            gezielten Call gegen efts.sec.gov (Name/CIK bereits
-                            bekannt aus dem Index → das ist innerhalb der von
-                            SEC dokumentierten Nutzung, anders als ein "alle
-                            Filings"-Scan ohne Suchbegriff). Floor ≥$10M.
+                            Indexdatei selbst enthält KEINEN Betrag —
+                            total_offering_amount kommt aus der eigenen
+                            primary_doc.xml jeder Filing (FORMD-DIRECT-XML-01,
+                            S78 — löst den ursprünglichen efts.sec.gov-Namens-
+                            Search ab, dessen _source-Schema das Feld nie
+                            geführt hat, s. Funktion-Docstring). CIK +
+                            Accession-Number bereits aus dem form.idx-Eintrag
+                            bekannt, kein zweiter Suchindex-Call mehr nötig.
+                            Floor ≥$10M.
     (d) Kuratierte EU-News (Google News DE+EN, sektor- statt company-geschlüsselt,
                             + bestehender TechCrunch-Globalfeed), Domain-Whitelist,
                             Floor ≥€5M via _extract_eur_funding_amount() (NEU,
@@ -87,6 +90,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from typing import Literal
+from xml.etree import ElementTree as ET
 
 import httpx
 
@@ -124,7 +128,6 @@ _SEC_HEADERS = {"User-Agent": _SEC_USER_AGENT}
 _SEC_MIN_DELAY_S = 0.15   # ≈6.6 req/s — sicher unter dem 10-req/s-Limit
 
 _EDGAR_DAILY_INDEX_BASE = "https://www.sec.gov/Archives/edgar/daily-index"
-_EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"   # NUR für (c) Form-D-Beträge, gezielt pro CIK/Name
 
 _ESMA_PRIII_SELECT = "https://registers.esma.europa.eu/solr/esma_registers_priii_documents/select"
 
@@ -227,42 +230,89 @@ async def _fetch_edgar_daily_index(
     return []
 
 
+_ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
+
+
+def _extract_accession_from_file_name(file_name: str) -> str | None:
+    """form.idx 'File Name'-Spalte, z.B. 'edgar/data/1750153/0001750153-26-000123.txt'."""
+    m = _ACCESSION_RE.search(file_name)
+    return m.group(1) if m else None
+
+
 async def _fetch_form_d_amount(
     client: httpx.AsyncClient,
+    cik: str,
+    file_name: str,
     company_name: str,
 ) -> float | None:
     """
-    total_offering_amount steht NICHT im form.idx (nur form_type/name/CIK/date/
-    path) — gezielter Zweit-Call gegen efts.sec.gov, NAME bereits bekannt aus
-    dem Index. Das ist die normale, von SEC dokumentierte Nutzung dieser API
-    (Namens-/Ticker-Suche), kein "alle Filings ohne Suchbegriff"-Scan — der
-    Unterschied, der efts.sec.gov für die Index-Phase selbst ungeeignet macht
-    (s. Moduldocstring), gilt hier nicht.
+    FORMD-DIRECT-XML-01 (S78): ersetzt den Namens-Search gegen efts.sec.gov.
+    DIAGNOSE (S77-Dry-Run, 248/248 Filer ohne Treffer): das offizielle
+    _source-Schema von efts.sec.gov (SEC EDGAR Full-Text-Search) liefert nur
+    file_date/period_of_report/form_type/entity_name/file_num/film_num/
+    file_description — total_offering_amount ist dort KEIN indexiertes Feld,
+    sondern strukturierte Form-D-XML-Information (offeringData.offering
+    SalesAmounts.totalOfferingAmount laut SEC EDGAR Form-D-XML-Tech-Spec).
+    Identisches Muster wie der source_type-Fund aus TR-RELATIONAL-CALIBRATION-01
+    (S77): kein Kalibrierungsproblem, eine nicht existierende Datenquelle.
+
+    Holt stattdessen direkt die primary_doc.xml der eigenen Filing — CIK +
+    Accession-Number stammen schon aus der form.idx-Zeile (kein Name-Match-
+    Risiko mehr, kein zweiter Index-Scan). Konvention: .../edgar/data/{cik}/
+    {accession_ohne_bindestriche}/primary_doc.xml. Nicht gegen ein Live-File
+    verifiziert (gleiche Sandbox-Bot-Detection-Einschränkung wie form.idx
+    selbst, s. Moduldocstring) — Namespace-agnostisches Parsing (Tag-Suffix
+    statt vollem Tag-Namen) fängt Spec-Versions-Drift ab, 404/Parse-Fehler
+    werden geloggt statt stillschweigend verschluckt (IMPORT-GUARD-01).
     """
-    try:
-        resp = await client.get(
-            _EDGAR_SEARCH_URL,
-            params={
-                "q": f'"{company_name}"',
-                "forms": "D,D/A",
-                "_source": "total_offering_amount",
-            },
-            headers=_SEC_HEADERS,
-            timeout=12.0,
+    accession = _extract_accession_from_file_name(file_name)
+    if not accession:
+        logger.warning(
+            "Form D: Accession-Number nicht aus file_name extrahierbar — '%s' (%s)",
+            file_name, company_name,
         )
+        return None
+    cik_clean = cik.lstrip("0") or "0"
+    url = (
+        f"https://www.sec.gov/Archives/edgar/data/{cik_clean}/"
+        f"{accession.replace('-', '')}/primary_doc.xml"
+    )
+    try:
+        resp = await client.get(url, headers=_SEC_HEADERS, timeout=12.0)
         await asyncio.sleep(_SEC_MIN_DELAY_S)
         if resp.status_code != 200:
+            logger.debug(
+                "Form D primary_doc.xml HTTP %s — %s (%s)",
+                resp.status_code, company_name, url,
+            )
             return None
-        hits = resp.json().get("hits", {}).get("hits", [])
-        for hit in hits[:3]:
-            total = hit.get("_source", {}).get("total_offering_amount")
-            if total:
+        root = ET.fromstring(resp.text)
+        element_found = False
+        for el in root.iter():
+            tag = el.tag.split("}")[-1]   # Namespace-Präfix abstreifen
+            if tag == "totalOfferingAmount" and el.text:
+                element_found = True
                 try:
-                    return round(float(total) / 1_000_000, 2)
+                    return round(float(el.text.strip()) / 1_000_000, 2)
                 except (ValueError, TypeError):
+                    # Form-D-Spec erlaubt den Sentinel "Indefinite" statt einer
+                    # Zahl (unbegrenzte Offering-Größe) — kein Parse-Bug.
+                    logger.debug(
+                        "Form D: totalOfferingAmount nicht-numerisch ('%s', vermutlich "
+                        "'Indefinite'-Sentinel) — %s (%s)",
+                        el.text.strip(), company_name, url,
+                    )
                     continue
+        if not element_found:
+            logger.debug(
+                "Form D: kein totalOfferingAmount-Element in primary_doc.xml — %s (%s)",
+                company_name, url,
+            )
     except Exception as e:
-        logger.debug("Form-D-Betrag-Lookup fehlgeschlagen für %s: %s", company_name, e)
+        logger.debug(
+            "Form D primary_doc.xml Fetch fehlgeschlagen für %s: %s — %r",
+            company_name, type(e).__name__, e,
+        )
     return None
 
 
@@ -335,7 +385,12 @@ async def _fetch_esma_priii_documents(
                 "raw": doc,
             })
     except Exception as e:
-        logger.warning("ESMA PRIII Fetch fehlgeschlagen: %s", e)
+        # ESMA-EXC-TYPE-LOG-01: str(e) ist bei manchen Exceptions (u.a.
+        # asyncio.TimeoutError) leer — ohne Typ+repr nicht diagnostizierbar
+        # (S77-Dry-Run-Log zeigte exakt das: "Fetch fehlgeschlagen: " ohne Inhalt).
+        logger.warning(
+            "ESMA PRIII Fetch fehlgeschlagen: %s — %r", type(e).__name__, e
+        )
     return candidates
 
 
@@ -623,6 +678,10 @@ async def run_discovery_pipeline() -> dict:
         "ipo_intent_written": 0, "funding_written": 0,
         "ipo_intent_seen": 0, "funding_seen": 0,
         "rejected_sector": 0, "rejected_dedupe": 0,
+        # EU-NEWS-FUNDING-GRANULARITY-01: unterscheidet, ob ein EU-News-Item
+        # am EUR-Floor oder an der Claude-Haiku-Namensextraktion scheitert —
+        # vorher beides im selben "funding_seen=0" nicht unterscheidbar.
+        "eu_news_seen": 0, "eu_news_rejected_floor": 0, "eu_news_rejected_extraction": 0,
     }
     new_signals: list[SignalEvent] = []
 
@@ -693,7 +752,7 @@ async def run_discovery_pipeline() -> dict:
 
         edgar_formd = await _fetch_edgar_daily_index(client, forms={"D", "D/A"})
         for row in edgar_formd:
-            amount = await _fetch_form_d_amount(client, row["company_name"])
+            amount = await _fetch_form_d_amount(client, row["cik"], row["file_name"], row["company_name"])
             if amount is None or amount < FORM_D_FLOOR_USD_MN:
                 continue
             funding_candidates.append({
@@ -706,13 +765,24 @@ async def run_discovery_pipeline() -> dict:
             })
 
         eu_news = await _fetch_curated_eu_news(client)
+        stats["eu_news_seen"] = len(eu_news)
         for item in eu_news:
             text = f"{item['title']} {item['description']}"
             eur_amount = _extract_eur_funding_amount(text)
             if eur_amount is None or eur_amount < EU_NEWS_FLOOR_EUR_MN:
+                stats["eu_news_rejected_floor"] += 1
+                logger.debug(
+                    "EU-News Floor-Reject (kein/zu kleiner EUR-Betrag erkannt): '%s'",
+                    item["title"][:120],
+                )
                 continue
             extracted = await _extract_company_from_news(client, item["title"], item["description"])
             if not extracted:
+                stats["eu_news_rejected_extraction"] += 1
+                logger.debug(
+                    "EU-News Extraction-Reject (kein Company-Name trotz €%.1fM-Treffer): '%s'",
+                    eur_amount, item["title"][:120],
+                )
                 continue
             funding_candidates.append({
                 "name": extracted["company_name"], "source": "news_curated_eu",
