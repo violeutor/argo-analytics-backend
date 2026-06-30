@@ -843,6 +843,39 @@ def _insert_discovery_company(db, name: str, discovery_source: str, identity_con
     return None
 
 
+async def _backfill_acquired_company(db, client: httpx.AsyncClient, deal: dict) -> str | None:
+    """
+    DEALCOMPS-BACKFILL-01 (S78): legt ein akquiriertes Target nachträglich
+    als Company an, wenn es nicht schon bei uns getrackt ist (Andreas, S78:
+    "jüngst akquirierte Unternehmen ... nachträglich schreiben"). Nutzt
+    lifecycle_status='acquired' — Enum-Wert existiert bereits (DISAMBIG-03,
+    company_detail.py Zeile 257), kein neues Vokabular.
+
+    Bewusst OHNE Beitrag zur EXIT_ADJUSTMENT-Kalibrierung: zum Backfill-
+    Zeitpunkt ist die Company schon akquiriert, ihr "aktueller" Funding-
+    Stand sagt nichts mehr über den Zustand vor dem Verkauf (s. Snapshot-
+    Diskussion S78) — komplett unabhängig vom *_at_sale-Snapshot der
+    Transaktion. Wert liegt in Sektor-/Peer-/Supply-Chain-Vollständigkeit,
+    nicht im Multiple-Pfad.
+    """
+    identity_confidence, resolved = await _identity_gate(client, deal["target_name"])
+    new_id = _insert_discovery_company(
+        db, deal["target_name"], "dealcomps_backfill", identity_confidence, resolved,
+    )
+    if new_id:
+        from src.integrations.supabase import upsert_company_enrichment
+        upsert_company_enrichment(new_id, {
+            "lifecycle_status": "acquired",
+            "industry": deal.get("industry"),
+        })
+        logger.info(
+            "DEALCOMPS-BACKFILL-01: '%s' nachträglich angelegt → %s "
+            "(lifecycle_status=acquired, industry=%s)",
+            deal["target_name"], new_id, deal.get("industry") or "—",
+        )
+    return new_id
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run_discovery_pipeline() -> dict:
@@ -869,6 +902,7 @@ async def run_discovery_pipeline() -> dict:
         # (eigene Decke COMPTX_DAILY_CAP, andere Logik s. dort).
         "comp_tx_seen": 0, "comp_tx_written": 0,
         "comp_tx_rejected_no_item": 0, "comp_tx_rejected_extraction": 0,
+        "comp_tx_backfilled": 0,
     }
     new_signals: list[SignalEvent] = []
 
@@ -1068,6 +1102,14 @@ async def run_discovery_pipeline() -> dict:
                 target_company_id    = existing_target.get("id")
                 target_funding_total = existing_target.get("funding_total_usd_mn") or target_funding_total
                 target_funding_stage = existing_target.get("funding_stage") or target_funding_stage
+            elif not DRY_RUN:
+                # DEALCOMPS-BACKFILL-01: nur scharf anlegen, kein Dry-Run-
+                # Zweigpfad für eine Company-Erstellung mit echten Web-Calls
+                # (Identitäts-Gate) — im Dry-Run bleibt es bei der Log-Zeile
+                # unten, die das fehlende target_company_id schon transparent macht.
+                target_company_id = await _backfill_acquired_company(db, client, deal)
+                if target_company_id:
+                    stats["comp_tx_backfilled"] += 1
 
             if DRY_RUN:
                 logger.info(
