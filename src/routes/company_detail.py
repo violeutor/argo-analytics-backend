@@ -3350,6 +3350,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     _ma_aggregate_meta: dict = {"aggregate_score": None, "basis": "none",
                                 "deals_considered": 0, "feasible_count": 0, "contributors": []}
 
+    # COMPANY-404-WRITE-01: target_valuation_obj hing bisher NUR im is_cache_valid-
+    # else-Zweig (s.u.) — bei kaltem/abgelaufenem Buyer-Cache (Cold-Load, Research-
+    # Suche, Explore-Kachel, Notification-Klick treffen das überdurchschnittlich oft)
+    # blieb die Variable unbound → UnboundLocalError beim Response-Bauen → 500,
+    # via BaseHTTPMiddleware als 502 sichtbar. compute_target_valuation(company)
+    # hängt nur von company ab, nicht von buyers/Cache-Status → unconditional
+    # vor den Branch gezogen, exakt das BUYER-AGG-01-Muster direkt darüber.
+    _target_valuation = compute_target_valuation(company)
+    target_valuation_obj = TargetValuationDetail(
+        value_usd_mn=_target_valuation["value_usd_mn"],
+        method=_target_valuation["method"],
+        stage_mult=_target_valuation["stage_mult"],
+        vertical_delta=_target_valuation["vertical_delta"],
+    )
+
     if not is_cache_valid(potential_buyers_raw):
         # Noch nicht generiert oder abgelaufen → BackgroundTask, scorings=[]
         if company_id:
@@ -3395,13 +3410,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         # FRONTEND-VALUATION-SSOT-DRIFT-01: company-konstant, unabhängig vom
         # Buyer (gleiche Logik-Stelle wie der TR-Intrinsic-Wert oben) — EINE
         # Berechnung statt der bisherigen lokalen page.tsx-Stage-Tabelle.
-        _target_valuation = compute_target_valuation(company)
-        target_valuation_obj = TargetValuationDetail(
-            value_usd_mn=_target_valuation["value_usd_mn"],
-            method=_target_valuation["method"],
-            stage_mult=_target_valuation["stage_mult"],
-            vertical_delta=_target_valuation["vertical_delta"],
-        )
+        # COMPANY-404-WRITE-01: Berechnung jetzt vor dem if/else-Branch (s.o.),
+        # damit sie auch im not-cache-valid-Pfad gesetzt ist.
 
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
