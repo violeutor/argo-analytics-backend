@@ -692,21 +692,23 @@ async def _extract_deal_details(
 
 async def _lookup_company_by_name(name: str) -> dict | None:
     """
-    Duenne Wrapper-Funktion, bewusst getrennt vom direkten Import im
-    Orchestrator: macht die Abhaengigkeit von einer NOCH NICHT EXISTIERENDEN
-    supabase.py-Funktion (fetch_company_by_name) an einer Stelle sichtbar
-    und faengt das fehlende Funktion sauber statt mit ImportError im Cron ab.
-    supabase.py lag mir beim Schreiben nicht vor — TODO vor Deploy: dort
-    ergaenzen (Name-Match gegen companies.name, gleiche Normalisierung wie
-    _normalize_name() hier im Modul, sonst False-Negatives durch Rechtsform-
-    Suffixe wie 'Inc.'/'GmbH').
+    Duenne Wrapper-Funktion statt direktem Import im Orchestrator — macht
+    die Abhaengigkeit an einer Stelle sichtbar und faengt einen ggf.
+    fehlenden Import sauber ab statt mit ImportError im Cron zu crashen.
+    fetch_company_by_name() existiert bereits in supabase.py (S78 geprueft) —
+    ABER: nutzt .ilike() ohne Wildcards = exaktes Case-Insensitive-Match,
+    keine Rechtsform-Normalisierung wie _normalize_name() hier im Modul.
+    Reale Praezisions-Luecke: "BiomX" (Haiku-Extraktion) matcht NICHT
+    "BiomX, Inc." (DB-Eintrag) — bewusst nicht an der gemeinsam genutzten
+    Funktion geaendert (andere Caller koennten vom exakten Verhalten
+    abhaengen), hier nur dokumentiert statt verschwiegen.
     """
     try:
         from src.integrations.supabase import fetch_company_by_name
         return fetch_company_by_name(name)
     except ImportError:
         logger.warning(
-            "fetch_company_by_name fehlt noch in supabase.py — Snapshot-Capture "
+            "fetch_company_by_name fehlt in supabase.py — Snapshot-Capture "
             "für '%s' übersprungen, target_company_id bleibt leer", name,
         )
         return None
@@ -714,16 +716,17 @@ async def _lookup_company_by_name(name: str) -> dict | None:
 
 async def _insert_comparable_transaction(row: dict) -> None:
     """
-    Gleiche Lage wie _lookup_company_by_name — insert_comparable_transaction
-    muss noch in supabase.py ergänzt werden. Upsert-Key: (source, source_url),
-    s. schema_patch_comparable_transactions.sql.
+    Gleiche Wrapper-Logik wie _lookup_company_by_name. insert_comparable_
+    transaction() wurde S78 in supabase.py ergänzt (Upsert-Key: (source,
+    source_url), s. schema_patch_comparable_transactions.sql) — try/except
+    bleibt als Sicherheitsnetz, falls Backend- und Frontend-Push je auseinanderlaufen.
     """
     try:
         from src.integrations.supabase import insert_comparable_transaction
         insert_comparable_transaction(row)
     except ImportError:
         logger.warning(
-            "insert_comparable_transaction fehlt noch in supabase.py — "
+            "insert_comparable_transaction fehlt in supabase.py — "
             "Transaktion '%s' nicht geschrieben (lieber laut scheitern als "
             "stiller Datenverlust)", row.get("target_name"),
         )

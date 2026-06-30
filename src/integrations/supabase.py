@@ -185,6 +185,36 @@ def fetch_company_by_name(name: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+# ── Comparable Transactions (DEALCOMPS-TRANSACTIONS-01, S78) ──────────────────
+
+def insert_comparable_transaction(row: dict) -> bool:
+    """
+    Schreibt eine vergleichbare M&A-Transaktion. Duplikat-sicher via UNIQUE
+    CONSTRAINT (source, source_url) — gleiches Upsert-Muster wie
+    upsert_signals(), eine Quelle/URL kann nicht zweimal dieselbe Transaktion
+    liefern (z.B. wiederholter 8-K-Scan an Folgetagen).
+
+    Erwartet dict mit: target_name, target_company_id, acquirer_name,
+    industry, deal_price_usd_mn, deal_date, source, source_url,
+    target_funding_total_usd_mn_at_sale, target_funding_stage_at_sale
+    (s. discovery_engine.py::run_discovery_pipeline, Comp-Transactions-Topf).
+    """
+    db = get_supabase()
+    try:
+        db.table("comparable_transactions").upsert(
+            row,
+            on_conflict="source,source_url",
+            ignore_duplicates=True,
+        ).execute()
+        return True
+    except Exception as e:
+        logger.warning(
+            "insert_comparable_transaction FAILED for '%s': %s",
+            row.get("target_name"), e,
+        )
+        return False
+
+
 # ── Funding Rounds ────────────────────────────────────────────────────────────
 
 def fetch_funding_rounds(company_id: str) -> list[dict]:
