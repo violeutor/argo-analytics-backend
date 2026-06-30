@@ -232,6 +232,12 @@ class TechReadinessDetail(BaseModel):
     factors: dict[str, float]
     factor_weights: dict[str, float]
     confidence: str = "auto_medium"  # listed | auto_low | auto_medium | auto_high | user
+    # TR-RELATIONAL-CONFIDENCE-SURFACE-01 (S78): zweiter Rückgabewert von
+    # compute_auto_tech_readiness_relational() — vorher am Aufrufort verworfen
+    # (_rel, _ = ...). None im fixed-Modus (manual/neutral/listed), da dort kein
+    # relationaler Call stattfindet. Werte z.B. "auto_relational_mcap_mid" oder
+    # mit Suffix "..._sector_match", wenn der Sektor-Overlap-Bonus griff.
+    relational_confidence: str | None = None
 
 
 class ScoringDetail(BaseModel):
@@ -570,44 +576,16 @@ def _load_tr_override(user_id: str | None, company_id: str | None) -> dict | Non
         return None
 
 
-# ── BUG-13: Buyer-Relevanz-Filter ────────────────────────────────────────────
-
-_SECTOR_FIT: dict[str, list[str]] = {
-    "energy":          ["energy", "solar", "wind", "hydrogen", "battery", "grid", "geothermal", "nuclear", "cleantech"],
-    "industrials":     ["manufacturing", "construction", "materials", "cement", "steel", "chemical", "industrial"],
-    "technology":      ["software", "ai", "saas", "semiconductor", "cloud", "iot", "robotics", "tech"],
-    "agriculture":     ["agritech", "food", "agriculture", "biotech"],
-    "transportation":  ["mobility", "evs", "logistics", "aviation", "maritime", "transport"],
-    "materials":       ["mining", "materials", "recycling", "carbon capture", "carbon", "climate"],
-    "healthcare":      ["medtech", "biotech", "pharma", "health"],
-    "finance":         ["fintech", "insurance", "payments"],
-}
-
-
-def _filter_relevant_buyers_detail(buyers: list[dict], company: dict) -> list[dict]:
-    """
-    BUG-13: Filtert Buyers nach Sektor-Fit zur Company.
-    Fallback auf alle Buyers wenn < 2 Treffer (kleines Universe).
-    """
-    industry = (company.get("industry") or "").lower()
-    category = (company.get("category") or "").lower()
-    inv_path = (company.get("investment_path") or "").lower()
-    region   = (company.get("region") or "").lower()
-
-    def _fits(buyer: dict) -> bool:
-        buyer_sector = (buyer.get("sector") or "").lower()
-        fit_kws = _SECTOR_FIT.get(buyer_sector, [])
-        if any(kw in industry or kw in category for kw in fit_kws):
-            return True
-        buyer_region = (buyer.get("region") or "").lower()
-        if buyer_region and region and buyer_region == region:
-            return True
-        if inv_path in ("käufer-proxy", "kaufer-proxy") and buyer.get("market_cap_usd_bn", 0) > 5:
-            return True
-        return False
-
-    relevant = [b for b in buyers if _fits(b)]
-    return relevant if len(relevant) >= 2 else buyers
+# DEAD-CODE-BUG13-01 (S78): _SECTOR_FIT + _filter_relevant_buyers_detail() hier
+# entfernt. War toter Code (nie aufgerufen, operierte auf nicht-existentem
+# buyer["sector"]-Feld). Entscheidung gegen Reaktivierung mit category/industry:
+# (1) widerspricht BUYER-IDENT-02s expliziter Architekturentscheidung, dass das
+#     Size-Gate das EINZIGE Korrektheitskriterium ist und Sektor-Differenzierung
+#     bewusst der Scoring-Engine überlassen bleibt, nicht einem Pre-Filter, der
+#     Buyer aus der Liste wirft; (2) redundant mit dem S77-Sektor-Overlap-Bonus
+#     (compute_auto_tech_readiness_relational, TR-RELATIONAL-CALIBRATION-01),
+#     der dieselbe category/industry-Passung bereits als Score-Bonus abbildet,
+#     ohne Buyer zu eliminieren.
 
 
 # ── Claude intro ──────────────────────────────────────────────────────────────
@@ -3447,8 +3425,9 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 # TR-RELATIONAL-CALIBRATION-01).
                 if _tr_mode_fixed is not None:
                     buyer_tr = _tr_mode_fixed
+                    _rel_confidence = None   # fixed-Modus: kein relationaler Call
                 else:
-                    _rel, _ = compute_auto_tech_readiness_relational(
+                    _rel, _rel_confidence = compute_auto_tech_readiness_relational(
                         buyer_market_cap_usd_bn=float(mcap),
                         target_funding_usd_mn=company.get("funding_total_usd_mn"),
                         buyer_category=buyer.get("category"),
@@ -3484,6 +3463,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                         factors=scores.tech_readiness.factor_scores,
                         factor_weights=_TR_WEIGHTS,
                         confidence=tr_confidence,
+                        relational_confidence=_rel_confidence,
                     ),
                     deal_success_score=scores.deal_success_score,
                     rating=scores.rating,
