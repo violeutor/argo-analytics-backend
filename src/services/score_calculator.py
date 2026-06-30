@@ -462,9 +462,18 @@ def compute_financial_score(
     score += stage_pts
     data_points += 1
 
-    # Bei sehr wenig Datenbasis: Minimum-Baseline setzen (verhindert 0.5-Scores aus Stage allein)
+    # Bei sehr wenig Datenbasis: additiver Cushion statt Flat-Override (COMPOSITE-
+    # STAGE-MULTICOUNT-01-Audit, S78). Vorher max(score, 2.5) buegelte JEDEN
+    # stage_pts-Wert (0.5-2.0) auf eine flache 2.5 — das eigentliche Stage-Signal
+    # ging fuer Companies ohne Revenue/Margin/CAGR komplett verloren (Mehrheit
+    # des privaten Portfolios laut S78-DB-Sample). Additiv erhaelt die
+    # Untergrenze fuer den schlechtesten Fall exakt (stage_pts=0.5 -> 2.5,
+    # identisch zum alten Floor) UND laesst bessere Stages nach oben
+    # differenzieren (stage_pts=2.0 -> 4.0 statt 2.5). Ob 2.5 der richtige
+    # Cushion-Wert ist (vs. SC-10s 4.0-5.0-Neutral-Konvention) ist Kalibrierung,
+    # bewusst nicht Teil dieses Fixes.
     if data_points <= 1:
-        score = max(score, 2.5)
+        score += 2.0
 
     return _safe_round(score), inputs
 
