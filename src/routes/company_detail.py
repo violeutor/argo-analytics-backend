@@ -3663,11 +3663,50 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             else:
                 # On-demand berechnen
                 signals_raw   = fetch_signals(company_id, limit=50)
-                ownership_raw = [
-                    {"name": inv.name, "investor_type": inv.type,
-                     "share_pct": None, "source": "enrichment"}
-                    for inv in enrichment.investors
-                ]
+                # OWNERSHIP-SCORE-SOURCE-GAP-01 (S81): vorher NUR enrichment.investors
+                # — der Score sah damit strukturell weniger als der Tab, der zusätzlich
+                # Funding-Rounds-Lead/Co-Investoren (BUG-30) und die DB-ownership_entries-
+                # Tabelle (EN-08) mergt. Eine Company mit echten, im Tab sichtbaren
+                # Investoren (z.B. Brightmark: Lead+Co-Investor aus funding_rounds) konnte
+                # trotzdem auf den Opaque-Floor fallen (compute_ownership_score:
+                # "not ownership_entries" → 1.0), weil deren Daten aus einer der beiden
+                # anderen Quellen kamen. Fix: dieselbe Drei-Quellen-Priorität/Dedup wie bei
+                # der Tab-Anzeige (curated XOR enrichment als Basis, dann funding_rounds,
+                # dann db_ownership_entries), aber aus den ROH-Dicts statt der Pydantic-
+                # OwnershipItem-Liste — OwnershipItem (Zeile 116) hat kein source-Feld,
+                # eine Wiederverwendung der Anzeige-Liste hätte die Transparenz-Herkunft
+                # (edgar/bundesanzeiger vs. manual) für JEDEN Eintrag auf "manual"
+                # abgeflacht. funding_rounds-Herkunft bekommt hier bewusst KEINEN eigenen
+                # erhöhten Transparenz-Tier (fällt weiterhin auf den 0.5-"manual"-Default
+                # in compute_ownership_score) — das ist eine Kalibrierungsfrage,
+                # CATEGORY-CEILING-REVIEW-01, nicht Teil dieses Wiring-Fixes.
+                _own_raw_names: set[str] = set()
+                ownership_raw: list[dict] = []
+
+                def _add_own_raw(name, investor_type, source, share_pct=None):
+                    nm = (name or "").strip()
+                    if not nm or nm.lower() in _own_raw_names:
+                        return
+                    _own_raw_names.add(nm.lower())
+                    ownership_raw.append({
+                        "name": nm, "investor_type": investor_type,
+                        "share_pct": share_pct, "source": source,
+                    })
+
+                if company_name in _OWNERSHIP_OVERRIDES:
+                    for _o in _OWNERSHIP_OVERRIDES[company_name]:
+                        _add_own_raw(_o.name, _o.type, "curated")
+                elif enrichment.investors:
+                    for inv in enrichment.investors:
+                        _add_own_raw(inv.name, inv.type, "enrichment")
+
+                for r in db_rounds:
+                    _add_own_raw(r.get("lead_investor"), "VC/Investor", "funding_rounds")
+                    for co in (r.get("co_investors") or []):
+                        _add_own_raw(co, "VC/Investor", "funding_rounds")
+
+                for e in db_ownership_entries:
+                    _add_own_raw(e.get("name"), e.get("type"), e.get("source") or "manual", e.get("share_pct"))
                 vd_cached_now = fetch_value_drivers(company_id)
                 vd_list: list[dict] = []
                 if vd_cached_now:
