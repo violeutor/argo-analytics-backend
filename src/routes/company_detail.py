@@ -3390,6 +3390,22 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     _ma_aggregate_meta: dict = {"aggregate_score": None, "basis": "none",
                                 "deals_considered": 0, "feasible_count": 0, "contributors": []}
 
+    # COMPANY-404-WRITE-01 (Re-Fix): FRONTEND-VALUATION-SSOT-DRIFT-01 hing hier
+    # bisher im else-Zweig (nur bei gültigem Buyer-Cache berechnet), wurde aber
+    # weiter unten UNBEDINGT referenziert (target_valuation=target_valuation_obj).
+    # Bei leerem/kaltem Buyer-Cache (Erstaufruf, BackgroundTask-Pfad) crashte das
+    # mit UnboundLocalError → 500 für JEDE Company ohne bereits generierte Buyer
+    # (bestätigt live: LanzaTech, Siemens). compute_target_valuation() hängt nur
+    # von company ab, nicht von buyers/Cache-Status — gehört daher unconditional
+    # hierher, nicht in den else-Zweig.
+    _target_valuation = compute_target_valuation(company)
+    target_valuation_obj = TargetValuationDetail(
+        value_usd_mn=_target_valuation["value_usd_mn"],
+        method=_target_valuation["method"],
+        stage_mult=_target_valuation["stage_mult"],
+        vertical_delta=_target_valuation["vertical_delta"],
+    )
+
     if not is_cache_valid(potential_buyers_raw):
         # Noch nicht generiert oder abgelaufen → BackgroundTask, scorings=[]
         if company_id:
@@ -3431,17 +3447,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 funding_last_round=company.get("funding_last_round"),
             )
             logger.info("Auto-TR (intrinsic) for %s: %.3f (confidence=%s)", company_name, _tr_intrinsic, tr_confidence)
-
-        # FRONTEND-VALUATION-SSOT-DRIFT-01: company-konstant, unabhängig vom
-        # Buyer (gleiche Logik-Stelle wie der TR-Intrinsic-Wert oben) — EINE
-        # Berechnung statt der bisherigen lokalen page.tsx-Stage-Tabelle.
-        _target_valuation = compute_target_valuation(company)
-        target_valuation_obj = TargetValuationDetail(
-            value_usd_mn=_target_valuation["value_usd_mn"],
-            method=_target_valuation["method"],
-            stage_mult=_target_valuation["stage_mult"],
-            vertical_delta=_target_valuation["vertical_delta"],
-        )
 
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
