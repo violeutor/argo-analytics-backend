@@ -21,8 +21,13 @@ Path-Scores (0–10):
 
 Composite + Rating:
   SC-05  Composite Score     — Gewichteter Durchschnitt der Sub-Scores
-                               Financial 25% + Strategic 20% + Market 20%
-                               + Ownership 15% + Value Driver 10% + (10−Risk) 10%
+                             COMPOSITE-DEFINITION-01 (S81): Financial 25% +
+                             Market 20% + Ownership 15% + Value Driver 10%
+                             + (10−Risk) 10% (Basis 0.80, auto-normalisiert).
+                             SC-02 Strategic bewusst NICHT Teil des Composite
+                             — ist Buyer-Matching-Signal (M&A), keine Company-
+                             intrinsische Attraktivität. Bleibt eigenständig
+                             berechnet, speist weiterhin M&A Score.
   SC-11  Hero Path           — argmax(path_scores) → dominanter Investitionspfad
   SC-12  Score Inputs        — serialisierte Inputs je Score (für Tooltip)
   SC-13  Rating A–D          — aus hero_score; A ≥7.5 · B ≥5.5 · C ≥3.5 · D <3.5
@@ -179,9 +184,21 @@ _PATH_LABELS: dict[str, str] = {
 }
 
 # Composite-Gewichte (SC-05)
+# COMPOSITE-DEFINITION-01 (S81, Andreas-Entscheidung): "strategic" (SC-02) entfernt.
+# SC-02 ist deal_success_score des besten Buyers — eine Buyer-Matching-Größe
+# (M&A-Signal), keine Company-intrinsische Attraktivität. Composite soll laut
+# Andreas NUR Marktposition/-potential + Risiko + finanzielle Situation messen.
+# Beweis der Kontamination: Mega-Caps/listed ohne Buyer-Aggregat (Acquirability-
+# Gate) fielen strukturell auf SC-02≈1.5-1.8/10 zurück (compute_strategic_score,
+# "no_buyer_aggregate"-Fallback), was den Composite bei 20% Gewicht unabhängig
+# von der tatsächlichen Unternehmensqualität nach unten zog (Apple/Nvidia <5,
+# SCORING-TAB-AUDIT-01). SC-02 bleibt vollständig berechnet + im Buyer-Tab
+# sichtbar + speist weiterhin M&A Score (SC02-MA-UNIFY-01) — nur der Composite-
+# Beitrag entfällt. Restliche Gewichte summieren jetzt auf 0.80 (statt 1.0) —
+# compute_composite_score() normalisiert bereits automatisch über total_weight,
+# kein manuelles Reskalieren der verbleibenden vier Werte nötig.
 _COMPOSITE_WEIGHTS: dict[str, float] = {
     "financial":    0.25,
-    "strategic":    0.20,
     "market":       0.20,
     "ownership":    0.15,
     "value_driver": 0.10,
@@ -1093,10 +1110,12 @@ def compute_composite_score(result: ScoreResult) -> float | None:
             components.append((score, _COMPOSITE_WEIGHTS[key]))
 
     _try_add(result.financial_score,    "financial")
-    _try_add(result.strategic_score,    "strategic")
     _try_add(result.market_score,       "market")
     _try_add(result.ownership_score,    "ownership")
     _try_add(result.value_driver_score, "value_driver")
+    # COMPOSITE-DEFINITION-01 (S81): strategic_score (SC-02) bewusst NICHT mehr
+    # Teil des Composite — s. Begründung bei _COMPOSITE_WEIGHTS oben. SC-02
+    # bleibt auf result.strategic_score unverändert berechnet für Buyer-Tab/M&A.
 
     if result.risk_score is not None:
         components.append((10.0 - result.risk_score, _COMPOSITE_WEIGHTS["risk_inv"]))
@@ -1312,13 +1331,36 @@ def compute_dimension_risks(
         "risk_sources":        ["signals[regulatory_intervention,policy_risk,sanctions]"],
     }
 
-    # ─── 5. TECHNOLOGY (Stage-TR-Proxy + Signals + SE-14 Patent Depth) ────
-    _STAGE_TR = {
-        "pre_seed": 0.15, "seed": 0.20, "series_a": 0.35, "series_b": 0.50,
-        "series_c": 0.65, "series_d": 0.75, "series_d_plus": 0.80,
-        "growth": 0.85, "pre_ipo": 0.88, "listed": 0.90,
-    }
-    tr_proxy  = _STAGE_TR.get(stage, 0.50)
+    # ─── 5. TECHNOLOGY (User-Override > kanonische Auto-TR > Signals/Patents) ──
+    # SC10-STAGE-TR-PROXY-01 (S81, Andreas-Entscheidung): vorher eine VIERTE,
+    # unabhängig kalibrierte lokale _STAGE_TR-Kopie, die sich selbst fälschlich
+    # als "auto_tech_readiness(stage_proxy)" auswies, ohne die Funktion je
+    # aufzurufen (andere Zahlen: seed 0.20 hier vs. 0.28 im Original). Jetzt:
+    # (1) kanonische compute_auto_tech_readiness() aus scoring.py statt eigener
+    # Tabelle — ein Ort für "was ist der Stage-basierte TR-Schätzwert", nicht
+    # vier. (2) Aktiver User-TR-Override (company["_tr_override"], TR-MODAL-01)
+    # wird respektiert, wenn vorhanden — bewusste Revision der S76-Aussage
+    # "TechReadiness lebt ausschließlich in der Per-Buyer-Engine": TR-MODAL-01
+    # ist company-level (kein Buyer-Parameter), ein User, der sich die Mühe
+    # macht, TR manuell einzuschätzen, soll das auch im 6D-Radar sehen statt
+    # dass dort weiter aus der Stage geraten wird.
+    from src.services.scoring import compute_auto_tech_readiness
+
+    _tr_override = company.get("_tr_override")
+    if _tr_override and _tr_override.get("value") is not None:
+        tr_proxy  = float(_tr_override["value"])
+        tr_source_label = f"user_tr_override(mode={_tr_override.get('mode', '?')})"
+        tech_conf_base = "high"
+    else:
+        tr_proxy, _tr_confidence = compute_auto_tech_readiness(
+            stage=stage,
+            category=company.get("category") or company.get("industry"),
+            funding_total_usd_mn=company.get("funding_total_usd_mn"),
+            funding_last_round=company.get("funding_last_round"),
+        )
+        tr_source_label = "auto_tech_readiness(canonical)"
+        tech_conf_base = "medium" if _tr_confidence != "auto_low" else "low"
+
     tech_opp  = min(10.0, round(tr_proxy * 9.0 + 0.5, 1))
     tech_risk = min(10.0, round((1.0 - tr_proxy) * 6.5 + 1.0, 1))
 
@@ -1329,8 +1371,8 @@ def compute_dimension_risks(
 
     # SE-14: Patent-Tiefe aus EPO OPS — nur für PATENT_SCORING_SECTORS
     # Datensammlung universell; Scoring nur wo IP ein echter Moat ist (Deep Tech, Chemie, Pharma …)
-    tech_conf    = "medium" if stage else "low"
-    tech_sources = ["auto_tech_readiness(stage_proxy)", "signals[patent,tech_milestone]"]
+    tech_conf    = tech_conf_base if stage else "low"
+    tech_sources = [tr_source_label, "signals[patent,tech_milestone]"]
     patent_bonus = 0.0
     category_raw = (company.get("category") or company.get("industry") or "").lower()
     in_patent_sector = _is_patent_relevant(category_raw)
