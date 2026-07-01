@@ -3152,6 +3152,46 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         if _funding_momentum_obj else None
     )
 
+    # FUNDING-STAGE-ROUND-CONSISTENCY-01 (S79): companies.funding_total_usd_mn/
+    # _stage/_last_round werden NUR einmalig beim Cold-Insert in search.py
+    # geschrieben (_persist_enriched_company(), nur wenn ein Wikipedia-Hint
+    # existiert) und danach NIE wieder aktualisiert — keine der geprüften
+    # Enrichment-Pipelines (funding_enrichment.py, enrichment.py, signal_engine.py,
+    # ownership_enrichment.py, edgar_kpi.py) schreibt sie zurück. funding_rounds
+    # (migration_004) IST aktiv gepflegt (04:30-Cron, EDGAR Form D/TechCrunch/
+    # Google News). Daher: funding_rounds wird zur SSOT, die drei companies-
+    # Spalten sind nur noch Bootstrap-Fallback für Companies ohne getrackte Runden.
+    #
+    # WICHTIG: company wird ab hier mit den abgeleiteten Werten gemerged — JEDER
+    # spätere company.get("funding_total_usd_mn"/"funding_stage"/"funding_last_round")
+    # in dieser Funktion (Scoring, Target-Valuation, Response) bekommt automatisch
+    # die konsistente, aktuelle Zahl. Kein Einzel-Patch pro Call-Site nötig.
+    #
+    # Format von funding_last_round ("<Typ>; <Datum>") ist eine Annahme, nicht
+    # gegen Bestandsdaten verifiziert — page.tsx macht `.split(";")[0]`, das legt
+    # ein Trenn-Semikolon nahe, aber das exakte Alt-Format war nicht einsehbar.
+    # Bitte einmal live gegen eine Company mit echten Runden gegenchecken.
+    def _derive_funding_summary(rounds: list[dict], fallback: dict) -> dict:
+        dated = sorted(
+            (r for r in rounds if r.get("date")),
+            key=lambda r: r["date"], reverse=True,
+        )
+        amounts = [r["amount_usd_mn"] for r in rounds if r.get("amount_usd_mn") is not None]
+        total = round(sum(amounts), 2) if amounts else None
+        if dated:
+            latest = dated[0]
+            stage = latest.get("type")
+            last_round = f"{latest.get('type') or 'Runde'}; {latest['date']}"
+        else:
+            stage, last_round = None, None
+        return {
+            "funding_total_usd_mn": total if total is not None else fallback.get("funding_total_usd_mn"),
+            "funding_stage":        stage or fallback.get("funding_stage"),
+            "funding_last_round":   last_round or fallback.get("funding_last_round"),
+        }
+
+    company = {**company, **_derive_funding_summary(db_rounds, company)}
+
     # BUG-30: Funding History → Investoren immer in Ownership aufnehmen
     # Investoren aus funding_rounds werden immer gemerged (Lead + Co-Investoren),
     # deduped gegen bereits vorhandene Einträge (curated overrides / enrichment).
@@ -3350,21 +3390,6 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     _ma_aggregate_meta: dict = {"aggregate_score": None, "basis": "none",
                                 "deals_considered": 0, "feasible_count": 0, "contributors": []}
 
-    # COMPANY-404-WRITE-01: target_valuation_obj hing bisher NUR im is_cache_valid-
-    # else-Zweig (s.u.) — bei kaltem/abgelaufenem Buyer-Cache (Cold-Load, Research-
-    # Suche, Explore-Kachel, Notification-Klick treffen das überdurchschnittlich oft)
-    # blieb die Variable unbound → UnboundLocalError beim Response-Bauen → 500,
-    # via BaseHTTPMiddleware als 502 sichtbar. compute_target_valuation(company)
-    # hängt nur von company ab, nicht von buyers/Cache-Status → unconditional
-    # vor den Branch gezogen, exakt das BUYER-AGG-01-Muster direkt darüber.
-    _target_valuation = compute_target_valuation(company)
-    target_valuation_obj = TargetValuationDetail(
-        value_usd_mn=_target_valuation["value_usd_mn"],
-        method=_target_valuation["method"],
-        stage_mult=_target_valuation["stage_mult"],
-        vertical_delta=_target_valuation["vertical_delta"],
-    )
-
     if not is_cache_valid(potential_buyers_raw):
         # Noch nicht generiert oder abgelaufen → BackgroundTask, scorings=[]
         if company_id:
@@ -3410,8 +3435,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         # FRONTEND-VALUATION-SSOT-DRIFT-01: company-konstant, unabhängig vom
         # Buyer (gleiche Logik-Stelle wie der TR-Intrinsic-Wert oben) — EINE
         # Berechnung statt der bisherigen lokalen page.tsx-Stage-Tabelle.
-        # COMPANY-404-WRITE-01: Berechnung jetzt vor dem if/else-Branch (s.o.),
-        # damit sie auch im not-cache-valid-Pfad gesetzt ist.
+        _target_valuation = compute_target_valuation(company)
+        target_valuation_obj = TargetValuationDetail(
+            value_usd_mn=_target_valuation["value_usd_mn"],
+            method=_target_valuation["method"],
+            stage_mult=_target_valuation["stage_mult"],
+            vertical_delta=_target_valuation["vertical_delta"],
+        )
 
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
