@@ -70,6 +70,13 @@ _STAGE_TR: dict[str, float] = {
     "series_d_plus": 0.73,
     "pre_ipo":       0.80,
     "public":        1.00,  # Gate — wird im Frontend nicht angezeigt
+    # SC10-STAGE-TR-PROXY-01 (S81): "listed" ergänzt — _resolve_funding_stage()
+    # liefert seit STAGE-FORMAT-MISMATCH-01 (S75) "listed", nicht "public".
+    # Folgenlos, solange diese Funktion nur für is_listed=False aufgerufen
+    # wurde (Per-Buyer-Engine-Guard) — SC-10 (score_calculator.py) ruft sie
+    # jetzt auch für gelistete Companies auf, wo der fehlende Key sonst
+    # lautlos auf den generischen 0.50-Fallback gefallen wäre statt ~1.0.
+    "listed":        1.00,
 }
 
 # Kategorie → Branchenspezifischer Boost/Abzug
