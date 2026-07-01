@@ -1344,7 +1344,12 @@ def compute_dimension_risks(
     # ist company-level (kein Buyer-Parameter), ein User, der sich die Mühe
     # macht, TR manuell einzuschätzen, soll das auch im 6D-Radar sehen statt
     # dass dort weiter aus der Stage geraten wird.
-    from src.services.scoring import compute_auto_tech_readiness
+    # SCORING-PATH-01 (S82): Pfad-Korrektur — scoring.py liegt unter src/pipelines/,
+    # nicht src/services/. Der S81-Import (SC10-STAGE-TR-PROXY-01) nahm den falschen
+    # Pfad an; Datei war korrekt gepusht/deployed, nur der Import zeigte ins Leere —
+    # ModuleNotFoundError, compute_dimension_risks komplett ausgefallen (fail-loud
+    # abgefangen in assessments.py, aber Risk-Dimension-Assessments plattformweit tot).
+    from src.pipelines.scoring import compute_auto_tech_readiness
 
     _tr_override = company.get("_tr_override")
     if _tr_override and _tr_override.get("value") is not None:
