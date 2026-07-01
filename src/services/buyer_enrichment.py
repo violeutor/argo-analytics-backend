@@ -495,7 +495,11 @@ async def _harvest_sector(company: dict, client: httpx.AsyncClient) -> list[dict
     try:
         cands = await find_sector_incumbents(industry, client=client)
     except Exception as e:
-        logger.debug("Sector-Harvest failed für '%s': %s", industry, e)
+        # FAIL-LOUD-PASS-01: war logger.debug — bei Prod-Log-Level INFO unsichtbar,
+        # exakt das Muster aus BUYER-SCORING-SILENT-01 (S80), hier separat gefunden
+        # bei der Fail-loud-Validierung (S81). Layer 2 (Wikidata-Sektor-Harvest)
+        # konnte lautlos für JEDEN Industry-Wert ausfallen, ohne dass es je auffiel.
+        logger.warning("Sector-Harvest failed für '%s': %s", industry, e)
         return []
 
     out: list[dict] = []
