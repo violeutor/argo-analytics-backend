@@ -3448,6 +3448,24 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             )
             logger.info("Auto-TR (intrinsic) for %s: %.3f (confidence=%s)", company_name, _tr_intrinsic, tr_confidence)
 
+        # STAGE-FORMAT-MISMATCH-02: company-konstant, einmal vor der Buyer-
+        # Schleife normalisiert (gleiches Muster wie target_valuation oben).
+        # AnalyzeRequest.target_stage ist ein Pydantic-Literal in snake_case
+        # ('seed'|'series_a'|'series_b'|'series_c'|'series_d_plus'|'public') —
+        # company['funding_stage'] kommt aber im DB-Anzeigeformat ("Series B").
+        # Bisher unmaskiert durchgereicht → ValidationError für JEDEN Buyer bei
+        # JEDER Company mit nicht-normalisiertem Rohwert (live bestätigt:
+        # Brightmark, alle 4 Buyer). Bewusst NICHT score_calculator.
+        # _resolve_funding_stage() wiederverwendet — deren Zielvokabular mapped
+        # Listed auf "listed", das ist kein gültiges AnalyzeRequest-Literal
+        # (nur "public"); andere Konsumenten, anderes Vokabular, gleiche Quelle.
+        _VALID_TARGET_STAGES = {"seed", "series_a", "series_b", "series_c", "series_d_plus", "public"}
+        if is_listed:
+            _target_stage_norm = "public"
+        else:
+            _raw_stage = (company.get("funding_stage") or "").strip().lower().replace(" ", "_").replace("-", "_")
+            _target_stage_norm = _raw_stage if _raw_stage in _VALID_TARGET_STAGES else "series_b"
+
         for buyer in buyers:
             mcap = buyer.get("market_cap_usd_bn")
             if not mcap:
@@ -3490,7 +3508,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     buyer_cash_usd_bn=float(_cash),
                     buyer_debt_ebitda=float(_debt_ebitda),
                     target_funding_usd_mn=company.get("funding_total_usd_mn") or 50,
-                    target_stage=company.get("funding_stage") or "series_b",
+                    target_stage=_target_stage_norm,
                     target_vertical=company.get("industry"),   # VALUATION-SSOT-01 Vertical-Korrektur
                     tech_readiness_override=buyer_tr,
                 )
