@@ -38,6 +38,16 @@ HAI_API_KEY  = os.environ.get("HAI_API_KEY", "")
 HAI_BASE_URL = "https://handelsregister.ai/api/v1/fetch-organization"
 HAI_TIMEOUT  = 20.0  # Sekunden
 
+
+class HAIQuotaExceeded(Exception):
+    """
+    HAI-GATE-01 Nachbesserung (S82): Credits erschöpft (HTTP 402) ist ein Account-/Billing-
+    Zustand, keine Aussage über die Company. Muss von "echtem Miss" unterschieden werden
+    können, sonst wird hai_enriched_at fälschlich gestempelt → Company bekommt nie wieder
+    einen Retry, auch nach Top-up.
+    """
+    pass
+
 # Feature-Set Basis-Call (13 Credits)
 HAI_FEATURES_BASE = [
     "financial_kpi",    # +1 Credit: Revenue, Net Income, Employees historisch
@@ -80,7 +90,7 @@ async def fetch_hai_organization(company_name: str) -> dict | None:
             )
             if resp.status_code == 402:
                 logger.warning("HAI-01: Insufficient Credits für %s", company_name)
-                return None
+                raise HAIQuotaExceeded(f"HAI-01: Credits erschöpft bei Call für {company_name}")
             if resp.status_code == 404:
                 logger.info("HAI-01: Kein Treffer für %s", company_name)
                 return None
@@ -96,6 +106,8 @@ async def fetch_hai_organization(company_name: str) -> dict | None:
                 company_name, data.get("entity_id"), data.get("name"),
             )
             return data
+    except HAIQuotaExceeded:
+        raise  # nicht in die generische Fehlerbehandlung durchfallen lassen
     except Exception as e:
         logger.warning("HAI-01: fetch_hai_organization failed für %s: %s", company_name, e)
         return None
@@ -299,7 +311,18 @@ async def enrich_hai_de_private(
         write_headcount_snapshot,
     )
 
-    data = await fetch_hai_organization(company_name)
+    try:
+        data = await fetch_hai_organization(company_name)
+    except HAIQuotaExceeded:
+        # HAI-GATE-01 Nachbesserung: Credits erschöpft = Account-Zustand, nicht Company-
+        # Zustand. NICHT stempeln, sonst nie wieder Retry auch nach Top-up. Laut sichtbar
+        # loggen (ERROR), das ist ein operatives Problem, kein Routine-Miss.
+        logger.error(
+            "HAI-01: Credits erschöpft bei %s — hai_enriched_at NICHT gestempelt, "
+            "Retry nach Top-up automatisch möglich", company_name,
+        )
+        return False
+
     if not data:
         # HAI-GATE-01: nur stempeln wenn wirklich ein Versuch stattfand (API-Key vorhanden).
         # Fehlt der Key, ist das ein Config-Problem, kein "Company hat keine HR-Daten" —
