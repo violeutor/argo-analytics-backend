@@ -2535,8 +2535,12 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
     # Nur beim Cold Path (neue Company), nur wenn DE erkannt, nie im Rolling Refresh.
     # Schreibt: KPI-Zeitreihen + Headcount-Snapshots + Ownership (Gesellschafter + GF)
     # Kosten: 13 Credits pro Call — gated auf Cold Path, kein proaktiver Trigger.
+    # HAI-GATE-01 (S82): eigenes Flag statt _enrichment_fields_complete — das ist ein
+    # Identitäts-/Klassifikations-Flag (category+industry), ändert sich praktisch nie
+    # und hat mit "wurde HAI je versucht" nichts zu tun. Companies, die früh klassifiziert
+    # wurden, liefen sonst NIE durch HAI (Enpal-Fall, S82 Log-Diagnose).
     if (
-        not _enrichment_fields_complete   # Cold Path — neue/unvollständige Company
+        not company.get("hai_enriched_at")  # HAI noch nie versucht für diese Company
         and not is_listed                 # nur Private
         and company_id                   # company_id muss bekannt sein
         and _is_likely_german_company    # DE erkannt (Flag aus Phase A)

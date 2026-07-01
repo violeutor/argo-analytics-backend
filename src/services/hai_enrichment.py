@@ -301,21 +301,28 @@ async def enrich_hai_de_private(
 
     data = await fetch_hai_organization(company_name)
     if not data:
+        # HAI-GATE-01: nur stempeln wenn wirklich ein Versuch stattfand (API-Key vorhanden).
+        # Fehlt der Key, ist das ein Config-Problem, kein "Company hat keine HR-Daten" —
+        # sonst bleibt der Skip nach Key-Fix dauerhaft blockiert.
+        if HAI_API_KEY:
+            upsert_company_enrichment(company_id, {"hai_enriched_at": datetime.utcnow().isoformat()})
+            logger.info("HAI-01: kein Treffer/Fehler für %s — hai_enriched_at gestempelt (kein Retry-Loop)", company_name)
         return False
 
     db = get_supabase()
 
     # 1. Basisdaten → companies
     base = parse_hai_base(data)
-    if base:
-        # Felder die companies kennt (hai_entity_id + legal_form ggf. nicht in Schema)
-        companies_payload = {
-            k: v for k, v in base.items()
-            if k in {"headquarters", "website", "founding_year"}
-        }
-        if companies_payload:
-            upsert_company_enrichment(company_id, companies_payload)
-            logger.info("HAI-01: Basisdaten geschrieben für %s: %s", company_name, list(companies_payload.keys()))
+    # Felder die companies kennt (hai_entity_id + legal_form ggf. nicht in Schema).
+    # HAI-GATE-01: hai_enriched_at IMMER stempeln bei erfolgtem Versuch — unabhängig
+    # davon, ob base überhaupt Felder liefert (Gate darf nicht an Datenqualität hängen).
+    companies_payload = {
+        k: v for k, v in base.items()
+        if k in {"headquarters", "website", "founding_year"}
+    }
+    companies_payload["hai_enriched_at"] = datetime.utcnow().isoformat()
+    upsert_company_enrichment(company_id, companies_payload)
+    logger.info("HAI-01: Basisdaten geschrieben für %s: %s", company_name, list(companies_payload.keys()))
 
     # 2. KPI-Zeitreihen → kpi_timeseries
     kpi_rows = parse_hai_kpi(data, company_id)
