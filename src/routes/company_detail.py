@@ -3515,7 +3515,15 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                     execution_warning=scores.srr.execution_warning,
                 ))
             except Exception as e:
-                logger.debug("Scoring failed %s/%s: %s", company_name, buyer["name"], e)
+                # BUYER-SCORING-SILENT-01: war logger.debug — bei INFO-Log-Level
+                # (Produktionsstandard, siehe alle bisherigen Render-Logs heute)
+                # verschwand jede Exception hier spurlos. Exakt das Muster von
+                # is_cache_valid (BUYER-CACHE-PARSE-01) und target_valuation_obj
+                # (COMPANY-404-WRITE-01) — Fail-loud statt stillem continue.
+                logger.warning(
+                    "Scoring failed %s/%s: %s", company_name, buyer.get("name", "?"), e,
+                    exc_info=True,
+                )
 
         scorings.sort(key=lambda x: -x.deal_success_score)
 
