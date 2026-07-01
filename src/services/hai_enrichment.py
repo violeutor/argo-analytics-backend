@@ -9,8 +9,13 @@ One-Click Cold Path für deutsche Privatunternehmen:
                                           &feature=shareholders
                                           &ai_search=on-default
 
-Kosten: 5 (Basis) + 1 (financial_kpi) + 2 (related_persons) + 5 (shareholders)
-      = 13 Credits pro Call
+Kosten: NICHT fix 13 Credits/Call — nur der Basispreis für einfache Fälle
+      (5 Basis + 1 financial_kpi + 2 related_persons + 5 shareholders = 13).
+      S82: Bei AGs real 28 Credits beobachtet (mehr eintragungspflichtige Personen:
+      Vorstand, Aufsichtsrat, ggf. mehr Aktionäre als bei GmbH-Gesellschafterliste).
+      Tatsächliche Kosten offenbar komplexitätsabhängig auf handelsregister.ai-Seite —
+      13 Credits NICHT als Budget-Grundlage verwenden, bis wir eine verlässlichere
+      Schätzung haben (CREDIT-BUDGET-01, offen).
 
 Schreibt in:
   - companies          → Basisdaten (HQ, Website, Rechtsform, Gründungsjahr)
