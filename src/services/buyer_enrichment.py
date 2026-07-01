@@ -117,13 +117,31 @@ def is_cache_valid(buyers: list[dict]) -> bool:
     """
     if not buyers:
         return False
+    gen_at = buyers[0].get("generated_at")
+    if not gen_at:
+        return False
     try:
-        gen_at = buyers[0].get("generated_at")
-        if not gen_at:
-            return False
-        gen_dt = datetime.fromisoformat(gen_at.replace("Z", "+00:00"))
+        raw = str(gen_at).replace("Z", "+00:00").replace(" ", "T", 1)
+        # BUYER-CACHE-PARSE-01: Postgres liefert Offsets teils als 2-stelliges
+        # "+00" statt "+00:00" — datetime.fromisoformat() (Python <3.11) lehnt
+        # das mit ValueError ab. Vorher landete das SILENT im except-Block
+        # unten und der Cache galt für IMMER als ungültig, egal wie frisch die
+        # Daten wirklich waren (bestätigt: 20 Tage alte Kanten bei 30d-TTL,
+        # trotzdem als invalid behandelt → BackgroundTask-Loop ohne Wirkung).
+        raw = re.sub(r'([+-]\d{2})$', r'\1:00', raw)
+        gen_dt = datetime.fromisoformat(raw)
+        if gen_dt.tzinfo is None:
+            gen_dt = gen_dt.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - gen_dt).days < _CACHE_TTL_DAYS
-    except Exception:
+    except Exception as e:
+        # Fail-loud statt stillem False: falls die Normalisierung oben doch
+        # nicht den echten Fehler trifft, sehen wir hier sofort WELCHES Format
+        # tatsächlich ankommt, statt erneut zu raten.
+        logger.warning(
+            "is_cache_valid: Parsing fehlgeschlagen für generated_at=%r (%s) — "
+            "Cache wird als ungültig behandelt, Re-Generierung erneut ausgelöst",
+            gen_at, e,
+        )
         return False
 
 
