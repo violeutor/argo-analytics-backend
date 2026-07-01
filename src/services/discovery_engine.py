@@ -383,7 +383,12 @@ async def _fetch_esma_priii_documents(
     try:
         resp = await client.get(
             _ESMA_PRIII_SELECT,
-            params={"q": "*:*", "rows": rows, "wt": "json", "sort": "id desc"},
+            # ESMA-FL-PARAM-01: OHNE fl=* liefert Solr nur den im Request-
+            # Handler des Cores hinterlegten Default-Feldsatz — genau das
+            # erklärte den bisherigen Befund (nur id/_version_/timestamp
+            # in der Rohantwort, keine Issuer-Felder). fl=* zwingt den
+            # vollen Stored-Field-Satz, unabhängig vom Core-Default.
+            params={"q": "*:*", "rows": rows, "wt": "json", "sort": "id desc", "fl": "*"},
             timeout=15.0,
         )
         if resp.status_code != 200:
@@ -893,7 +898,15 @@ async def run_discovery_pipeline() -> dict:
         "dry_run": DRY_RUN,
         "ipo_intent_written": 0, "funding_written": 0,
         "ipo_intent_seen": 0, "funding_seen": 0,
-        "rejected_sector": 0, "rejected_dedupe": 0,
+        # STATS-ATTRIBUTION-01: vorher ein geteiltes rejected_sector/
+        # rejected_dedupe über BEIDE Töpfe — machte nicht rekonstruierbar,
+        # wie viele Rejections aus IPO-Intent vs. Funding kamen. Jetzt pro
+        # Topf getrennt + Fallback-Summe für Rückwärts-Kompatibilität mit
+        # bestehenden Log-Auswertungen.
+        "ipo_intent_rejected_sector": 0, "ipo_intent_rejected_dedupe": 0,
+        "ipo_intent_skipped_cap": 0,
+        "funding_rejected_sector": 0, "funding_rejected_dedupe": 0,
+        "funding_skipped_cap": 0,
         # EU-NEWS-FUNDING-GRANULARITY-01: unterscheidet, ob ein EU-News-Item
         # am EUR-Floor oder an der Claude-Haiku-Namensextraktion scheitert —
         # vorher beides im selben "funding_seen=0" nicht unterscheidbar.
@@ -934,15 +947,20 @@ async def run_discovery_pipeline() -> dict:
 
         stats["ipo_intent_seen"] = len(ipo_intent_candidates)
 
-        for cand in ipo_intent_candidates:
+        for idx, cand in enumerate(ipo_intent_candidates):
             if stats["ipo_intent_written"] >= DAILY_CAP_PER_POT:
+                # STATS-ATTRIBUTION-01: Cap erreicht ist by-design (Decke,
+                # kein Soll) — aber ohne diesen Zähler sehen die restlichen,
+                # nie evaluierten Kandidaten in den Stats wie spurloser
+                # Datenverlust aus statt wie beabsichtigtes Cap-Verhalten.
+                stats["ipo_intent_skipped_cap"] += len(ipo_intent_candidates) - idx
                 break
             if _is_known(cand["name"], known_normalized):
-                stats["rejected_dedupe"] += 1
+                stats["ipo_intent_rejected_dedupe"] += 1
                 continue
             sector = await _classify_sector(client, cand["name"], cand["context"])
             if sector is None:
-                stats["rejected_sector"] += 1
+                stats["ipo_intent_rejected_sector"] += 1
                 continue
             identity_confidence, resolved = await _identity_gate(client, cand["name"])
 
@@ -1016,15 +1034,16 @@ async def run_discovery_pipeline() -> dict:
 
         stats["funding_seen"] = len(funding_candidates)
 
-        for cand in funding_candidates:
+        for idx, cand in enumerate(funding_candidates):
             if stats["funding_written"] >= DAILY_CAP_PER_POT:
+                stats["funding_skipped_cap"] += len(funding_candidates) - idx
                 break
             if _is_known(cand["name"], known_normalized):
-                stats["rejected_dedupe"] += 1
+                stats["funding_rejected_dedupe"] += 1
                 continue
             sector = await _classify_sector(client, cand["name"], cand["context"])
             if sector is None:
-                stats["rejected_sector"] += 1
+                stats["funding_rejected_sector"] += 1
                 continue
             identity_confidence, resolved = await _identity_gate(client, cand["name"])
 
