@@ -182,6 +182,18 @@ async def ensure_peers(
         peer_id, is_new = await _resolve_or_create_peer(db, peer_name, name_to_id, company)
         if not peer_id:
             continue
+        # BUG-34 (Erweiterung, Session 83): der Name-Guard oben fängt nur exakte
+        # String-Treffer. Liefert Claude eine Namensvariante (z.B. "Watershed
+        # Climate" statt "Watershed"), matched der String-Vergleich nicht — aber
+        # _resolve_or_create_peer kann trotzdem per Fuzzy-Match auf dieselbe
+        # bestehende Company-Zeile zurückfallen. Deshalb zusätzlich auf die
+        # tatsächlich aufgelöste ID prüfen, nicht nur auf den Rohnamen.
+        if peer_id == company.get("id"):
+            logger.warning(
+                "Self-reference (ID-Match) übersprungen: Claude-Name '%s' löste auf Subject '%s' selbst auf",
+                peer_name, company_name,
+            )
+            continue
         resolved_ids.append(peer_id)
         name_to_id[peer_name.lower()] = peer_id
         if is_new:
