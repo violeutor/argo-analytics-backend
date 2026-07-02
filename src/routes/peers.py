@@ -75,6 +75,12 @@ class PeerCompany(BaseModel):
     market_score: float | None = None
     # R-10: Positioning note (Claude-generiert, relativ zu Subject Company)
     positioning_note: str | None = None
+    # PEER-RELATION-01: strukturierte Sektornähe statt nur Freitext — Claude
+    # klassifiziert ohnehin implizit für die positioning_note, hier explizit
+    # gemacht für Sortierung/Gruppierung im Frontend.
+    # direct = gleiche Technologie/Zielmarkt · adjacent = angrenzend, überlappender
+    # Markt oder Kunde · analog = anderes Feld, vergleichbares Geschäftsmodell/Stage
+    relation: str | None = None
 
 
 class PeerBenchmark(BaseModel):
@@ -133,12 +139,17 @@ async def ensure_peers(
     company_id   = company.get("id")
     company_name = company.get("name", "")
     if not company_id:
-        return {"resolved_ids": [], "peer_notes": {}, "generated_at": None, "from_cache": False}
+        return {"resolved_ids": [], "peer_notes": {}, "peer_relations": {},
+                "generated_at": None, "from_cache": False}
 
     # Cache prüfen
-    peers_resolved = company.get("peers_resolved") or []
-    generated_at   = company.get("peers_generated_at")
-    peers_context  = company.get("peers_context") or {}
+    peers_resolved  = company.get("peers_resolved") or []
+    generated_at    = company.get("peers_generated_at")
+    peers_context   = company.get("peers_context") or {}
+    # PEER-RELATION-01: eigene Spalte statt peers_context umzuformen — bestehende
+    # gecachte peers_context-Werte (reiner String je Peer) bleiben unangetastet,
+    # kein Migrations-/Parsing-Sonderfall für altes vs. neues Format nötig.
+    peers_relations = company.get("peers_relations") or {}
     cache_valid    = False
     if peers_resolved and generated_at:
         try:
@@ -148,12 +159,14 @@ async def ensure_peers(
             pass
     if cache_valid and peers_resolved:
         return {"resolved_ids": peers_resolved, "peer_notes": peers_context,
+                "peer_relations": peers_relations,
                 "generated_at": generated_at, "from_cache": True}
 
-    # Claude generiert Peer-Namen + Positioning Notes
-    peer_names, peer_notes = await _claude_generate_peers(company)
+    # Claude generiert Peer-Namen + Positioning Notes + Relation
+    peer_names, peer_notes, peer_relations = await _claude_generate_peers(company)
     if not peer_names:
-        return {"resolved_ids": [], "peer_notes": {}, "generated_at": None, "from_cache": False}
+        return {"resolved_ids": [], "peer_notes": {}, "peer_relations": {},
+                "generated_at": None, "from_cache": False}
 
     # Peers in DB auflösen / anlegen
     all_companies = fetch_companies(limit=500)
@@ -186,20 +199,22 @@ async def ensure_peers(
             if not _has_score:
                 await _schedule_or_await(background_tasks, _enrich_new_peer, peer_id, peer_name)
 
-    # peers_resolved + peers_context + generated_at in companies schreiben
+    # peers_resolved + peers_context + peers_relations + generated_at schreiben
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         db.table("companies").update({
             "peers":              peer_names,
             "peers_resolved":     resolved_ids,
             "peers_generated_at": now_iso,
-            "peers_context":      peer_notes,   # {peer_name: positioning_note}
+            "peers_context":      peer_notes,       # {peer_name: positioning_note}
+            "peers_relations":    peer_relations,   # {peer_name: direct|adjacent|analog}
         }).eq("id", company_id).execute()
         logger.info("peers_resolved + context geschrieben: %s → %d peers", company_name, len(resolved_ids))
     except Exception as e:
         logger.warning("peers_resolved upsert failed for %s: %s", company_name, e)
 
     return {"resolved_ids": resolved_ids, "peer_notes": peer_notes,
+            "peer_relations": peer_relations,
             "generated_at": now_iso, "from_cache": False}
 
 
@@ -231,7 +246,7 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
     return PeersResponse(
         status="ready",
         company_name=company_name,
-        peers=[_to_peer_model(p, result["peer_notes"]) for p in peer_rows],
+        peers=[_to_peer_model(p, result["peer_notes"], result["peer_relations"]) for p in peer_rows],
         benchmark=_build_benchmark(company, peer_rows),
         generated_at=result["generated_at"],
         from_cache=result["from_cache"],
@@ -240,10 +255,11 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
 
 # ── Claude Peer-Generierung ───────────────────────────────────────────────────
 
-async def _claude_generate_peers(company: dict) -> tuple[list[str], dict[str, str]]:
+async def _claude_generate_peers(company: dict) -> tuple[list[str], dict[str, str], dict[str, str]]:
     """
-    Claude generiert 4-5 direkte Wettbewerber + Positioning Note je Peer.
-    Gibt (peer_names, {peer_name: positioning_note}) zurück.
+    Claude generiert 4-5 Wettbewerber/Vergleichs-Companies + Positioning Note +
+    strukturierte Relation (direct/adjacent/analog) je Peer.
+    Gibt (peer_names, {peer_name: positioning_note}, {peer_name: relation}) zurück.
     """
     api_key = settings.anthropic_api_key
     if not api_key:
@@ -276,14 +292,18 @@ Beschreibung: {company.get('description') or company.get('summary') or '—'}
 Investment Path: {company.get('investment_path') or '—'}
 
 Regeln:
-- Nur direkte Wettbewerber (gleiche Technologie / gleicher Zielmarkt)
 - Bevorzuge Companies ähnlicher Größe und Stage
 - Mische US + Europa wenn relevant
 - Keine Konglomerate oder reine Investoren
-- positioning_note: 1 präziser Satz — warum direkter Wettbewerber, worin liegt der Kernunterschied zu {subject}
+- positioning_note: 1 präziser Satz — warum Wettbewerber/vergleichbar, worin liegt der Kernunterschied zu {subject}
+- relation: genau einer von drei Werten —
+  "direct" = gleiche Technologie UND gleicher Zielmarkt, austauschbares Angebot
+  "adjacent" = überlappender Markt oder Kunde, aber andere Technologie/Teilsegment
+  "analog" = anderes Feld, aber vergleichbares Geschäftsmodell/Stage (Referenzpunkt, kein echter Wettbewerber)
+- Mische nicht nur "direct" — wenn es für {subject} weniger als 3 echte direkte Wettbewerber gibt, ergänze bewusst adjacent/analog statt sie zu erzwingen
 
 Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
-[{{"name": "Company Name", "positioning_note": "Direkter Wettbewerber weil ... — unterscheidet sich von {subject} durch ..."}}]"""
+[{{"name": "Company Name", "relation": "direct", "positioning_note": "Direkter Wettbewerber weil ... — unterscheidet sich von {subject} durch ..."}}]"""
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -311,15 +331,18 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
 
         names: list[str] = []
         notes: dict[str, str] = {}
+        relations: dict[str, str] = {}
         seen: set[str] = set()
+        _VALID_RELATIONS = {"direct", "adjacent", "analog"}
 
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
-                    n    = (item.get("name") or "").strip()
-                    note = (item.get("positioning_note") or "").strip()
+                    n        = (item.get("name") or "").strip()
+                    note     = (item.get("positioning_note") or "").strip()
+                    relation = (item.get("relation") or "").strip().lower()
                 elif isinstance(item, str):
-                    n, note = item.strip(), ""
+                    n, note, relation = item.strip(), "", ""
                 else:
                     continue
                 if n and n.lower() not in seen:
@@ -327,16 +350,27 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
                     names.append(n)
                     if note:
                         notes[n] = note
+                    # Fail-loud statt stillem Falsch-Wert: unbekannte/fehlende
+                    # Relation wird NICHT geraten (z.B. immer "adjacent"),
+                    # sondern bleibt None — Frontend zeigt das als "unklassifiziert"
+                    # statt eine falsche Sicherheit vorzutäuschen.
+                    if relation in _VALID_RELATIONS:
+                        relations[n] = relation
+                    elif relation:
+                        logger.warning(
+                            "Claude Peer-Gen: unbekannter relation-Wert '%s' für %s (Subject %s) — verworfen",
+                            relation, n, subject,
+                        )
                 if len(names) >= 5:
                     break
 
         logger.info("Claude Peers für %s: %s", subject, names)
-        return names, notes
+        return names, notes, relations
 
     except Exception as e:
         logger.warning("_claude_generate_peers failed: %s", e)
 
-    return [], {}
+    return [], {}, {}
 
 
 # ── Peer auflösen / anlegen ───────────────────────────────────────────────────
@@ -442,6 +476,15 @@ async def _resolve_or_create_peer(
                 "category":            source_company.get("category"),
                 "region":              source_company.get("region"),
                 "identity_confidence": identity_confidence,
+                # CATEGORY-INHERIT-01: markiert category/industry explizit als
+                # geerbten Platzhalter, nicht als echten Wert — die spätere
+                # Anreicherung (_enrich_new_peer) darf ihn überschreiben, auch
+                # wenn das Feld technisch schon "gefüllt" ist. Ohne dieses Flag
+                # verhindert der reine NULL-Check in _enrich_new_peer, dass die
+                # echte, peer-eigene Kategorie je geschrieben wird (derselbe
+                # Fehlertyp wie HAI-GATE-01, S82: Feldzustand als Ersatz für ein
+                # eigenständiges Signal missbraucht).
+                "category_inherited":  True,
             }
             if resolved_ticker:
                 payload["ticker"] = resolved_ticker
@@ -563,14 +606,26 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
                 upsert_payload["exchange"] = enriched.exchange
 
         # category / industry aus Tag-Inferenz
+        # CATEGORY-INHERIT-01: Guard prüft jetzt category_inherited statt nur
+        # NULL — eine beim Anlegen kopierte Kategorie (Startwert von der
+        # Source-Company) blockiert die echte, peer-eigene Klassifizierung
+        # nicht mehr. Legacy-Rows ohne das Flag (vor diesem Fix angelegt,
+        # category_inherited IS NULL) werden konservativ wie "nicht geerbt"
+        # behandelt — die Reset-Migration holt diese separat nach.
         inferred_cat = enriched.category
         inferred_ind = enriched.industry
         if not inferred_cat and enriched.tags:
             inferred_cat, inferred_ind = infer_category_industry(enriched.tags)
-        if inferred_cat and not peer_record.get("category"):
+        _cat_was_inherited = bool(peer_record.get("category_inherited"))
+        if inferred_cat and (not peer_record.get("category") or _cat_was_inherited):
             upsert_payload["category"] = inferred_cat
-        if inferred_ind and not peer_record.get("industry"):
+        if inferred_ind and (not peer_record.get("industry") or _cat_was_inherited):
             upsert_payload["industry"] = inferred_ind
+        # Sobald eine echte Kategorie geschrieben wird, ist sie nicht mehr
+        # "nur geerbt" — Flag zurücksetzen, sonst würde eine spätere,
+        # möglicherweise schlechtere Neu-Anreicherung sie wieder überschreiben.
+        if "category" in upsert_payload or "industry" in upsert_payload:
+            upsert_payload["category_inherited"] = False
 
         # None-Werte rausfiltern — kein versehentliches Überschreiben mit null
         upsert_payload = {k: v for k, v in upsert_payload.items() if v is not None}
@@ -721,12 +776,19 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
 
         market_data = _fetch_md(peer_id) or {}
 
+        # PEERS-REWORK-01: compute_all_scores() kennt kein 'buyers'-Kwarg — der
+        # echte Parameter heißt 'ma_aggregate' (verifiziert gegen den Aufruf in
+        # company_detail.py). Peers durchlaufen die Buyer-Enrichment-Engine nicht,
+        # deshalb hier derselbe "kein Aggregat vorhanden"-Fallback, den
+        # compute_strategic_score() auch für Companies ohne Buyer-Match nutzt —
+        # kein Sonderfall, sondern der bereits vorgesehene neutrale Default.
         score_result = compute_all_scores(
             company=peer_company,
             market_data=market_data,
             signals=[],
             ownership_entries=[],
-            buyers=[],
+            ma_aggregate={"aggregate_score": None, "basis": "none",
+                          "deals_considered": 0, "feasible_count": 0, "contributors": []},
             value_drivers=[],
         )
         upsert_company_scores(peer_id, score_result.to_dict())
@@ -793,22 +855,31 @@ _STAGE_LABEL: dict[str, str] = {
 }
 
 
-def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> PeerCompany:
+def _to_peer_model(
+    row: dict,
+    peers_context: dict[str, str] | None = None,
+    peers_relations: dict[str, str] | None = None,
+) -> PeerCompany:
     raw_stage = row.get("funding_stage") or ""
     db_name   = row["name"]
 
     # Positioning-Note Lookup: exakter Match → normalisiert → leer
     # Normalisierung: lowercase + strip — verhindert stille Datenverluste wenn
     # Claude-generierter Name marginal vom DB-Namen abweicht
-    note = None
-    if peers_context:
-        note = peers_context.get(db_name)
-        if note is None:
-            db_name_norm = db_name.lower().strip()
-            for ctx_name, ctx_note in peers_context.items():
-                if ctx_name.lower().strip() == db_name_norm:
-                    note = ctx_note
-                    break
+    def _lookup(ctx: dict[str, str] | None) -> str | None:
+        if not ctx:
+            return None
+        val = ctx.get(db_name)
+        if val is not None:
+            return val
+        db_name_norm = db_name.lower().strip()
+        for ctx_name, ctx_val in ctx.items():
+            if ctx_name.lower().strip() == db_name_norm:
+                return ctx_val
+        return None
+
+    note     = _lookup(peers_context)
+    relation = _lookup(peers_relations)
 
     return PeerCompany(
         id=row["id"],
@@ -840,6 +911,7 @@ def _to_peer_model(row: dict, peers_context: dict[str, str] | None = None) -> Pe
         financial_score=row.get("financial_score"),
         market_score=row.get("market_score"),
         positioning_note=note,
+        relation=relation,
     )
 
 
