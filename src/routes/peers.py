@@ -188,7 +188,22 @@ async def ensure_peers(
             # Neue Company: vollständiges Enrichment
             await _schedule_or_await(background_tasks, _enrich_new_peer, peer_id, peer_name)
         else:
-            # Bestehende Company ohne Score: Enrichment nachholen (PEERS-01)
+            # Bestehende Company: zwei unabhängige Nachhol-Gründe.
+            # (1) PEERS-01: kein Score → volles Enrichment nötig.
+            # (2) CATEGORY-INHERIT-01: Score vorhanden, aber category_inherited
+            #     noch true → NUR die schlanke Kategorie-Korrektur, nicht den
+            #     ganzen Zyklus (TAM/Financials/Scoring sind bereits korrekt,
+            #     das nochmal zu laufen wäre unnötige DDG/yfinance/Anthropic-Last).
+            # Macht künftige Fälle dieses Bugmusters selbstheilend, sobald
+            # irgendeine Subject-Company ihre Peer-Liste refresht — unabhängig
+            # vom einmaligen Backfill für den aktuellen Bestand.
+            try:
+                _peer_check = db.table("companies").select("category_inherited").eq(
+                    "id", peer_id
+                ).limit(1).execute()
+                _cat_inherited = bool((_peer_check.data or [{}])[0].get("category_inherited"))
+            except Exception:
+                _cat_inherited = False
             try:
                 _score_check = db.table("company_scores").select("composite_score").eq(
                     "company_id", peer_id
@@ -198,6 +213,8 @@ async def ensure_peers(
                 _has_score = False
             if not _has_score:
                 await _schedule_or_await(background_tasks, _enrich_new_peer, peer_id, peer_name)
+            elif _cat_inherited:
+                await _schedule_or_await(background_tasks, _backfill_category_only, peer_id, peer_name)
 
     # peers_resolved + peers_context + peers_relations + generated_at schreiben
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -251,6 +268,43 @@ async def get_peers(name: str, background_tasks: BackgroundTasks) -> PeersRespon
         generated_at=result["generated_at"],
         from_cache=result["from_cache"],
     )
+
+
+# ── CATEGORY-INHERIT-01: einmaliger Backfill-Trigger ─────────────────────────
+# Session 83: für den aktuellen Bestand (173 per Reset markierte Peers,
+# source='peer_generated'). Kein Cron, kein Dauerbetrieb. Nach bestätigtem
+# Abschluss (Monitoring-Query unten liefert 0) kann dieser Block wieder
+# entfernt werden — bewusst NICHT dauerhaft im Router lassen, ist reine
+# Migrationshilfe, kein Produktfeature.
+#
+# Einfacher Token-Schutz statt vollem Auth-Wiring: das ist ein POST-Endpoint
+# mit echtem Effekt (Netzwerk-Calls, DB-Writes für bis zu ~200 Companies) —
+# ungeschützt öffentlich erreichbar wäre ein Einfallstor für versehentliche
+# oder böswillige Wiederholungsaufrufe. Token ist hart codiert, ausreichend
+# für den kurzen Zeitraum zwischen Deploy und Backfill-Abschluss, KEIN Ersatz
+# für echte Auth — Andreas' eigener Zugriff via curl direkt nach Deploy.
+_BACKFILL_TOKEN = "s83-category-backfill-x7k2"
+
+
+class BackfillResult(BaseModel):
+    status: str
+    queued: int
+
+
+@router.post("/admin/peers/backfill-category", response_model=BackfillResult)
+async def backfill_category_inherited(
+    background_tasks: BackgroundTasks, token: str, limit: int = 250,
+) -> BackfillResult:
+    if token != _BACKFILL_TOKEN:
+        raise HTTPException(status_code=403, detail="Ungültiges Token.")
+
+    db = get_supabase()
+    rows = db.table("companies").select("id, name").eq("category_inherited", True).limit(limit).execute()
+    targets = rows.data or []
+    for row in targets:
+        background_tasks.add_task(_backfill_category_only, row["id"], row["name"])
+    logger.info("CATEGORY-INHERIT-01 Backfill: %d Companies queued", len(targets))
+    return BackfillResult(status="queued", queued=len(targets))
 
 
 # ── Claude Peer-Generierung ───────────────────────────────────────────────────
@@ -511,6 +565,60 @@ async def _resolve_or_create_peer(
             break
 
     return None, False
+
+
+# ── Background: schlanker Kategorie-Backfill (CATEGORY-INHERIT-01) ──────────
+
+async def _backfill_category_only(peer_id: str, peer_name: str) -> None:
+    """
+    CATEGORY-INHERIT-01 · Session 83: leichte Variante von _enrich_new_peer
+    Stufe 1 — nur Identität/Kategorie neu ermitteln, KEIN Financials-/TAM-/
+    Market-/Scoring-Durchlauf. Für Companies gedacht, die bereits einen validen
+    Score haben und nur wegen der geerbten Platzhalter-Kategorie betroffen
+    sind — der volle Zyklus wäre unnötige DDG/yfinance/Anthropic-Last für
+    Daten, die schon korrekt sind.
+    """
+    try:
+        from src.services.enrichment import enrich_company, infer_category_industry
+        from src.integrations.supabase import upsert_company_enrichment
+
+        db = get_supabase()
+        peer_row_res = db.table("companies").select("*").eq("id", peer_id).limit(1).execute()
+        peer_record = (peer_row_res.data or [{}])[0]
+        if not peer_record:
+            return
+
+        enriched = await enrich_company(peer_record.get("name") or peer_name, company_record=peer_record)
+        if not enriched:
+            logger.warning("CATEGORY-INHERIT-01 Backfill: kein Enrichment-Ergebnis für %s", peer_name)
+            return
+
+        inferred_cat = enriched.category
+        inferred_ind = enriched.industry
+        if not inferred_cat and enriched.tags:
+            inferred_cat, inferred_ind = infer_category_industry(enriched.tags)
+
+        if inferred_cat:
+            upsert_payload: dict = {"category": inferred_cat, "category_inherited": False}
+            if inferred_ind:
+                upsert_payload["industry"] = inferred_ind
+            upsert_company_enrichment(peer_id, upsert_payload)
+            logger.info(
+                "CATEGORY-INHERIT-01 Backfill: %s → category=%s industry=%s",
+                peer_name, inferred_cat, inferred_ind,
+            )
+        else:
+            # Fail-loud statt still: kein Fund wird NICHT als Erfolg maskiert,
+            # category_inherited bleibt true — sichtbar in der Monitoring-Query,
+            # nächster natürlicher Besuch der Company-Seite versucht es erneut
+            # (R1-GUARD greift ohnehin, solange category NULL ist).
+            logger.warning(
+                "CATEGORY-INHERIT-01 Backfill: keine Kategorie ermittelbar für %s — Flag bleibt gesetzt",
+                peer_name,
+            )
+
+    except Exception as e:
+        logger.warning("CATEGORY-INHERIT-01 Backfill failed für %s: %s", peer_name, e)
 
 
 # ── Background: Enrichment für neue Peers ────────────────────────────────────
