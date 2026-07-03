@@ -22,14 +22,24 @@ nie gelockert um die Zahl zu erreichen:
                             NICHT efts.sec.gov (laut SEC-FAQ für Stichwortsuche
                             gedacht, kein "alle Filings eines Typs ohne Suchbegriff").
     (b) ESMA PRIII       — esma_registers_priii_documents Solr-Core (pan-EWR-
-                            Pendant zu S-1). Core-Name live verifiziert (S71-
-                            Recherche), EXAKTE Feldnamen NICHT — Sandbox kommt
-                            zwar an registers.esma.europa.eu ran, aber das
-                            Solr-Predefined-Query-Dokument war zu groß, um die
-                            PRIII-spezifische Feldtabelle vollständig zu laden.
-                            Dry-Run loggt deshalb die Roh-Keys der ersten Antwort
-                            (_log_unknown_schema) — der erste echte Render-Lauf
-                            liefert die fehlende Bestätigung quasi nebenbei.
+                            Pendant zu S-1). Core-Name UND Parent-Feldnamen
+                            jetzt gegen die offizielle A2A-Doku verifiziert
+                            (ESMA-SCHEMA-01, S84 — registers.esma.europa.eu/
+                            publication/helpApp, Abschnitt 11): Core ist
+                            Parent/Child (Block-Join), Query korrigiert auf
+                            {!parent which="type_s:parent"}. Issuer-Name sitzt
+                            auf separaten Child-Records (party_type="ISSR") —
+                            ob der Parent-Response ihn dennoch mitliefert, ist
+                            NICHT verifiziert (ESMA-SCHEMA-02, offen). Zusätzlich
+                            fehlte bisher jeder Header am Request (ESMA-HEADER-01,
+                            S84) — Diagnose-Fetches gegen denselben Endpoint
+                            schlugen von hier aus konsequent mit 400 fehl, auch
+                            bei q=*:*, was für einen UA-sensiblen WAF spricht.
+                            Dry-Run loggt weiterhin die Roh-Keys der ersten
+                            Antwort bei fehlendem Issuer-Namen (_log_unknown_
+                            schema) — der nächste Render-Lauf zeigt, ob Header+
+                            Query-Fix reichen oder ob ESMA-SCHEMA-02 (Child-Doc-
+                            Join/[child]-Transformer) nachgezogen werden muss.
 
   Funding-Topf:
     (c) EDGAR Form D/D-A — gleicher Index-Mechanismus wie (a). WICHTIG: die
@@ -77,9 +87,11 @@ Write (nur scharf, DISCOVERY_DRY_RUN=false):
 Cron-Slot: main.py, 03:45 UTC, vor Signal-Engine (04:00) — s. main.py-Patch.
 
 Offene Verifikation (bewusst nicht blockierend für den Dry-Run-Bau, s. MODUL06
-S71/S72): ESMA-PRIII-Feldnamen final, EDGAR-form.idx-Spaltentrennung am echten
-Live-File (Bot-Detection verhinderte den direkten Abruf aus der Sandbox; Doku-
-basierte Spalten-Semantik ist verifiziert, das exakte Whitespace-Layout nicht).
+S71/S72/S84): ESMA-SCHEMA-02 (liefert der korrigierte Parent-Query den Issuer-
+Namen mit, oder braucht es einen Child-Doc-Join — s. ESMA PRIII oben), EDGAR-
+form.idx-Spaltentrennung am echten Live-File (Bot-Detection verhinderte den
+direkten Abruf aus der Sandbox; Doku-basierte Spalten-Semantik ist verifiziert,
+das exakte Whitespace-Layout nicht).
 """
 
 from __future__ import annotations
@@ -135,6 +147,15 @@ _SEC_MIN_DELAY_S = 0.15   # ≈6.6 req/s — sicher unter dem 10-req/s-Limit
 _EDGAR_DAILY_INDEX_BASE = "https://www.sec.gov/Archives/edgar/daily-index"
 
 _ESMA_PRIII_SELECT = "https://registers.esma.europa.eu/solr/esma_registers_priii_documents/select"
+
+# ESMA-HEADER-01 (S84): Anders als der EDGAR-Client sendete dieser Call bisher
+# GAR KEINEN Header (kein User-Agent) — plausibelster Timeout-Verdächtiger
+# (Diagnose-Fetches gegen denselben Endpoint schlugen von hier aus konsequent
+# mit 400 fehl, selbst bei q=*:*; die menschliche Registers-UI zeigt zudem ein
+# Captcha-Cookie-Gate — beides spricht für einen WAF, der Requests ohne
+# plausiblen Absender abweist/verzögert statt sauber abzulehnen). Gleicher
+# deklarierter UA wie SEC, aus demselben Grund: ein Produkt, ein Absender.
+_ESMA_HEADERS = {"User-Agent": _SEC_USER_AGENT}
 
 _TC_FEED = "https://techcrunch.com/feed/"
 _GNEWS_BASE = "https://news.google.com/rss/search"
@@ -337,14 +358,24 @@ async def _fetch_form_d_amount(
 
 # ── ESMA PRIII ────────────────────────────────────────────────────────────────
 
-# Plausible Feldnamen-Kandidaten — ESMA-Register-Cores folgen durchgängig einem
-# Präfix-Schema (ae_, sn_, shs_, bm_ ...), für PRIII vermutlich "pd_" o.ä.
-# NICHT final verifiziert (s. Moduldocstring) — defensiv mehrere Kandidaten
-# probieren statt einen einzigen zu raten und bei Fehltreffer leer zu laufen.
+# ESMA-SCHEMA-01 (S84): Feldnamen jetzt gegen die offizielle A2A-Doku
+# (registers.esma.europa.eu/publication/helpApp, Abschnitt 11 "Prospectus III")
+# verifiziert statt geraten. Zwei Befunde:
+#   1. approval_filing_date ist der bestätigte Datumsfeld-Name auf den
+#      Parent-Docs (document_type-Einträgen) — an erster Stelle.
+#   2. issuer_name/issuer_lei/issuer_residency sitzen NICHT auf dem Parent-
+#      Doc, sondern auf separaten Child-Records (party_type="ISSR") — der
+#      Core ist Parent/Child (Block-Join), kein flaches Schema. issuer_name
+#      bleibt trotzdem als Kandidat stehen (ESMA-SCHEMA-02, S84, offen): falls
+#      der Parent-Response ihn NICHT liefert, bestätigt das die Child-Doc-
+#      Hypothese und _log_unknown_schema_once zeigt die echten Parent-Felder
+#      für den nächsten Schritt (Block-Join-Query oder [child]-Transformer,
+#      bewusst noch nicht gebaut — erst am echten Response-Schema verifizieren).
+#   Alte geratene Kandidaten bleiben als Fallback, falls die Doku veraltet ist.
 _ESMA_ISSUER_NAME_KEYS = (
-    "pd_issuerName", "issuerName", "issuer_name", "pd_issuer_name", "name",
+    "issuer_name", "pd_issuerName", "issuerName", "pd_issuer_name", "name",
 )
-_ESMA_DATE_KEYS = ("pd_approvalDate", "approvalDate", "approval_date", "pd_publicationDate")
+_ESMA_DATE_KEYS = ("approval_filing_date", "pd_approvalDate", "approvalDate", "approval_date", "pd_publicationDate")
 _ESMA_LOGGED_UNKNOWN_SCHEMA = False   # nur einmal pro Prozess loggen, nicht pro Kandidat
 
 
@@ -374,21 +405,39 @@ async def _fetch_esma_priii_documents(
 ) -> list[dict]:
     """
     Holt aktuelle PRIII-Dokumente (Prospekt-Genehmigungen, pan-EWR). Kein API-
-    Key, öffentlicher Solr-Select-Endpoint. Datumsfilter clientseitig statt via
-    `fq`, da der exakte Datumsfeld-Name nicht verifiziert ist (s. oben) — robuster
-    gegen einen falsch geratenen fq-Feldnamen, der sonst stillschweigend 0
-    Treffer liefern würde, statt einen Fehler zu zeigen.
+    Key, öffentlicher Solr-Select-Endpoint. Datumsfilter weiterhin clientseitig
+    statt via `fq` — approval_filing_date ist jetzt doku-bestätigt (s.o.), aber
+    das exakte Datumsformat/-verhalten im `fq`-Range-Syntax ist ungetestet;
+    client-seitig bleibt robuster gegen einen falsch formatierten fq, der sonst
+    still 0 Treffer liefern würde statt einen Fehler zu zeigen.
+
+    ESMA-SCHEMA-01 (S84): Core ist Parent/Child (Block-Join), kein flaches
+    Schema — Prospekt-Dokumente (document_type: URGN/REGN/SECN/SMRY/BPFT/
+    BPWO/STDA) sind Parent-Docs, Issuer/Offeror/Guarantor sind separate
+    Child-Records (party_type: ISSR/OFFR/GNTR). q=*:* ohne Parent-Filter
+    durchsuchte bisher den kompletten verschachtelten Index ungefiltert —
+    korrigiert auf {!parent which="type_s:parent"} + fq=document_type:(...),
+    exakt wie in der offiziellen A2A-Doku (Abschnitt 11) vorgegeben.
+
+    ESMA-HEADER-01 (S84): Request sendete bisher keinen User-Agent — jetzt
+    gleicher deklarierter UA wie SEC (s. _ESMA_HEADERS).
     """
     candidates: list[dict] = []
     try:
         resp = await client.get(
             _ESMA_PRIII_SELECT,
-            # ESMA-FL-PARAM-01: OHNE fl=* liefert Solr nur den im Request-
-            # Handler des Cores hinterlegten Default-Feldsatz — genau das
-            # erklärte den bisherigen Befund (nur id/_version_/timestamp
-            # in der Rohantwort, keine Issuer-Felder). fl=* zwingt den
-            # vollen Stored-Field-Satz, unabhängig vom Core-Default.
-            params={"q": "*:*", "rows": rows, "wt": "json", "sort": "id desc", "fl": "*"},
+            headers=_ESMA_HEADERS,
+            params={
+                "q": '{!parent which="type_s:parent"}',
+                "fq": 'document_type:("URGN" or "REGN" or "SECN" or "SMRY" '
+                      'or "BPFT" or "BPWO" or "STDA")',
+                "rows": rows,
+                "wt": "json",
+                "sort": "approval_filing_date desc",
+                # ESMA-FL-PARAM-01 (S83) bleibt in Kraft: ohne fl=* liefert
+                # Solr nur den Request-Handler-Default-Feldsatz.
+                "fl": "*",
+            },
             timeout=15.0,
         )
         if resp.status_code != 200:
