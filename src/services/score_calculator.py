@@ -338,6 +338,33 @@ def _investor_tier(name: str, investor_type: str) -> int:
     return 1   # default
 
 
+_LOGGED_UNKNOWN_OWNERSHIP_SOURCES: set[str] = set()
+
+# Bewusst im 6.0-Fallback eingeordnete, bekannte Tags — kein Log-Rauschen.
+# Nur Tags AUSSERHALB dieser Menge sind eine echte Überraschung.
+_KNOWN_FALLBACK_OWNERSHIP_SOURCES: set[str] = {"manual", "curated", "enrichment"}
+
+
+def _log_unknown_ownership_source_once(sources: set[str]) -> None:
+    """
+    CATEGORY-CEILING-REVIEW-01 (S84): fängt WIRKLICH neue ownership_entries.
+    source-Werte sichtbar ab (z. B. ein zukünftiger North-Data/OpenRegister-
+    Tag), statt sie lautlos auf den 6.0-Fallback fallen zu lassen — gleiches
+    Prinzip wie _log_unknown_schema_once (ESMA-Fix, S84). manual/curated/
+    enrichment sind bewusst im Fallback und lösen KEIN Log aus, sonst Rauschen
+    bei jedem regulären Aufruf. Pro Tag nur einmal pro Prozess geloggt.
+    """
+    surprising = sources - _KNOWN_FALLBACK_OWNERSHIP_SOURCES - _LOGGED_UNKNOWN_OWNERSHIP_SOURCES
+    if not surprising:
+        return
+    _LOGGED_UNKNOWN_OWNERSHIP_SOURCES.update(surprising)
+    logger.warning(
+        "SC-08: unbekannte(r) ownership_entries.source-Tag(s) %s auf 6.0-Fallback "
+        "eingeordnet — Transparenz-Ladder in compute_ownership_score ggf. nachziehen.",
+        sorted(surprising),
+    )
+
+
 # ── SC-01 · Financial Score ────────────────────────────────────────────────────
 
 def compute_financial_score(
@@ -735,32 +762,51 @@ def compute_ownership_score(
     LABEL-01-Kopplung). Jetzt: Quelle bestimmt den Basiswert, Investoren-Tier
     ist nur noch ein kleiner, gedeckelter Modifier.
 
-    Transparenz-Ladder (region-neutral, sourcenbasiert statt listed-Flag):
-      10.0  Amtliches Register — DE Handelsregister/Bundesanzeiger, oder
-            US SEC 13D/13F/Proxy (Pipeline für Listed noch offen — s.
-            Nachbarticket "13D/13F/Proxy-Pipeline für Listed", S84).
-       8.0  funding_rounds (Form D / kuratierte News) — struktureller
-            BESTWERT für US-Private, keine Datenqualitäts-Strafe: die USA
-            haben seit der FinCEN-BOI-Aussetzung für Inlandsunternehmen
-            (Interim Final Rule 26.03.2025, weiterhin in Kraft, S84-
-            Recherche) kein öffentliches UBO-Register — anders als DE
-            (Handelsregister) ist die 10 für US-Private strukturell nicht
-            erreichbar, unabhängig von Datenqualität. Andreas: "das wäre
-            ein gemeinsamer Anspruch an Transparenz, die US-Unternehmen
-            nicht erfüllen können."
-       7.0  Wikipedia
-       6.0  manual (schwächste bekannte Quelle — bewusst > No-Data, s.u.)
+    Tag-Inventar gegen drei echte Dateien verifiziert (ownership_enrichment.py,
+    company_detail.py, hai_enrichment.py) — NICHT mehr geraten (die erste
+    Fassung dieses Patches hatte "wikipedia"/"edgar"/"sec" verdrahtet, was
+    keinem echten Tag entsprach und praktisch alles auf "manual" durchfallen
+    ließ — S84, Selbstkorrektur im selben Rutsch).
+
+    Transparenz-Ladder (region-neutral, sourcenklassenbasiert statt listed-
+    Flag oder Datentiefe — misst Quellen-AUTORITÄT, nicht wie vollständig
+    der aktuelle Parse ist; vollständigeres Filing-Parsing ist ein separates,
+    zukünftiges Ticket):
+      10.0  handelsregister (hai_enrichment.py), bundesanzeiger/ba_bridge
+            (Legacy, Bestands-Rows vor Bridge-Kill S52), bafin_stimmrechte
+            (WpHG-Meldepflicht DE-Listed), edgar_sc_13g/edgar_sc_13d
+            (US-Listed Pflicht-Offenlegung, EN-07) — amtlich/pflichtoffengelegt.
+       8.0  edgar_form_d, edgar_d (Form-D-Investoren/Directors, keine
+            Offenlegungspflicht), funding_rounds (Lead/Co-Investor aus
+            Funding-Runden), yahoo_institutional (13F-abgeleitet, aber nur
+            Top-Holder via Drittanbieter — Andreas, S84: "wenn nur
+            eingeschränkte Pflichtdaten, dann eher mit einer 8 ansetzen").
+            8.0 ist zugleich der strukturelle Bestwert für US-Private: kein
+            öffentliches UBO-Register in den USA seit FinCEN-BOI-Aussetzung
+            für Inlandsunternehmen (Interim Final Rule 26.03.2025, weiterhin
+            in Kraft, S84-Recherche) — anders als DE (Handelsregister) ist
+            die 10 für US-Private strukturell nicht erreichbar, unabhängig
+            von Datenqualität. Andreas: "das wäre ein gemeinsamer Anspruch
+            an Transparenz, die US-Unternehmen nicht erfüllen können."
+       7.0  wikipedia_infobox
+       6.0  curated (company_detail.py::_OWNERSHIP_OVERRIDES — statischer
+            ~10-Company-Dict ohne Zeitstempel/Quelle, keine laufende
+            Verifikation, S84 als Legacy-Seed identifiziert, nicht als
+            User-Feature — separate Frage, ob das Konstrukt bestehen bleibt),
+            enrichment (Herkunft ungeklärt, s. TODO unten), alles Unbekannte.
        5.0  keine Daten, listed   (Neutralzone — Pipeline-Lücke, kein
-                                   Verschleierungs-Signal, s. Docstring-
-                                   Diskussion S84: Ownership-Disclosure ist
-                                   bei Listed gesetzlich verpflichtend,
-                                   "keine Daten" heißt fast immer "Argo hat
-                                   die Quelle noch nicht gebaut", nicht
-                                   "Company verschleiert".)
+            Verschleierungs-Signal: Ownership-Disclosure ist bei Listed
+            gesetzlich verpflichtend, "keine Daten" heißt fast immer "Argo
+            hat die Quelle noch nicht abgefragt", nicht "Company verschleiert".)
        4.0  keine Daten, privat   (Neutralzone, unteres Ende)
 
-    Alte Tags ba_bridge/bundesanzeiger bleiben in der Ladder (Bestands-Rows
-    vor dem Bridge-Kill S52), auch wenn kein aktiver Schreibpfad mehr existiert.
+    TODO (S84, nicht blockierend): "enrichment"-Tag-Herkunft (enrichment.
+    investors in company_detail.py) nicht abschließend geklärt — liegt auf
+    6.0-Fallback, bis geklärt. Unbekannte Tags werden einmalig geloggt
+    (_log_unknown_ownership_source_once) statt lautlos auf 6.0 zu fallen —
+    fängt zukünftige Quellen (z. B. North Data/OpenRegister, Phase 3 laut
+    ownership_enrichment.py-Docstring) auf, bevor sie unbemerkt fehlklassifiziert
+    werden.
 
     Investoren-Tier-Modifier (±1.0, additiv, gedeckelt): kann den Quellen-
     Basiswert NICHT überschreiten (jeder Basiswert ist bereits der Bestwert
@@ -769,8 +815,8 @@ def compute_ownership_score(
     nur mit geringerer Gewichtung" (vorher 50% des Scores, jetzt ≤1 Pkt Zug).
 
     Diversifikation + Listed-Bonus ENTFERNT (S84) — Listed-Status steckt jetzt
-    strukturell im No-Data-Floor + in der zukünftigen SEC-Disclosure-Tier,
-    nicht mehr als separater Bonus obendrauf (Doppel-Zählung vermieden).
+    strukturell im No-Data-Floor + in der SEC/BaFin-Disclosure-Tier, nicht
+    mehr als separater Bonus obendrauf (Doppel-Zählung vermieden).
     """
     inputs: dict = {}
     is_listed = _is_listed(company)
@@ -784,16 +830,19 @@ def compute_ownership_score(
 
     sources = {(e.get("source") or "manual").lower() for e in ownership_entries}
 
-    if sources & {"handelsregister", "bundesanzeiger", "ba_bridge"}:
-        base, inputs["transparency"] = 10.0, "official_register"
-    elif sources & {"edgar", "sec"}:
-        base, inputs["transparency"] = 10.0, "sec_disclosure"
-    elif "funding_rounds" in sources:
-        base, inputs["transparency"] = 8.0, "funding_rounds"
-    elif "wikipedia" in sources:
+    _TIER_10 = {"handelsregister", "bundesanzeiger", "ba_bridge",
+                "bafin_stimmrechte", "edgar_sc_13g", "edgar_sc_13d"}
+    _TIER_8  = {"edgar_form_d", "edgar_d", "funding_rounds", "yahoo_institutional"}
+
+    if sources & _TIER_10:
+        base, inputs["transparency"] = 10.0, "official_disclosure"
+    elif sources & _TIER_8:
+        base, inputs["transparency"] = 8.0, "known_but_not_mandatory"
+    elif "wikipedia_infobox" in sources:
         base, inputs["transparency"] = 7.0, "wikipedia"
     else:
         base, inputs["transparency"] = 6.0, "manual"
+        _log_unknown_ownership_source_once(sources)
 
     tiers = [
         _investor_tier(e.get("name") or "", e.get("investor_type") or e.get("type") or "")
