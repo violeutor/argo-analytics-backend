@@ -441,63 +441,6 @@ def _ipo_probability(ipo_status: str | None, ipo_potential: str | None) -> int |
     return legacy_map.get(ipo_potential or "")
 
 
-# ── Curated ownership overrides ───────────────────────────────────────────────
-
-_OWNERSHIP_OVERRIDES: dict[str, list[OwnershipItem]] = {
-    "CarbonCure": [
-        OwnershipItem(name="Amazon Climate Pledge Fund", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Breakthrough Energy Ventures", type="Impact VC", role="Lead"),
-        OwnershipItem(name="Microsoft Climate Innovation Fund", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Clean Growth Fund", type="Impact VC", role="Co-Investor"),
-        OwnershipItem(name="New Enterprise Associates", type="VC", role="Co-Investor"),
-    ],
-    "Brimstone": [
-        OwnershipItem(name="CRH Ventures", type="Corporate", role="Strategic", notes="Strategic investor"),
-        OwnershipItem(name="Breakthrough Energy Ventures", type="Impact VC", role="Lead"),
-        OwnershipItem(name="DCVC", type="VC", role="Co-Investor"),
-    ],
-    "Sublime Systems": [
-        OwnershipItem(name="CRH", type="Corporate", role="Strategic", notes="Direct investment"),
-        OwnershipItem(name="Breakthrough Energy Ventures", type="Impact VC", role="Lead"),
-        OwnershipItem(name="Prelude Ventures", type="VC", role="Co-Investor"),
-    ],
-    "VoltaGrid": [
-        OwnershipItem(name="Blackstone", type="Fund", role="Lead", notes="$1B equity round May 2026"),
-        OwnershipItem(name="Halliburton", type="Corporate", role="Strategic"),
-    ],
-    "Fervo Energy": [
-        OwnershipItem(name="DCVC", type="VC", role="Lead"),
-        OwnershipItem(name="Breakthrough Energy Ventures", type="Impact VC", role="Co-Investor"),
-        OwnershipItem(name="Liberty Energy", type="Corporate", role="Strategic"),
-    ],
-    "Factorial Energy": [
-        OwnershipItem(name="Stellantis", type="Corporate", role="Strategic", notes="OEM investor"),
-        OwnershipItem(name="Samsung SDI", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Cartesian Growth Corporation III", type="Fund", role="SPAC"),
-    ],
-    "Syzygy Plasmonics": [
-        OwnershipItem(name="Saudi Aramco Energy Ventures", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Honeywell", type="Corporate", role="Strategic", notes="Technology partner"),
-        OwnershipItem(name="Cottonwood Technology Fund", type="VC", role="Co-Investor"),
-    ],
-    "Indigo Ag": [
-        OwnershipItem(name="Flagship Pioneering", type="VC", role="Lead"),
-        OwnershipItem(name="Investment Corporation of Dubai", type="Government", role="Co-Investor"),
-        OwnershipItem(name="Alaska Permanent Fund", type="Fund", role="Co-Investor"),
-    ],
-    "Pairwise": [
-        OwnershipItem(name="Corteva Agriscience", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Deerfield Management", type="Fund", role="Co-Investor"),
-        OwnershipItem(name="Fall Line Capital", type="VC", role="Early"),
-    ],
-    "Climeworks": [
-        OwnershipItem(name="Swiss Federal Railways (SBB)", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Shopify", type="Corporate", role="Strategic"),
-        OwnershipItem(name="Baillie Gifford", type="Fund", role="Co-Investor"),
-        OwnershipItem(name="M&G Investments", type="Fund", role="Co-Investor"),
-    ],
-}
-
 _TR_WEIGHTS = {
     "tech_stack_fit": 0.20, "integration_capacity": 0.20,
     "gtm_fit": 0.15, "capital_deployment_velocity": 0.15,
@@ -3120,9 +3063,13 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
             logger.debug("persist_company_financials für %s übersprungen: %s", company_name, _fin_err)
 
     # 7. Ownership
-    if company_name in _OWNERSHIP_OVERRIDES:
-        ownership = _OWNERSHIP_OVERRIDES[company_name]
-    elif enrichment.investors:
+    # OWNERSHIP-OVERRIDES-RETIRE-01 (S84, Andreas-Entscheidung): _OWNERSHIP_OVERRIDES
+    # (statischer ~10-Company-Dict, kein Zeitstempel, keine laufende Verifikation)
+    # entfernt — Daten nach ownership_entries (source="curated") migriert, s.
+    # Backfill-Script. Fällt jetzt auf denselben Pfad wie jede andere Company:
+    # enrichment.investors → DB-ownership_entries (EN-08, weiter unten gemergt)
+    # → "Not publicly disclosed"-Platzhalter.
+    if enrichment.investors:
         ownership = [
             OwnershipItem(name=inv.name, type=inv.type, role=inv.role, notes=inv.notes)
             for inv in enrichment.investors
@@ -3697,10 +3644,7 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                         "share_pct": share_pct, "source": source,
                     })
 
-                if company_name in _OWNERSHIP_OVERRIDES:
-                    for _o in _OWNERSHIP_OVERRIDES[company_name]:
-                        _add_own_raw(_o.name, _o.type, "curated")
-                elif enrichment.investors:
+                if enrichment.investors:
                     for inv in enrichment.investors:
                         _add_own_raw(inv.name, inv.type, "enrichment")
 
