@@ -10,7 +10,10 @@ Sub-Scores (0–10):
   SC-02  Strategic Score     — SRR × TechReadiness × Buyer Fit
   SC-03  Market Score        — CAGR + Competition + Data Richness
   SC-04  Risk Score          — Beta + Governance + Negative Signals + Stage
-  SC-08  Ownership Score     — Investor-Qualität + Diversifikation + Transparenz
+  SC-08  Ownership Score     — Transparenz-Score (Quelle) ± Investoren-Tier-
+                             Modifier (CATEGORY-CEILING-REVIEW-01, S84 —
+                             war Investor-Qualität + Diversifikation +
+                             Transparenz, s. compute_ownership_score)
   SC-09  Value Driver Score  — Dependency + Netzeffekte + TechReadiness
 
 Path-Scores (0–10):
@@ -168,6 +171,13 @@ _INVESTOR_TIER_KW: list[tuple[str, int]] = [
     ("khosla", 3), ("founders fund", 3), ("breakthrough energy", 3),
     ("lowercarbon", 3), ("google ventures", 3), ("gv", 3), ("microsoft ventures", 3),
     ("amazon industrial", 3), ("2150", 3), ("systemiq", 3),
+    # Tier 3 — EU-Buyout/Growth (CATEGORY-CEILING-REVIEW-01, S84: fehlten
+    # komplett, obwohl reputationsgleich zu den US-Mega-Funds oben —
+    # INVESTOR-TIER-LABEL-01 US-Westcoast-Bias-Befund, jetzt teilweise
+    # behoben. Vollständigkeitslücke, keine strukturelle Asymmetrie wie das
+    # SC-08-Register-Thema — bewusst getrennt gehalten.)
+    ("eqt", 3), ("permira", 3), ("cinven", 3), ("nordic capital", 3),
+    ("cvc capital", 3), ("apax", 3), ("bridgepoint", 3),
     # Tier 2 — Etablierte EU/US VC + Corporate VC
     ("earlybird", 2), ("hv capital", 2), ("atomico", 2), ("northzone", 2),
     ("cherry", 2), ("point nine", 2), ("b capital", 2), ("btov", 2),
@@ -671,12 +681,17 @@ def compute_risk_score(
         score += raw_pts * damodaran_factor
 
     # Governance (0–3): Ownership-Intransparenz = Risiko
+    # CATEGORY-CEILING-REVIEW-01 (S84, Andreas-Entscheidung): No-Data-Floor
+    # war 3.0 (= maximales Risiko, identisch zu aktiv verschleiert). "Keine
+    # Daten" darf nicht schlechter stehen als "eine bekannte Beteiligung" —
+    # jetzt auf Höhe von single_entry (1.5), SC-10-Neutralkonvention
+    # (BUG-31: "Datenmangel → neutral, kein halluziniertes Risiko").
     is_listed = _is_listed(company)
     if is_listed:
         score += 0.3   # listed: öffentliche Rechenschaftspflicht → niedrig
         inputs["governance"] = "listed"
     elif not ownership_entries:
-        score += 3.0   # keine Daten = maximale Governance-Unsicherheit
+        score += 1.5   # keine Daten = neutral, kein Verschleierungs-Signal
         inputs["governance"] = "opaque"
     elif len(ownership_entries) == 1:
         score += 1.5
@@ -710,68 +725,90 @@ def compute_ownership_score(
     ownership_entries: list[dict],
 ) -> tuple[float, dict]:
     """
-    SC-08: Ownership Score (0–10). Höher = bessere Investor-Qualität + Transparenz.
+    SC-08: Ownership Score (0–10) — Transparenz-Score, keine Investoren-Bewertung.
 
-    Inputs: ownership_entries (name, investor_type, share_pct, source), is_listed.
+    CATEGORY-CEILING-REVIEW-01 (S84, Andreas-Entscheidung): Misst, wie
+    belastbar/vollständig Argos Kenntnis der Eigentümerstruktur ist — NICHT,
+    wie "gut" die Investoren sind. Vorher: quality_pts (Investoren-Tier)
+    machte 0–5 von ~10.5 Pkt aus (fast 50%) und vermischte ein Werturteil
+    über Investoren mit einer Datenbelastbarkeits-Metrik (INVESTOR-TIER-
+    LABEL-01-Kopplung). Jetzt: Quelle bestimmt den Basiswert, Investoren-Tier
+    ist nur noch ein kleiner, gedeckelter Modifier.
 
-    Gewichtung:
-      Investor-Qualität  0–5 Pkt   (Tier 1–3 VC, Corporate, Government)
-      Diversifikation    0–2 Pkt   (3–7 Investoren ideal)
-      Transparenz        0–2.5 Pkt (Datenquelle: Bundesanzeiger > Wikipedia > manual)
-      Listed Bonus       0–1 Pkt   (öffentliche Märkte = höchste Transparenz)
+    Transparenz-Ladder (region-neutral, sourcenbasiert statt listed-Flag):
+      10.0  Amtliches Register — DE Handelsregister/Bundesanzeiger, oder
+            US SEC 13D/13F/Proxy (Pipeline für Listed noch offen — s.
+            Nachbarticket "13D/13F/Proxy-Pipeline für Listed", S84).
+       8.0  funding_rounds (Form D / kuratierte News) — struktureller
+            BESTWERT für US-Private, keine Datenqualitäts-Strafe: die USA
+            haben seit der FinCEN-BOI-Aussetzung für Inlandsunternehmen
+            (Interim Final Rule 26.03.2025, weiterhin in Kraft, S84-
+            Recherche) kein öffentliches UBO-Register — anders als DE
+            (Handelsregister) ist die 10 für US-Private strukturell nicht
+            erreichbar, unabhängig von Datenqualität. Andreas: "das wäre
+            ein gemeinsamer Anspruch an Transparenz, die US-Unternehmen
+            nicht erfüllen können."
+       7.0  Wikipedia
+       6.0  manual (schwächste bekannte Quelle — bewusst > No-Data, s.u.)
+       5.0  keine Daten, listed   (Neutralzone — Pipeline-Lücke, kein
+                                   Verschleierungs-Signal, s. Docstring-
+                                   Diskussion S84: Ownership-Disclosure ist
+                                   bei Listed gesetzlich verpflichtend,
+                                   "keine Daten" heißt fast immer "Argo hat
+                                   die Quelle noch nicht gebaut", nicht
+                                   "Company verschleiert".)
+       4.0  keine Daten, privat   (Neutralzone, unteres Ende)
+
+    Alte Tags ba_bridge/bundesanzeiger bleiben in der Ladder (Bestands-Rows
+    vor dem Bridge-Kill S52), auch wenn kein aktiver Schreibpfad mehr existiert.
+
+    Investoren-Tier-Modifier (±1.0, additiv, gedeckelt): kann den Quellen-
+    Basiswert NICHT überschreiten (jeder Basiswert ist bereits der Bestwert
+    seiner Quellenkategorie) — Tier 3 lässt den Basiswert unverändert, Tier 1/2
+    ziehen innerhalb der Kategorie ab. Andreas: "Investoren-Reputation einfach
+    nur mit geringerer Gewichtung" (vorher 50% des Scores, jetzt ≤1 Pkt Zug).
+
+    Diversifikation + Listed-Bonus ENTFERNT (S84) — Listed-Status steckt jetzt
+    strukturell im No-Data-Floor + in der zukünftigen SEC-Disclosure-Tier,
+    nicht mehr als separater Bonus obendrauf (Doppel-Zählung vermieden).
     """
     inputs: dict = {}
     is_listed = _is_listed(company)
 
     if not ownership_entries:
         if is_listed:
-            inputs["source"] = "listed_no_local_data"
-            return _safe_round(5.5), inputs
-        inputs["source"] = "opaque"
-        return _safe_round(1.0), inputs
+            inputs["transparency"] = "no_data_listed"
+            return _safe_round(5.0), inputs
+        inputs["transparency"] = "no_data_private"
+        return _safe_round(4.0), inputs
 
-    # Investor-Qualität (0–5)
-    tiers = []
-    for entry in ownership_entries:
-        name = entry.get("name") or ""
-        itype = entry.get("investor_type") or entry.get("type") or ""
-        tiers.append(_investor_tier(name, itype))
+    sources = {(e.get("source") or "manual").lower() for e in ownership_entries}
 
+    if sources & {"handelsregister", "bundesanzeiger", "ba_bridge"}:
+        base, inputs["transparency"] = 10.0, "official_register"
+    elif sources & {"edgar", "sec"}:
+        base, inputs["transparency"] = 10.0, "sec_disclosure"
+    elif "funding_rounds" in sources:
+        base, inputs["transparency"] = 8.0, "funding_rounds"
+    elif "wikipedia" in sources:
+        base, inputs["transparency"] = 7.0, "wikipedia"
+    else:
+        base, inputs["transparency"] = 6.0, "manual"
+
+    tiers = [
+        _investor_tier(e.get("name") or "", e.get("investor_type") or e.get("type") or "")
+        for e in ownership_entries
+    ]
     avg_tier = sum(tiers) / len(tiers) if tiers else 1.0
-    quality_pts = (avg_tier / 3.0) * 5.0
     inputs["avg_investor_tier"] = round(avg_tier, 2)
     inputs["investor_count"]    = len(tiers)
 
-    # Diversifikation (0–2)
-    n = len(ownership_entries)
-    div_pts = (
-        2.0 if 3 <= n <= 7 else
-        1.5 if n >= 8 else
-        1.0 if n == 2 else
-        0.5   # n == 1
-    )
-    inputs["ownership_count"] = n
+    # Tier 3 → 0.0 (Basiswert bleibt, da Basiswert schon Bestwert der Quelle
+    # ist), Tier 2 → -0.5, Tier 1 → -1.0. Nie positiv — s. Docstring.
+    modifier = 0.0 if avg_tier >= 3.0 else -0.5 if avg_tier >= 2.0 else -1.0
+    inputs["investor_modifier"] = modifier
 
-    # Transparenz (0–2.5)
-    sources = {(e.get("source") or "manual").lower() for e in ownership_entries}
-    if "ba_bridge" in sources or "bundesanzeiger" in sources:
-        trans_pts = 2.5
-        inputs["transparency"] = "bundesanzeiger"
-    elif "wikipedia" in sources:
-        trans_pts = 1.5
-        inputs["transparency"] = "wikipedia"
-    elif "edgar" in sources or "sec" in sources:
-        trans_pts = 2.0
-        inputs["transparency"] = "sec_edgar"
-    else:
-        trans_pts = 0.5
-        inputs["transparency"] = "manual"
-
-    # Listed Bonus (0–1)
-    listed_bonus = 1.0 if is_listed else 0.0
-    inputs["listed_bonus"] = is_listed
-
-    score = quality_pts + div_pts + trans_pts + listed_bonus
+    score = _clamp(base + modifier)
     return _safe_round(score), inputs
 
 
@@ -809,8 +846,13 @@ def compute_value_driver_score(
 
     vds = value_drivers or []
     if not vds:
+        # CATEGORY-CEILING-REVIEW-01 (S84): dritte Fundstelle desselben
+        # Anti-Patterns wie SC-04/SC-08 — "keine Value-Driver-Daten" fiel
+        # bisher auf die reine Baseline (0.5/10), identisch zu "keine
+        # strukturellen Vorteile vorhanden". SC-10-Neutralkonvention
+        # übernommen (BUG-31): fehlende Pipeline-Abdeckung ≠ fehlende Stärke.
         inputs["driver_count"] = 0
-        return _safe_round(score), inputs
+        return _safe_round(4.5), inputs
 
     # Driver Count (0–2)
     score += min(2.0, len(vds) * 0.4)
