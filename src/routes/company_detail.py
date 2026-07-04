@@ -111,6 +111,62 @@ def _fetch_live_enrichment_status(company_id: str) -> tuple[str | None, bool]:
         return None, False
 
 
+def _try_acquire_value_drivers_lock(company_id: str) -> bool:
+    """
+    VD-LOCK-01 (04.07.): Value-Drivers-Enrichment hatte bisher KEINEN Running-
+    Lock — anders als Ownership (Sentinel-Row) und Market-Data (R10,
+    set_enrichment_status/enrichment_started_at auf companies). Jeder Load mit
+    fehlendem/stale Cache (Zeile ~3558, _vd_stale) queued einen neuen
+    Background-Task, ohne zu prüfen ob schon einer läuft — bei mehreren Loads
+    kurz hintereinander (Tab-Wechsel, Doppel-Poll) laufen mehrere
+    enrich_value_drivers()-Aufrufe parallel. upsert_value_drivers() selbst ist
+    zwar race-safe (on_conflict="company_id", kein Duplikat-Risiko), aber jeder
+    zusätzliche Lauf ist verschwendete Arbeit (Wikipedia/Crunchbase/Haiku-Calls)
+    und mehrere konkurrierende Tasks können sich beim Response-Timing
+    gegenseitig verzögern — passt zu Andreas' Beobachtung "Ladezeiten wie
+    live-Berechnung, nicht wie DB-Read".
+
+    Nutzt companies.value_drivers_enrichment_started_at (NEU, additiv —
+    schema_patch_value_drivers_lock.sql) statt eines Felds auf value_drivers
+    selbst: die companies-Row existiert immer schon (nur .update(), kein
+    Insert-Risiko mit fehlenden Pflichtfeldern), während eine value_drivers-
+    Row bisher erst bei echtem Enrichment-Abschluss entsteht.
+
+    Gleiches TTL-Prinzip wie R10 (_ENRICHMENT_LOCK_TTL_S): Lock gilt als frei,
+    wenn nie gesetzt oder älter als die TTL (Crash-/Neustart-Schutz). Nicht
+    perfekt atomar (read-then-write, kein DB-seitiges CAS) — gleiches
+    Risikoniveau wie der bereits etablierte R10-Mechanismus selbst, kein neuer
+    Standard. Fail-open bei Fehlern: ein seltenes Doppel-Enrichment ist
+    unschädlicher als Value Drivers durch einen kaputten Lock nie zu bekommen.
+    """
+    from datetime import datetime, timezone
+    sb = get_supabase()
+    now = datetime.now(timezone.utc)
+    try:
+        row = (sb.table("companies")
+               .select("value_drivers_enrichment_started_at")
+               .eq("id", company_id).limit(1).execute().data)
+        if row:
+            started = row[0].get("value_drivers_enrichment_started_at")
+            if started:
+                try:
+                    started_dt = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                    if (now - started_dt).total_seconds() < _ENRICHMENT_LOCK_TTL_S:
+                        return False   # frischer Lock eines anderen Laufs — nicht übernehmen
+                except Exception:
+                    pass   # unparsebarer Timestamp → wie verwaist behandeln, Lock übernehmen
+        sb.table("companies").update({
+            "value_drivers_enrichment_started_at": now.isoformat(),
+        }).eq("id", company_id).execute()
+        return True
+    except Exception as e:
+        logger.warning(
+            "VD-LOCK-01: Lock-Acquire fehlgeschlagen für %s — fahre ohne Lock fort: %s",
+            company_id, e,
+        )
+        return True
+
+
 # ── Response models ───────────────────────────────────────────────────────────
 
 class OwnershipItem(BaseModel):
@@ -2201,7 +2257,11 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                         tam_usd_bn=tam.get("tam_usd_bn"),
                         tech_readiness=_tr_ref[0],   # gesetzt nach Scoring-Block
                     )
-                    all_companies = fetch_companies(limit=500)
+                    # PEERS-LOOKUP-SCALE-01 (04.07.) — Stopgap, s. peers.py für
+                    # dieselbe Begründung: breite Kandidatenliste für Competition-
+                    # Signale, kein Einzel-Lookup, daher Limit angehoben statt
+                    # auf gezielten Query umgestellt.
+                    all_companies = fetch_companies(limit=5000)
                     all_rounds = fetch_all_funding_rounds()
                     sync_result = enrich_market_data_sync_wrapper(
                         company_id=company_id,
@@ -2237,7 +2297,8 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
         if company_id and company.get("peers_context"):
             async def _competition_refresh_bg():
                 try:
-                    all_companies = fetch_companies(limit=500)
+                    # PEERS-LOOKUP-SCALE-01 (04.07.) — Stopgap, s. peers.py.
+                    all_companies = fetch_companies(limit=5000)
                     all_rounds    = fetch_all_funding_rounds()
                     comp_result   = enrich_market_data_sync_wrapper(
                         company_id=company_id,
@@ -3556,20 +3617,26 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 _vd_stale = not vd_cached  # Fallback: stale wenn kein Cache
 
         if _vd_stale:
-            async def _value_drivers_bg():
-                try:
-                    vd_result = await enrich_value_drivers(
-                        company_id=company_id,
-                        company_name=company_name,
-                        category=company.get("category"),
-                        tags=sc_tags,
-                    )
-                    upsert_value_drivers(company_id, vd_result)
-                    logger.info("Value drivers enrichment done for %s", company_name)
-                except Exception:
-                    logger.exception("Value drivers enrichment FAILED for %s", company_name)
-            background_tasks.add_task(_value_drivers_bg)
-            logger.info("Value drivers enrichment queued for %s", company_name)
+            if _try_acquire_value_drivers_lock(company_id):
+                async def _value_drivers_bg():
+                    try:
+                        vd_result = await enrich_value_drivers(
+                            company_id=company_id,
+                            company_name=company_name,
+                            category=company.get("category"),
+                            tags=sc_tags,
+                        )
+                        upsert_value_drivers(company_id, vd_result)
+                        logger.info("Value drivers enrichment done for %s", company_name)
+                    except Exception:
+                        logger.exception("Value drivers enrichment FAILED for %s", company_name)
+                background_tasks.add_task(_value_drivers_bg)
+                logger.info("Value drivers enrichment queued for %s", company_name)
+            else:
+                logger.debug(
+                    "VD-LOCK-01: Value drivers enrichment bereits in Arbeit für %s — Skip",
+                    company_name,
+                )
 
     if tam.get("method") == "fallback":
         warnings.append("TAM uses sector median fallback — verify with primary source.")

@@ -16,7 +16,7 @@ import logging
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from src.integrations.supabase import fetch_companies, fetch_value_drivers
+from src.integrations.supabase import fetch_company_by_name, search_companies_by_name, fetch_value_drivers
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["value-drivers"])
@@ -72,15 +72,18 @@ async def get_value_drivers(name: str) -> ValueDriversResponse:
     Background-Enrichment wird von company_detail.py angestoßen.
     Dieser Endpunkt ist rein lesend — kein eigener Enrichment-Trigger.
     """
-    # Company-ID über Name lookup
-    companies = fetch_companies(limit=500)
+    # NAME-LOOKUP-SCALE-01 (04.07.): fetch_companies(limit=500) ersetzt — bei
+    # >500 Companies in der DB (alphabetisch sortiert, s. supabase.py) fehlten
+    # Companies ab einem bestimmten Anfangsbuchstaben im Snapshot komplett und
+    # dieser Endpunkt lieferte fälschlich status="empty", obwohl Value Drivers
+    # längst in der DB standen. Gezielter Query statt Full-Table-Snapshot.
     q = name.lower().replace("-", " ").replace("_", " ")
-    company = next(
-        (c for c in companies if
-         c.get("name", "").lower() == q or
-         q in c.get("name", "").lower()),
-        None,
-    )
+    company = fetch_company_by_name(q)
+    if not company:
+        for row in search_companies_by_name(q, limit=10):
+            if q in (row.get("name") or "").lower():
+                company = row
+                break
 
     if not company:
         return ValueDriversResponse(status="empty", company_name=name)

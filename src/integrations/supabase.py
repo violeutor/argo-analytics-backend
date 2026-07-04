@@ -185,6 +185,30 @@ def fetch_company_by_name(name: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+def search_companies_by_name(name: str, limit: int = 10) -> list[dict]:
+    """
+    NAME-LOOKUP-SCALE-01 (04.07.): gezielter Fuzzy-Substring-Lookup als
+    Gegenstück zu fetch_company_by_name() (Exact-Match). Ersetzt in peers.py
+    und value_drivers.py den bisherigen fetch_companies(limit=500)-Snapshot
+    für Existenz-Checks — derselbe Skalierungs-Bug, der in company_detail.py
+    bereits gefixt wurde (dortiger Kommentar, Zeile ~1892: "bei >500 Companies
+    in der DB fand der alte Lookup neue Einträge nicht mehr → legte Duplikate
+    an"). Ursache: fetch_companies() sortiert alphabetisch (.order("name")
+    unten) UND deckelt hart auf `limit` — bei mehr als `limit` Companies in
+    der DB verschwinden Namen ab einem bestimmten Anfangsbuchstaben komplett
+    aus dem Snapshot. Ein gezielter ILIKE-Query pro Namen ist bei den kleinen
+    Kandidatenmengen (Peer-Listen, Einzel-Lookup) günstiger als ein einziger,
+    aber falscher 500er-Fetch.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("companies").select("*").ilike("name", f"*{name}*").limit(limit).execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning("search_companies_by_name failed für '%s': %s", name, e)
+        return []
+
+
 # ── Comparable Transactions (DEALCOMPS-TRANSACTIONS-01, S78) ──────────────────
 
 def fetch_calibration_eligible_transactions() -> list[dict]:
@@ -1094,7 +1118,41 @@ def find_or_create_buyer_company(
             logger.info("find_or_create_buyer_company: neue Buyer-Company '%s' (%s)", name, ticker)
             return res.data[0]
     except Exception as e:
-        logger.warning("find_or_create_buyer_company insert failed für %s: %s", name, e)
+        # BUYER-RACE-01 (04.07.): find-then-insert ist nicht atomar. Sektor-
+        # Incumbents aus _harvest_sector() sind dieselbe kleine Menge großer,
+        # bekannter Käufer für VIELE unterschiedliche Target-Companies —
+        # werden mehrere Targets ungefähr gleichzeitig geladen/enriched
+        # (z.B. Discovery-Cron-Nachlauf, Nutzer-Burst), können zwei parallele
+        # enrich_buyers_for_company()-Läufe denselben Buyer beide als "noch
+        # nicht in der DB" sehen und beide inserten wollen.
+        # Fängt den Fall ab, WENN eine Unique-Constraint auf ticker/name
+        # existiert (Postgres Duplicate-Key, 23505) — re-queried dann statt
+        # zu scheitern. Löst die Race NICHT, falls keine Unique-Constraint
+        # existiert (ungeprüft — offene Rückfrage), macht den Fall dann aber
+        # wenigstens sichtbar (warning) statt lautlos als None durchzureichen.
+        _msg = str(e)
+        if "duplicate key" in _msg.lower() or "23505" in _msg:
+            logger.info(
+                "find_or_create_buyer_company: Race erkannt für '%s' — "
+                "Concurrent-Insert war schneller, re-query statt Fehler", name,
+            )
+            try:
+                if ticker:
+                    hit = (db.table("companies").select("*")
+                           .ilike("ticker", ticker).limit(1).execute().data)
+                    if hit:
+                        return hit[0]
+                hit = (db.table("companies").select("*")
+                       .ilike("name", name).limit(1).execute().data)
+                if hit:
+                    return hit[0]
+            except Exception as e2:
+                logger.warning(
+                    "find_or_create_buyer_company: Re-Query nach Race failed für %s: %s",
+                    name, e2,
+                )
+        else:
+            logger.warning("find_or_create_buyer_company insert failed für %s: %s", name, e)
     return None
 
 

@@ -168,9 +168,18 @@ async def ensure_peers(
         return {"resolved_ids": [], "peer_notes": {}, "peer_relations": {},
                 "generated_at": None, "from_cache": False}
 
-    # Peers in DB auflösen / anlegen
-    all_companies = fetch_companies(limit=500)
-    name_to_id: dict[str, str] = {c["name"].lower(): c["id"] for c in all_companies}
+    # PEERS-LOOKUP-SCALE-01 (04.07.): fetch_companies(limit=500) entfernt —
+    # derselbe Skalierungs-Bug wie company_detail.py (Zeile ~1892, dort
+    # bereits gefixt): fetch_companies() sortiert alphabetisch, bei >500
+    # Companies in der DB fehlen Namen ab einem bestimmten Anfangsbuchstaben
+    # im Snapshot komplett → jeder Peer dahinter gilt fälschlich als "neu",
+    # _resolve_or_create_peer legt ein Duplikat an (kein Unique-Constraint,
+    # roher .insert()). Wahrscheinlichste Ursache für PEERS-BUYERS-
+    # PERSISTENCE-01. name_to_id bleibt als reiner Call-lokaler Cache (verhindert
+    # doppelte Anlage, wenn derselbe Peer-Name zweimal in einer generierten
+    # Liste auftaucht) — Existenz-Check läuft jetzt gezielt in
+    # _resolve_or_create_peer() gegen die DB, nicht gegen einen Snapshot.
+    name_to_id: dict[str, str] = {}
 
     # BUG-34: Self-reference guard — Company darf nicht ihr eigener Peer sein
     company_name_lower = company_name.lower()
@@ -477,15 +486,25 @@ async def _resolve_or_create_peer(
     trotzdem reale Companies — anders als ein unauflösbarer Buyer-Name, der
     per Definition kein tauglicher Buyer ist.
     """
-    # Exakter Match (case-insensitive)
+    # Exakter Match — zuerst im Call-lokalen Cache (schnell, deckt Mehrfach-
+    # nennung desselben Namens innerhalb dieser Peer-Liste ab).
     existing_id = name_to_id.get(peer_name.lower())
     if existing_id:
         return existing_id, False
 
+    # PEERS-LOOKUP-SCALE-01 (04.07.): gezielter DB-Lookup statt In-Memory-Scan
+    # über einen (bei >500 Companies potenziell unvollständigen) Snapshot.
+    from src.integrations.supabase import fetch_company_by_name, search_companies_by_name
+
+    exact_hit = fetch_company_by_name(peer_name)
+    if exact_hit and exact_hit.get("id"):
+        return exact_hit["id"], False
+
     # Fuzzy: Substring-Match (z.B. "Climeworks AG" findet "Climeworks")
-    for db_name, db_id in name_to_id.items():
-        if peer_name.lower() in db_name or db_name in peer_name.lower():
-            return db_id, False
+    for row in search_companies_by_name(peer_name, limit=10):
+        row_name = (row.get("name") or "").lower()
+        if peer_name.lower() in row_name or row_name in peer_name.lower():
+            return row["id"], False
 
     # ── PEER-IDENT-01: Identität prüfen, bevor wir eine companies-Row anlegen ──
     resolved_name:       str        = peer_name
@@ -849,7 +868,16 @@ async def _enrich_new_peer(peer_id: str, peer_name: str) -> None:
         existing_md = fetch_market_data(peer_id)
         if not existing_md or not existing_md.get("enriched_at"):
             set_enrichment_status(peer_id, "running")
-            all_companies = fetch_companies(limit=500)
+            # PEERS-LOOKUP-SCALE-01 (04.07.) — Stopgap, kein vollständiger Fix:
+            # anders als der Existenz-Check oben (jetzt gezielter Lookup) braucht
+            # enrich_market_data_sync_wrapper() eine BREITE Kandidatenliste für
+            # Competition-Signale, kein Einzel-Name-Match — ein gezielter Lookup
+            # ist hier nicht 1:1 übertragbar. Limit angehoben (500→5000) als
+            # Übergangslösung gegen den akuten Skalierungs-Bug; der eigentliche
+            # Fix (serverseitige Filterung z.B. nach category/industry statt
+            # Full-Table-Fetch + In-Memory-Filter) braucht Einsicht in
+            # enrich_market_data_sync_wrapper() selbst — nicht Teil dieser Session.
+            all_companies = fetch_companies(limit=5000)
             all_rounds    = fetch_all_funding_rounds()
             async_result  = await enrich_market_data(
                 company_id=peer_id,
