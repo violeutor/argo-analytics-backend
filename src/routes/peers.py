@@ -34,6 +34,7 @@ from src.integrations.supabase import (
     fetch_companies,
 )
 from src.services.score_calculator import _is_listed as _resolve_is_listed
+from src.services.llm_name_validation import split_llm_company_name
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["peers"])
@@ -339,7 +340,7 @@ async def _claude_generate_peers(company: dict) -> tuple[list[str], dict[str, st
     api_key = settings.anthropic_api_key
     if not api_key:
         logger.warning("ANTHROPIC_API_KEY fehlt — Peer-Generierung nicht möglich")
-        return [], {}
+        return [], {}, {}
 
     subject = company.get("name", "")
 
@@ -413,29 +414,39 @@ Antworte NUR mit einem JSON-Array, keine Erklärung, kein Markdown:
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
-                    n        = (item.get("name") or "").strip()
+                    raw_n    = (item.get("name") or "").strip()
                     note     = (item.get("positioning_note") or "").strip()
                     relation = (item.get("relation") or "").strip().lower()
                 elif isinstance(item, str):
-                    n, note, relation = item.strip(), "", ""
+                    raw_n, note, relation = item.strip(), "", ""
                 else:
                     continue
-                if n and n.lower() not in seen:
-                    seen.add(n.lower())
-                    names.append(n)
-                    if note:
-                        notes[n] = note
-                    # Fail-loud statt stillem Falsch-Wert: unbekannte/fehlende
-                    # Relation wird NICHT geraten (z.B. immer "adjacent"),
-                    # sondern bleibt None — Frontend zeigt das als "unklassifiziert"
-                    # statt eine falsche Sicherheit vorzutäuschen.
-                    if relation in _VALID_RELATIONS:
-                        relations[n] = relation
-                    elif relation:
-                        logger.warning(
-                            "Claude Peer-Gen: unbekannter relation-Wert '%s' für %s (Subject %s) — verworfen",
-                            relation, n, subject,
-                        )
+
+                # PEER-GEN-NAME-VALIDATION-01: "X / Y" → beide als eigene
+                # Kandidaten, "X (nun Y)" → Rename-Notiz abgeschnitten. Note/
+                # Relation gelten inhaltlich für beide Split-Hälften gleicher-
+                # maßen (Haiku begründet meist das Paar gemeinsam, z.B. "beide
+                # sind Nischenanbieter im selben Subsegment") — dieselbe
+                # Zuordnung wie im unveränderten Einzelnamen-Fall.
+                for n in split_llm_company_name(raw_n):
+                    if n and n.lower() not in seen:
+                        seen.add(n.lower())
+                        names.append(n)
+                        if note:
+                            notes[n] = note
+                        # Fail-loud statt stillem Falsch-Wert: unbekannte/fehlende
+                        # Relation wird NICHT geraten (z.B. immer "adjacent"),
+                        # sondern bleibt None — Frontend zeigt das als "unklassifiziert"
+                        # statt eine falsche Sicherheit vorzutäuschen.
+                        if relation in _VALID_RELATIONS:
+                            relations[n] = relation
+                        elif relation:
+                            logger.warning(
+                                "Claude Peer-Gen: unbekannter relation-Wert '%s' für %s (Subject %s) — verworfen",
+                                relation, n, subject,
+                            )
+                    if len(names) >= 5:
+                        break
                 if len(names) >= 5:
                     break
 
@@ -592,6 +603,31 @@ async def _resolve_or_create_peer(
             if source_val == "peer_generated" and "22P02" in str(e):
                 logger.warning("Enum 'peer_generated' fehlt — Fallback auf 'manual' für %s", peer_name)
                 continue
+            _msg = str(e)
+            if resolved_ticker and ("duplicate key" in _msg.lower() or "23505" in _msg):
+                # PEER-GEN-NAME-VALIDATION-01-Folgefund (04.07.): analog zu
+                # find_or_create_buyer_company()'s Race-Handling. Wenn zwei
+                # Split-Kandidaten ("X / Y") beide auf denselben Ticker
+                # auflösen (z.B. weil sie tatsächlich dieselbe Company sind),
+                # verhindert companies_ticker_unique zwar korrekt die zweite
+                # Row — ohne Re-Query ging der zweite Kandidat bisher aber
+                # spurlos verloren statt mit der bereits existierenden Row
+                # verknüpft zu werden (Andreas-Frage 04.07.).
+                try:
+                    hit = (db.table("companies").select("*")
+                           .ilike("ticker", resolved_ticker).limit(1).execute().data)
+                    if hit:
+                        logger.info(
+                            "Peer-Race erkannt für '%s' (Ticker %s bereits vergeben) — "
+                            "verknüpft mit bestehender Row statt Duplikat",
+                            peer_name, resolved_ticker,
+                        )
+                        return hit[0]["id"], False
+                except Exception as e2:
+                    logger.warning(
+                        "Peer anlegen: Re-Query nach Ticker-Race failed für %s: %s",
+                        peer_name, e2,
+                    )
             logger.warning("Peer anlegen fehlgeschlagen für %s: %s", peer_name, e)
             break
 

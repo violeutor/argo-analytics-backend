@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 import httpx
 
 from src.config import settings
+from src.services.llm_name_validation import split_llm_company_name
 
 logger = logging.getLogger(__name__)
 
@@ -221,19 +222,35 @@ Antworte NUR mit JSON-Array, kein Markdown:
         for item in parsed:
             if not isinstance(item, dict):
                 continue
-            bname = (item.get("name") or "").strip()
-            if not bname or bname.lower() in seen:
+            raw_name = (item.get("name") or "").strip()
+            candidate_names = split_llm_company_name(raw_name)
+            if not candidate_names:
                 continue
-            seen.add(bname.lower())
-            out.append(_mk_pool_item(
-                name=bname,
-                source_type="adjacent_llm",
-                ticker_hint=(item.get("ticker") or "").strip().upper() or None,
-                exchange_hint=(item.get("exchange") or "").strip() or None,
-                rationale_seed=(item.get("rationale") or "").strip() or None,
-                confidence="low",
-                needs_resolve=True,
-            ))
+            # PEER-GEN-NAME-VALIDATION-01: Ticker-Hint gilt nur für den
+            # unveränderten Einzelnamen-Fall. Bei einem Split ("X / Y") kann
+            # der eine mitgelieferte Ticker unmöglich für beide Kandidaten
+            # stimmen — nicht übernehmen, stattdessen den vollen Wikidata-
+            # Resolve je Kandidat entscheiden lassen (needs_resolve=True greift
+            # für adjacent_llm ohnehin immer).
+            ticker_hint = (
+                (item.get("ticker") or "").strip().upper() or None
+                if len(candidate_names) == 1 else None
+            )
+            for bname in candidate_names:
+                if not bname or bname.lower() in seen:
+                    continue
+                seen.add(bname.lower())
+                out.append(_mk_pool_item(
+                    name=bname,
+                    source_type="adjacent_llm",
+                    ticker_hint=ticker_hint,
+                    exchange_hint=(item.get("exchange") or "").strip() or None,
+                    rationale_seed=(item.get("rationale") or "").strip() or None,
+                    confidence="low",
+                    needs_resolve=True,
+                ))
+                if len(out) >= limit:
+                    break
             if len(out) >= limit:
                 break
 
