@@ -589,7 +589,9 @@ def compute_strategic_score(company: dict, ma_aggregate: dict | None = None) -> 
         # Stage-sensitiver konservativer Sockel statt platt — analog zum
         # no-buyer-Fallback in compute_ma_score, damit eine private Company
         # ohne fertiges Buyer-Enrichment nicht kurzzeitig auf einen
-        # Einheitswert fällt (SC-02 fließt mit 20% in den Composite).
+        # Einheitswert fällt. (Hinweis: SC-02 fließt NICHT in den Composite,
+        # s. COMPOSITE-DEFINITION-01/S81 — der Sockel dient allein der
+        # Aussagekraft von SC-02 selbst im Buyer-/M&A-Kontext.)
         stage = _resolve_funding_stage(company)
         stage_pts = _stage_match(stage, _STAGE_MA_SCORE) * 0.15   # 0..1.275
         score = 1.5 + stage_pts
@@ -1188,8 +1190,10 @@ def compute_composite_score(result: ScoreResult) -> float | None:
     """
     SC-05: Gewichteter Composite aller Sub-Scores.
 
-    Formel: Financial 25% + Strategic 20% + Market 20% + Ownership 15%
-            + Value Driver 10% + (10−Risk) 10%
+    Formel: Financial 25% + Market 20% + Ownership 15% + Value Driver 10%
+            + (10−Risk) 10% — Basis 0.80, automatisch normalisiert über
+            total_weight. Strategic (SC-02) bewusst NICHT Teil des Composite
+            (COMPOSITE-DEFINITION-01, S81) — s. Begründung bei _COMPOSITE_WEIGHTS.
 
     Gibt None wenn weniger als 3 Sub-Scores berechnet wurden (zu wenig Datenbasis).
     Normalisiert Gewichte automatisch wenn Sub-Scores fehlen.
