@@ -1085,7 +1085,15 @@ def find_or_create_buyer_company(
     Listing-Kollisionen (gleicher Ticker, andere Börse) sind bei distinkten
     Large-Caps selten — bekannte Einschränkung, kein Blocker.
 
-    Gibt die companies-Row zurück (inkl. market_cap_usd_bn) oder None bei Fehler.
+    BUYER-RACE-01: Insert erfolgt NUR mit gesetztem `ticker` — ticker-lose
+    Kandidaten werden verworfen (None), nicht angelegt. Der Lookup-per-Name
+    (bereits existierende Rows finden) bleibt davon unberührt. Schließt damit
+    zugleich die einzige unprotected Insert-Race (kein Unique-Index auf `name`,
+    anders als `companies_ticker_unique`), da der Name-Only-Insert-Pfad nie
+    mehr erreicht wird.
+
+    Gibt die companies-Row zurück (inkl. market_cap_usd_bn) oder None bei Fehler
+    bzw. fehlendem Ticker.
     """
     db = get_supabase()
     try:
@@ -1101,13 +1109,33 @@ def find_or_create_buyer_company(
     except Exception as e:
         logger.warning("find_or_create_buyer_company lookup failed für %s: %s", name, e)
 
+    # BUYER-RACE-01 (04.07., final): kein Insert ohne Ticker. Ein Buyer ist
+    # axiomatisch börsennotiert (s. Docstring) — ein ticker-loser Kandidat ist
+    # entweder eine Datenlücke der Quelle (supply_chain ohne kuratierten Ticker,
+    # Wikidata-Incumbent ohne P249) oder ein Resolve-Fall, der eigentlich schon
+    # in _autopick_listed() hätte verworfen werden müssen. Nachgelagert wäre die
+    # Row ohnehin tot: _yahoo_ticker() braucht den Ticker für den Financials-Fill,
+    # ohne market_cap scheitert _passes_size_gate() garantiert — reine verwaiste
+    # Row, die nur noch das Name-Race-Fenster offenhält (kein Unique-Index auf
+    # `name`, anders als companies_ticker_unique). Kein Constraint-Workaround
+    # nötig, wenn der unprotected Insert-Pfad für Buyer schlicht nie erreicht wird.
+    # Lookup-per-Name oben bleibt unverändert (findet bereits existierende Rows,
+    # kein Insert, keine Race).
+    if not ticker:
+        logger.info(
+            "find_or_create_buyer_company: '%s' ohne auflösbaren Ticker — kein Insert "
+            "(Buyer ist axiomatisch börsennotiert; ticker-lose Kandidaten scheitern "
+            "ohnehin am Size-Gate mangels market_cap, BUYER-RACE-01)", name,
+        )
+        return None
+
     payload: dict = {
         "name":              name,
         "source":            "buyer_gen",
         "enrichment_status": "pending",
         "ipo_status":        "listed",   # is_listed (generated) folgt aus ticker IS NOT NULL
+        "ticker":            ticker,
     }
-    if ticker:        payload["ticker"]        = ticker
     if exchange:      payload["exchange"]      = exchange
     if headquarters:  payload["headquarters"]  = headquarters
     if founding_year: payload["founding_year"] = founding_year
@@ -1118,18 +1146,20 @@ def find_or_create_buyer_company(
             logger.info("find_or_create_buyer_company: neue Buyer-Company '%s' (%s)", name, ticker)
             return res.data[0]
     except Exception as e:
-        # BUYER-RACE-01 (04.07.): find-then-insert ist nicht atomar. Sektor-
+        # BUYER-RACE-01 (04.07., final): find-then-insert ist nicht atomar. Sektor-
         # Incumbents aus _harvest_sector() sind dieselbe kleine Menge großer,
         # bekannter Käufer für VIELE unterschiedliche Target-Companies —
         # werden mehrere Targets ungefähr gleichzeitig geladen/enriched
         # (z.B. Discovery-Cron-Nachlauf, Nutzer-Burst), können zwei parallele
         # enrich_buyers_for_company()-Läufe denselben Buyer beide als "noch
         # nicht in der DB" sehen und beide inserten wollen.
-        # Fängt den Fall ab, WENN eine Unique-Constraint auf ticker/name
-        # existiert (Postgres Duplicate-Key, 23505) — re-queried dann statt
-        # zu scheitern. Löst die Race NICHT, falls keine Unique-Constraint
-        # existiert (ungeprüft — offene Rückfrage), macht den Fall dann aber
-        # wenigstens sichtbar (warning) statt lautlos als None durchzureichen.
+        # Geklärt (04.07., DB-Check): companies_ticker_unique ist ein partieller
+        # Unique-Index (WHERE ticker IS NOT NULL) — wirft denselben 23505 wie ein
+        # Table-Constraint. `ticker` ist an dieser Stelle IMMER gesetzt (Guard
+        # oben verhindert den ticker-losen Insert-Fall komplett), der Race ist
+        # also für jeden Insert, der hierher kommt, tatsächlich geschlossen —
+        # dieser Handler re-queried nur noch den (seltenen) echten Gleichzeitig-
+        # keitsfall, kein Blindflug mehr wie vor dem DB-Check.
         _msg = str(e)
         if "duplicate key" in _msg.lower() or "23505" in _msg:
             logger.info(
