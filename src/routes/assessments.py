@@ -11,8 +11,8 @@ Flow v2.0 (BUG-31 Fix):
      c. Ergebnis in company_assessments schreiben
   4. Response zurück
 
-Dimensionen (6):
-  market · financials · strategy · political · technology · operations
+Dimensionen (7, seit S88 — SUBSCORE-COMPOSITION-AUDIT-01):
+  market · financials · strategy · political · technology · operations · governance
 
 Scoring-Prinzip (BUG-31):
   - Alle Scores kommen aus Daten (market_data, funding_stage, signals, value_drivers, peers)
@@ -37,9 +37,12 @@ from src.integrations.supabase import (
     fetch_market_data,
     fetch_tam_cache,
     fetch_value_drivers,
+    fetch_funding_rounds,
+    fetch_ownership_entries,
     get_supabase,
 )
 from src.services.score_calculator import compute_dimension_risks
+from src.services.ownership_merge import build_ownership_raw   # SUBSCORE-COMPOSITION-AUDIT-01 (S88)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -113,6 +116,7 @@ _DIM_LABELS = {
     "political":  "Political Environment",
     "technology": "Technologie",
     "operations": "Operative Stärke",
+    "governance": "Governance / Eigentümerstruktur",   # SUBSCORE-COMPOSITION-AUDIT-01 (S88)
 }
 
 def _build_narrative_context(
@@ -206,6 +210,7 @@ Dimensions to annotate:
 4. political — regulatory environment, policy signals
 5. technology — tech readiness, IP position, innovation signals
 6. operations — enabler dependencies, supplier/customer concentration
+7. governance — ownership structure transparency/concentration (NOT investor quality — that is a separate score)
 
 Context:
 {context}
@@ -241,6 +246,11 @@ Respond with this exact JSON structure:
     }},
     {{
       "id": "operations",
+      "opportunity_note": "<factual, max 2 sentences>",
+      "risk_note": "<factual, max 2 sentences>"
+    }},
+    {{
+      "id": "governance",
       "opportunity_note": "<factual, max 2 sentences>",
       "risk_note": "<factual, max 2 sentences>"
     }}
@@ -373,6 +383,30 @@ async def get_assessments(name: str):
             market = tam = vd_raw = None
             pos_signals = neg_signals = []
 
+        # SUBSCORE-COMPOSITION-AUDIT-01 (S88): Ownership-Daten für SC-10s neue
+        # Governance-Dimension. Nur zwei der drei Quellen, die company_detail.py
+        # nutzt (funding_rounds + ownership_entries-Tabelle) — enrichment.
+        # investors kommt aus der teuren _safe_enrichment()-Orchestrierung
+        # (Wikipedia/DDG/Ticker-Resolution), die hier bewusst NICHT repliziert
+        # wird, nur um an ein Investoren-Feld zu kommen. Kein struktureller
+        # Blindspot: EN-08 zieht enrichment.investors ohnehin in die
+        # ownership_entries-Tabelle nach, sobald die Enrichment-Pipeline für
+        # die Company einmal gelaufen ist — betrifft also nur das Fenster
+        # zwischen Erstanlage und erstem Enrichment-Lauf.
+        try:
+            _funding_rounds_raw = fetch_funding_rounds(company_id) if company_id else []
+            _ownership_entries_raw = fetch_ownership_entries(company_id) if company_id else []
+        except Exception as e:
+            logger.warning("assessments ownership fetch failed for %s: %s", name, e)
+            _funding_rounds_raw = []
+            _ownership_entries_raw = []
+
+        ownership_raw = build_ownership_raw(
+            enrichment_investors=None,   # s. Kommentar oben
+            funding_rounds=_funding_rounds_raw,
+            db_ownership_entries=_ownership_entries_raw,
+        )
+
         # Value Drivers als flache Liste für compute_dimension_risks
         vd_flat: list[dict] = []
         if vd_raw:
@@ -388,6 +422,7 @@ async def get_assessments(name: str):
                 market_data=market,
                 signals=all_signals,
                 value_drivers=vd_flat,
+                ownership_entries=ownership_raw,
             )
         except Exception as e:
             logger.error("compute_dimension_risks failed for %s: %s", name, e)
@@ -395,7 +430,7 @@ async def get_assessments(name: str):
             dimension_scores = {
                 dim: {"opportunity_score": 5.0, "risk_score": 5.0, "data_confidence": "low",
                       "opportunity_sources": [], "risk_sources": []}
-                for dim in ("market", "financials", "strategy", "political", "technology", "operations")
+                for dim in ("market", "financials", "strategy", "political", "technology", "operations", "governance")
             }
 
         # 5. Composite berechnen

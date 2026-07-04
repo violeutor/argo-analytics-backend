@@ -48,6 +48,7 @@ from src.services.market_data_enrichment import (
     enrich_market_data_sync_wrapper,
 )
 from src.services.value_drivers_enrichment import enrich_value_drivers
+from src.services.ownership_merge import build_ownership_raw   # SUBSCORE-COMPOSITION-AUDIT-01 (S88)
 from src.services.valuation import compute_target_valuation   # FRONTEND-VALUATION-SSOT-DRIFT-01
 from src.pipelines.scoring import (
     compute_scores,
@@ -3698,30 +3699,21 @@ async def get_company_detail(name: str, background_tasks: BackgroundTasks, isin:
                 # erhöhten Transparenz-Tier (fällt weiterhin auf den 0.5-"manual"-Default
                 # in compute_ownership_score) — das ist eine Kalibrierungsfrage,
                 # CATEGORY-CEILING-REVIEW-01, nicht Teil dieses Wiring-Fixes.
-                _own_raw_names: set[str] = set()
-                ownership_raw: list[dict] = []
-
-                def _add_own_raw(name, investor_type, source, share_pct=None):
-                    nm = (name or "").strip()
-                    if not nm or nm.lower() in _own_raw_names:
-                        return
-                    _own_raw_names.add(nm.lower())
-                    ownership_raw.append({
-                        "name": nm, "investor_type": investor_type,
-                        "share_pct": share_pct, "source": source,
-                    })
-
-                if enrichment.investors:
-                    for inv in enrichment.investors:
-                        _add_own_raw(inv.name, inv.type, "enrichment")
-
-                for r in db_rounds:
-                    _add_own_raw(r.get("lead_investor"), "VC/Investor", "funding_rounds")
-                    for co in (r.get("co_investors") or []):
-                        _add_own_raw(co, "VC/Investor", "funding_rounds")
-
-                for e in db_ownership_entries:
-                    _add_own_raw(e.get("name"), e.get("type"), e.get("source") or "manual", e.get("share_pct"))
+                # SUBSCORE-COMPOSITION-AUDIT-01 (S88): Inline-Merge nach
+                # src/services/ownership_merge.py ausgelagert — geteilt mit
+                # assessments.py (SC-10 Governance-Dimension braucht dieselben
+                # Rohdaten). enrichment.investors sind Pydantic-Objekte, hier
+                # vor dem Aufruf zu Dicts normalisiert (build_ownership_raw
+                # erwartet dict-Form, damit sie ohne Objekt-Import auch von
+                # anderen Aufrufern nutzbar ist).
+                _enrichment_investors_raw = [
+                    {"name": inv.name, "type": inv.type} for inv in (enrichment.investors or [])
+                ]
+                ownership_raw = build_ownership_raw(
+                    enrichment_investors=_enrichment_investors_raw,
+                    funding_rounds=db_rounds,
+                    db_ownership_entries=db_ownership_entries,
+                )
                 vd_cached_now = fetch_value_drivers(company_id)
                 vd_list: list[dict] = []
                 if vd_cached_now:
