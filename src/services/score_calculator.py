@@ -10,11 +10,20 @@ Sub-Scores (0–10):
   SC-02  Strategic Score     — SRR × TechReadiness × Buyer Fit
   SC-03  Market Score        — CAGR + Competition + Data Richness
   SC-04  Risk Score          — Beta + Governance + Negative Signals + Stage
+                             (S88, SUBSCORE-COMPOSITION-AUDIT-01: aus dem
+                             Composite entfernt, s. SC-10. Weiterhin berechnet
+                             als Frontend-Fallback/Diagnose, kein UI-Tab zeigt
+                             SC-04 direkt.)
   SC-08  Ownership Score     — Transparenz-Score (Quelle) ± Investoren-Tier-
                              Modifier (CATEGORY-CEILING-REVIEW-01, S84 —
                              war Investor-Qualität + Diversifikation +
                              Transparenz, s. compute_ownership_score)
-  SC-09  Value Driver Score  — Dependency + Netzeffekte + TechReadiness
+  SC-09  Value Driver Score  — Dependency (Enabler, dependency_level seit
+                             S88) + Market Position + Driver Count
+  SC-10  Compound Risk Score — 7 Dimensionen (Market/Financials/Strategy/
+                             Operations/Technology/Political/Governance, S88:
+                             +Governance +Beta-in-Market). Seit S88 alleiniger
+                             Risk-Lieferant für den Composite (löst SC-04 ab).
 
 Path-Scores (0–10):
   IPO Score      — TechReadiness + IPO Signals + Funding Stage + ipo_potential
@@ -27,10 +36,14 @@ Composite + Rating:
                              COMPOSITE-DEFINITION-01 (S81): Financial 25% +
                              Market 20% + Ownership 15% + Value Driver 10%
                              + (10−Risk) 10% (Basis 0.80, auto-normalisiert).
-                             SC-02 Strategic bewusst NICHT Teil des Composite
-                             — ist Buyer-Matching-Signal (M&A), keine Company-
-                             intrinsische Attraktivität. Bleibt eigenständig
-                             berechnet, speist weiterhin M&A Score.
+                             SUBSCORE-COMPOSITION-AUDIT-01 (S88): Risk-
+                             Komponente liest jetzt SC-10 (compound_risk_score)
+                             statt SC-04 — derselbe Score, den der Potenziale
+                             & Risiken-Tab anzeigt, kein unsichtbarer Parallel-
+                             Score mehr. SC-02 Strategic bewusst NICHT Teil des
+                             Composite — ist Buyer-Matching-Signal (M&A), keine
+                             Company-intrinsische Attraktivität. Bleibt eigen-
+                             ständig berechnet, speist weiterhin M&A Score.
   SC-11  Hero Path           — argmax(path_scores) → dominanter Investitionspfad
   SC-12  Score Inputs        — serialisierte Inputs je Score (für Tooltip)
   SC-13  Rating A–D          — aus hero_score; A ≥7.5 · B ≥5.5 · C ≥3.5 · D <3.5
@@ -872,15 +885,15 @@ def compute_value_driver_score(
     """
     SC-09: Value Driver Score (0–10). Höher = stärkere strukturelle Vorteile.
 
-    Inputs: value_drivers (dependency_score, market_position, type).
+    Inputs: value_drivers (dependency_level [nur Enabler], market_position, type).
 
     Gewichtung (TR-CONSISTENCY-AUDIT-01, S76 — TechReadiness entfernt):
-      Dependency Score   0–5.5 Pkt  (Kernmetrik — tatsächliche Enabler-Qualität)
+      Dependency Level   0–5.5 Pkt  (Kernmetrik — tatsächliche Enabler-Qualität)
       Market Position    0–2.0 Pkt  (Leader/Dominant Einträge)
       Driver Count       0–2.0 Pkt  (Anzahl identifizierter Value Drivers)
       Baseline           0.5  Pkt   (immer)
 
-    Rationale: Dependency Score und Market Position reflektieren die tatsächliche
+    Rationale: Dependency Level und Market Position reflektieren die tatsächliche
     Supply-Chain-Stärke. Eine Series-A Company mit kritischen Enablerabhängig-
     keiten schlägt eine Series-C Company mit commodity Enablers — wie in der
     Realität.
@@ -891,6 +904,20 @@ def compute_value_driver_score(
     Entfernung). Die 1.5 Pkt auf Dependency umverteilt (4.0→5.5), die laut
     eigener Doku die echte Qualitätsmetrik ist. _compute_target_tech_readiness()
     wird hier nicht mehr aufgerufen.
+
+    VALUE-DRIVER-DEPENDENCYSCORE-01 (S88, live-Bug seit S76): Das ursprünglich
+    hier gelesene numerische Feld "dependency_score" existiert in keiner
+    einzigen DB-Row (SQL-Stichprobe S88 — Keyliste realer Enabler-Einträge
+    enthält es nicht). dep_vals war seit der S76-Umgewichtung (4.0→5.5)
+    strukturell immer leer — SC-09 lieferte seitdem für jede Company nur
+    Baseline+Driver-Count+Market-Position (max. 4.5 von 10), nie mehr, ohne
+    Fehler oder Log. Fix: dependency_level (kategorisch: critical/high/medium/
+    commodity — dasselbe Feld, das SC-10s Operations-Dimension bereits nutzt,
+    s. compute_dimension_risks). Bewusst nur Enabler-Einträge (Docstring
+    spricht explizit von "Enabler-Qualität") — Contributors tragen weiterhin
+    nur zum Driver-Count bei, unverändert. Reale Nachkalibrierung der
+    Punktetabelle bleibt eigenständiges Ticket, hier zunächst plausible
+    Erstbelegung (critical > high > medium > commodity).
     """
     inputs: dict = {}
     score = 0.5   # Baseline
@@ -909,12 +936,21 @@ def compute_value_driver_score(
     score += min(2.0, len(vds) * 0.4)
     inputs["driver_count"] = len(vds)
 
-    # Dependency Score Durchschnitt (0–5.5) — Kernmetrik
-    dep_vals = [float(d["dependency_score"]) for d in vds if d.get("dependency_score") is not None]
-    if dep_vals:
-        avg_dep = sum(dep_vals) / len(dep_vals)
-        score += avg_dep * 5.5   # war: 4.0 — TR-Gewicht (1.5) auf die echte Qualitätsmetrik umverteilt
-        inputs["avg_dependency_score"] = round(avg_dep, 2)
+    # Dependency Level Durchschnitt (0–5.5) — Kernmetrik, nur Enabler
+    # VALUE-DRIVER-DEPENDENCYSCORE-01 (S88): dependency_level statt totem
+    # dependency_score, s. Docstring oben. Erstbelegung, Nachkalibrierung
+    # eigenständiges Ticket.
+    _DEP_LEVEL_PTS = {"critical": 1.0, "high": 0.7, "medium": 0.4, "commodity": 0.1}
+    enabler_levels = [
+        _DEP_LEVEL_PTS[d["dependency_level"]]
+        for d in vds
+        if d.get("type") == "enabler" and d.get("dependency_level") in _DEP_LEVEL_PTS
+    ]
+    if enabler_levels:
+        avg_dep = sum(enabler_levels) / len(enabler_levels)
+        score += avg_dep * 5.5
+        inputs["avg_dependency_level_pts"] = round(avg_dep, 2)
+        inputs["enabler_count_scored"]     = len(enabler_levels)
 
     # Market Position Bonus (0–2.0)
     strong = sum(
@@ -1174,12 +1210,23 @@ def compute_enabler_score(
     score += min(3.0, len(enabler_vds) * 1.0)
     inputs["enabler_driver_count"] = len(enabler_vds)
 
-    # Dependency Score (0–3.5) — Kernmetrik der Käufer-Abhängigkeit
-    dep_vals = [float(d["dependency_score"]) for d in enabler_vds if d.get("dependency_score") is not None]
-    if dep_vals:
-        avg_dep = sum(dep_vals) / len(dep_vals)
+    # Dependency Level (0–3.5) — Kernmetrik der Käufer-Abhängigkeit
+    # VALUE-DRIVER-DEPENDENCYSCORE-01 (S88): identischer Bug wie in SC-09
+    # gefunden, unabhängig davon — "dependency_score" existiert in keiner
+    # DB-Row (SQL-Stichprobe S88). dep_vals war seit S76 (TR-CONSISTENCY-
+    # AUDIT-01, Umgewichtung 2.0→3.5 auf dieses Feld) strukturell immer leer.
+    # Fix analog SC-09 (compute_value_driver_score): dependency_level-Mapping
+    # statt totem numerischen Feld.
+    _DEP_LEVEL_PTS_ENABLER = {"critical": 1.0, "high": 0.7, "medium": 0.4, "commodity": 0.1}
+    dep_levels = [
+        _DEP_LEVEL_PTS_ENABLER[d["dependency_level"]]
+        for d in enabler_vds
+        if d.get("dependency_level") in _DEP_LEVEL_PTS_ENABLER
+    ]
+    if dep_levels:
+        avg_dep = sum(dep_levels) / len(dep_levels)
         score += avg_dep * 3.5
-        inputs["avg_dependency"] = round(avg_dep, 2)
+        inputs["avg_dependency_level_pts"] = round(avg_dep, 2)
 
     return _safe_round(score), inputs
 
@@ -1212,8 +1259,16 @@ def compute_composite_score(result: ScoreResult) -> float | None:
     # Teil des Composite — s. Begründung bei _COMPOSITE_WEIGHTS oben. SC-02
     # bleibt auf result.strategic_score unverändert berechnet für Buyer-Tab/M&A.
 
-    if result.risk_score is not None:
-        components.append((10.0 - result.risk_score, _COMPOSITE_WEIGHTS["risk_inv"]))
+    if result.compound_risk_score is not None:
+        # SUBSCORE-COMPOSITION-AUDIT-01 (S88): SC-04 (risk_score) hier ersetzt
+        # durch SC-10 (compound_risk_score) — genau EIN Risk-Score speist jetzt
+        # den Composite, und es ist derselbe, den der Potenziale & Risiken-Tab
+        # anzeigt (vorher: unsichtbarer Parallel-Score). compute_risk_score()
+        # (SC-04) bleibt als Funktion bestehen und wird weiterhin berechnet
+        # (result.risk_score) — Frontend-Fallback für den unwahrscheinlichen
+        # Fall, dass compute_dimension_risks() komplett fehlschlägt, sowie
+        # Diagnose-Referenz während der Migration. Kein Composite-Input mehr.
+        components.append((10.0 - result.compound_risk_score, _COMPOSITE_WEIGHTS["risk_inv"]))
 
     if len(components) < 3:
         return None
@@ -1294,20 +1349,31 @@ def derive_rating(hero_score: float | None, composite_score: float | None) -> st
 # ── Haupt-Funktion ─────────────────────────────────────────────────────────────
 
 def compute_dimension_risks(
-    company:       dict,
-    market_data:   dict | None       = None,
-    signals:       list[dict] | None = None,
-    value_drivers: list[dict] | None = None,
+    company:           dict,
+    market_data:       dict | None       = None,
+    signals:           list[dict] | None = None,
+    value_drivers:     list[dict] | None = None,
+    ownership_entries: list[dict] | None = None,
 ) -> dict:
     """
-    SC-10 Basis: Algorithmische Opportunity/Risk-Scores für 6 Dimensionen.
+    SC-10 Basis: Algorithmische Opportunity/Risk-Scores für 7 Dimensionen.
     Datenmangel → neutral (4.0–5.0), kein halluziniertes Risiko (BUG-31).
+
+    SUBSCORE-COMPOSITION-AUDIT-01 (S88): Beta + Governance aus dem
+    retirierten SC-04 (compute_risk_score) migriert — Beta in die Market-
+    Dimension (identische Kalibrierung, Ziel-Skala 0–10 statt 0–2), Governance
+    als eigene 7. Dimension (bewusst keine Fusion mit SC-08 — SC-08 misst
+    Quellen-Autorität/Transparenz, diese Dimension misst Governance-RISIKO
+    aus Bekanntheit der Struktur; zwei Konzepte auf denselben Rohdaten,
+    analog zur Operations-Dimension, die Value Drivers ebenfalls anders liest
+    als SC-09 — dort als Stärke, hier als Risiko, bewusste Doppel-Perspektive).
 
     Returns: {dim_id: {opportunity_score, risk_score, data_confidence, opportunity_sources, risk_sources}}
     """
     md   = market_data or {}
     sigs = signals or []
     vd   = value_drivers or []
+    own  = ownership_entries or []
 
     dims: dict[str, dict] = {}
 
@@ -1324,17 +1390,47 @@ def compute_dimension_risks(
         min(10.0, max(3.0, float(cagr) * 0.4 + 5.0)) if cagr is not None
         else _CYCLE_OPP.get(market_cycle or "", 5.0)
     )
+
+    # Beta / Volatilität — Migration aus SC-04 (compute_risk_score, retiriert
+    # aus dem Composite, S88). Identische Kalibrierung: Market Beta (listed)
+    # volle Gewichtung, Damodaran-Sektor-Beta (privat) 60% — nur Ziel-Skala
+    # 0–10 statt 0–2 (×5).
+    beta        = company.get("beta_1y") or company.get("beta")
+    beta_source = company.get("beta_source", "")
+    beta_risk: float | None = None
+    if beta is not None:
+        beta = float(beta)
+        damodaran_factor = 0.6 if beta_source == "damodaran" else 1.0
+        raw_beta_risk = (
+            10.0 if beta >= 2.0 else
+            7.5  if beta >= 1.5 else
+            5.0  if beta >= 1.0 else
+            2.5  if beta >= 0.5 else 1.0
+        )
+        beta_risk = raw_beta_risk * damodaran_factor
+
     comp_risk  = _COMP_RISK.get(competition or "", 4.0)
     cycle_risk = _CYCLE_RISK.get(market_cycle or "", 4.0)
-    mkt_risk   = (comp_risk * 0.7 + cycle_risk * 0.3) if competition else 4.0
+    if competition and beta_risk is not None:
+        mkt_risk = comp_risk * 0.5 + cycle_risk * 0.2 + beta_risk * 0.3
+    elif competition:
+        mkt_risk = comp_risk * 0.7 + cycle_risk * 0.3
+    elif beta_risk is not None:
+        mkt_risk = beta_risk * 0.5 + 4.0 * 0.5   # Rest neutral, Beta bekannt
+    else:
+        mkt_risk = 4.0
 
-    mkt_conf = "high" if (cagr and competition) else ("medium" if (cagr or competition) else "low")
+    mkt_conf = "high" if (cagr and competition) else (
+        "medium" if (cagr or competition or beta_risk is not None) else "low"
+    )
     dims["market"] = {
         "opportunity_score": _safe_round(mkt_opp),
         "risk_score":        _safe_round(mkt_risk),
         "data_confidence":   mkt_conf,
         "opportunity_sources": ["market_data.cagr_pct", "market_data.market_cycle"],
-        "risk_sources":        ["market_data.competition_score", "market_data.market_cycle"],
+        "risk_sources":        ["market_data.competition_score", "market_data.market_cycle", "companies.beta_1y"],
+        "beta":               beta,
+        "beta_source":        beta_source or None,
     }
 
     # ─── 2. FINANCIALS ─────────────────────────────────────────────────────
@@ -1530,17 +1626,52 @@ def compute_dimension_risks(
         "risk_sources":        ["value_drivers.dependency_level(critical/high)", "signals[key_person_risk]"],
     }
 
+    # ─── 7. GOVERNANCE (Bekanntheit der Eigentümerstruktur) ─────────────────
+    # SUBSCORE-COMPOSITION-AUDIT-01 (S88): Migriert aus dem retirierten SC-04
+    # (compute_risk_score). Skala 1:1 aus SC-04 übernommen (0–3 → 0–10, ×3.33),
+    # keine Neukalibrierung — Ausgangswerte sind identisch zur bisherigen,
+    # bereits S84 bestätigten Neutralzone-Logik ("keine Daten ≠ aktiv
+    # verschleiert"). Bewusst getrennt von SC-08: SC-08 misst Autorität/
+    # Belastbarkeit der Ownership-Quelle (Transparenz-Score), diese Dimension
+    # misst Governance-RISIKO aus der schieren Bekanntheit der Struktur —
+    # unterschiedliche Fragen an dieselben Rohdaten (ownership_entries).
+    is_listed_gov = _is_listed(company)
+    if is_listed_gov:
+        gov_risk, gov_conf, gov_basis = 1.0, "high", "listed"
+    elif not own:
+        gov_risk, gov_conf, gov_basis = 5.0, "low", "opaque"
+    elif len(own) == 1:
+        gov_risk, gov_conf, gov_basis = 5.0, "medium", "single_entry"
+    else:
+        gov_risk, gov_conf, gov_basis = 1.67, "medium", "partial"
+
+    dims["governance"] = {
+        "opportunity_score": _safe_round(10.0 - gov_risk),
+        "risk_score":        _safe_round(gov_risk),
+        "data_confidence":   gov_conf,
+        "opportunity_sources": ["ownership_entries.count", "companies.is_listed"],
+        "risk_sources":        ["ownership_entries.count", "companies.is_listed"],
+        "governance_basis":   gov_basis,
+    }
+
     return dims
 
 
 def compute_compound_risk_score(dimension_risks: dict) -> tuple[float, dict]:
     """
-    SC-10: Compound Risk Score aus 6 Dimensions-Risiken (0–10, höher = mehr Risiko).
+    SC-10: Compound Risk Score aus 7 Dimensions-Risiken (0–10, höher = mehr Risiko).
     Confidence-Dämpfung: low-confidence Dimensionen zählen 50% (kein Aufblasen durch Datenmangel).
+
+    SUBSCORE-COMPOSITION-AUDIT-01 (S88): Governance neu aufgenommen (0.08),
+    Market/Strategy/Operations/Technology/Political moderat runtergewichtet,
+    um auf 1.00 zu summieren. Erstbelegung — bewusst niedrig gewichtet, da
+    neue Dimension ohne Kalibrierungs-Historie. Nachkalibrierung erwartet,
+    sobald Composite-Feed (statt SC-04) einige Sessions live gelaufen ist.
     """
     _WEIGHTS: dict[str, float] = {
-        "market":     0.20, "financials": 0.20, "strategy":  0.20,
-        "operations": 0.15, "technology": 0.15, "political": 0.10,
+        "market":     0.20, "financials": 0.20, "strategy":   0.18,
+        "operations": 0.13, "technology": 0.13, "political":  0.08,
+        "governance": 0.08,
     }
     _CONF_FACTOR = {"high": 1.0, "medium": 0.75, "low": 0.50}
 
@@ -1613,13 +1744,15 @@ def compute_all_scores(
     _run(result, "financial_score",    lambda: compute_financial_score(company, funding_momentum, headcount_snapshots), all_inputs, "financial",    "SC-01")
     _run(result, "strategic_score",    lambda: compute_strategic_score(company, ma_aggregate),  all_inputs, "strategic",    "SC-02")
     _run(result, "market_score",       lambda: compute_market_score(mkt, company),           all_inputs, "market",       "SC-03")
+    # SC-04: weiterhin berechnet (Frontend-Fallback, Diagnose) — S88 aus dem
+    # Composite entfernt, s. compute_composite_score(). Kein UI-Tab zeigt SC-04.
     _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
     _run(result, "ownership_score",    lambda: compute_ownership_score(company, own),        all_inputs, "ownership",    "SC-08")
     _run(result, "value_driver_score", lambda: compute_value_driver_score(company, vds),    all_inputs, "value_driver", "SC-09")
 
-    # SC-10: Compound Risk Score (algorithmisch aus 6 Dimensionen)
+    # SC-10: Compound Risk Score (algorithmisch aus 7 Dimensionen, S88: +Governance)
     try:
-        _dim_risks = compute_dimension_risks(company=company, market_data=mkt, signals=sigs, value_drivers=vds)
+        _dim_risks = compute_dimension_risks(company=company, market_data=mkt, signals=sigs, value_drivers=vds, ownership_entries=own)
         _crs, _crs_inputs = compute_compound_risk_score(_dim_risks)
         result.compound_risk_score = _crs
         all_inputs["compound_risk"] = _crs_inputs
