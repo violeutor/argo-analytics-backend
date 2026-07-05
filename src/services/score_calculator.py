@@ -9,11 +9,12 @@ Sub-Scores (0–10):
   SC-01  Financial Score     — BA-Bridge Fundamentals + Funding-Stage-Proxy
   SC-02  Strategic Score     — SRR × TechReadiness × Buyer Fit
   SC-03  Market Score        — CAGR + Competition + Data Richness
-  SC-04  Risk Score          — Beta + Governance + Negative Signals + Stage
-                             (S88, SUBSCORE-COMPOSITION-AUDIT-01: aus dem
-                             Composite entfernt, s. SC-10. Weiterhin berechnet
-                             als Frontend-Fallback/Diagnose, kein UI-Tab zeigt
-                             SC-04 direkt.)
+  SC-04  (SC04-REMOVAL-01, S89: vollständig entfernt. War Beta + Governance +
+                             Negative Signals + Stage; seit S88 bereits aus dem
+                             Composite raus (s. SC-10), Frontend hatte keinen
+                             Konsumenten mehr — Funktion war tote Diagnose-
+                             Fallback-Berechnung ohne Leser. Historie:
+                             REQUESTS_ARCHIVE, Session 88/89.)
   SC-08  Ownership Score     — Transparenz-Score (Quelle) ± Investoren-Tier-
                              Modifier (CATEGORY-CEILING-REVIEW-01, S84 —
                              war Investor-Qualität + Diversifikation +
@@ -23,7 +24,8 @@ Sub-Scores (0–10):
   SC-10  Compound Risk Score — 7 Dimensionen (Market/Financials/Strategy/
                              Operations/Technology/Political/Governance, S88:
                              +Governance +Beta-in-Market). Seit S88 alleiniger
-                             Risk-Lieferant für den Composite (löst SC-04 ab).
+                             Risk-Lieferant für den Composite (löste SC-04 ab,
+                             SC-04 seit S89 vollständig entfernt).
 
 Path-Scores (0–10):
   IPO Score      — TechReadiness + IPO Signals + Funding Stage + ipo_potential
@@ -67,11 +69,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScoreResult:
-    # Sub-Scores (SC-01–SC-04, SC-08–SC-09)
+    # Sub-Scores (SC-01–SC-03, SC-08–SC-09; SC-04 entfernt S89 s. SC04-REMOVAL-01)
     financial_score:     float | None = None
     strategic_score:     float | None = None
     market_score:        float | None = None
-    risk_score:          float | None = None
     ownership_score:     float | None = None
     value_driver_score:  float | None = None
 
@@ -101,7 +102,6 @@ class ScoreResult:
             "financial_score":    self.financial_score,
             "strategic_score":    self.strategic_score,
             "market_score":       self.market_score,
-            "risk_score":         self.risk_score,
             "ownership_score":    self.ownership_score,
             "value_driver_score": self.value_driver_score,
             "compound_risk_score": self.compound_risk_score,
@@ -225,7 +225,7 @@ _COMPOSITE_WEIGHTS: dict[str, float] = {
     "market":       0.20,
     "ownership":    0.15,
     "value_driver": 0.10,
-    "risk_inv":     0.10,   # (10 − risk_score) × 0.10
+    "risk_inv":     0.10,   # (10 − compound_risk_score) × 0.10 — SC-10, s. u.
 }
 
 
@@ -664,98 +664,6 @@ def compute_market_score(market_data: dict, company: dict) -> tuple[float, dict]
     if len(drivers) >= 2: score += 0.5
     inputs["segments_count"] = len(segs)
     inputs["drivers_count"]  = len(drivers)
-
-    return _safe_round(score), inputs
-
-
-# ── SC-04 · Risk Score ─────────────────────────────────────────────────────────
-
-def compute_risk_score(
-    company: dict,
-    signals: list[dict],
-    ownership_entries: list[dict],
-) -> tuple[float, dict]:
-    """
-    SC-04: Risk Score (0–10). Höher = mehr Risiko.
-    Wird im Composite invertiert: (10 − risk_score) × 0.10.
-
-    Inputs: signals (direction=negative/absence), beta, ownership_entries, funding_stage.
-
-    Gewichtung:
-      Signal-Risiko   0–3 Pkt   (negative + absence Signale, offsett durch positive)
-      Beta            0–2 Pkt   (Markt-Volatilität, nur listed)
-      Governance      0–3 Pkt   (Ownership-Transparenz)
-      Stage-Risiko    0–2 Pkt   (frühe Stage = höheres operatives Risiko)
-    """
-    inputs: dict = {}
-    score = 0.0
-
-    sigs = signals or []
-
-    # Signal-Risiko (0–3)
-    neg = [s for s in sigs if s.get("direction") == "negative" and s.get("source") != "internal_absence"]
-    abs_ = [s for s in sigs if s.get("source") == "internal_absence"]
-    pos  = [s for s in sigs if s.get("direction") == "positive"]
-
-    risk_pts = min(3.0, len(neg) * 0.5 + len(abs_) * 0.25)
-    pos_offset = min(1.0, len(pos) * 0.2)
-    score += max(0.0, risk_pts - pos_offset)
-    inputs["negative_signals"]  = len(neg)
-    inputs["absence_signals"]   = len(abs_)
-    inputs["positive_signals"]  = len(pos)
-
-    # Beta / Volatilität (0–2)
-    # Market Beta (listed)    → volle Gewichtung — direkt beobachtbar
-    # Damodaran Beta (private) → 60% Gewichtung — Branchen-Proxy, nicht company-spezifisch
-    beta = company.get("beta_1y") or company.get("beta")
-    beta_source = company.get("beta_source", "")
-    if beta is not None:
-        beta = float(beta)
-        inputs["beta"] = beta
-        inputs["beta_source"] = beta_source
-        damodaran_factor = 0.6 if beta_source == "damodaran" else 1.0
-        raw_pts = (
-            2.0 if beta >= 2.0 else
-            1.5 if beta >= 1.5 else
-            1.0 if beta >= 1.0 else
-            0.5 if beta >= 0.5 else 0.0
-        )
-        score += raw_pts * damodaran_factor
-
-    # Governance (0–3): Ownership-Intransparenz = Risiko
-    # CATEGORY-CEILING-REVIEW-01 (S84, Andreas-Entscheidung): No-Data-Floor
-    # war 3.0 (= maximales Risiko, identisch zu aktiv verschleiert). "Keine
-    # Daten" darf nicht schlechter stehen als "eine bekannte Beteiligung" —
-    # jetzt auf Höhe von single_entry (1.5), SC-10-Neutralkonvention
-    # (BUG-31: "Datenmangel → neutral, kein halluziniertes Risiko").
-    is_listed = _is_listed(company)
-    if is_listed:
-        score += 0.3   # listed: öffentliche Rechenschaftspflicht → niedrig
-        inputs["governance"] = "listed"
-    elif not ownership_entries:
-        score += 1.5   # keine Daten = neutral, kein Verschleierungs-Signal
-        inputs["governance"] = "opaque"
-    elif len(ownership_entries) == 1:
-        score += 1.5
-        inputs["governance"] = "single_entry"
-    else:
-        score += 0.5
-        inputs["governance"] = "partial"
-
-    # Stage-Risiko (0–2)
-    stage = _resolve_funding_stage(company)
-    stage_lower = stage.lower()
-    stage_risk = (
-        2.0 if "seed" in stage_lower else
-        1.5 if "series_a" in stage_lower else
-        1.0 if "series_b" in stage_lower else
-        0.5 if "series_c" in stage_lower else
-        0.3 if any(s in stage_lower for s in ["series_d", "pre_ipo"]) else
-        0.1 if any(s in stage_lower for s in ["listed", "public"]) else
-        1.0   # unbekannt
-    )
-    score += stage_risk
-    inputs["funding_stage"] = stage
 
     return _safe_round(score), inputs
 
@@ -1260,14 +1168,13 @@ def compute_composite_score(result: ScoreResult) -> float | None:
     # bleibt auf result.strategic_score unverändert berechnet für Buyer-Tab/M&A.
 
     if result.compound_risk_score is not None:
-        # SUBSCORE-COMPOSITION-AUDIT-01 (S88): SC-04 (risk_score) hier ersetzt
-        # durch SC-10 (compound_risk_score) — genau EIN Risk-Score speist jetzt
-        # den Composite, und es ist derselbe, den der Potenziale & Risiken-Tab
-        # anzeigt (vorher: unsichtbarer Parallel-Score). compute_risk_score()
-        # (SC-04) bleibt als Funktion bestehen und wird weiterhin berechnet
-        # (result.risk_score) — Frontend-Fallback für den unwahrscheinlichen
-        # Fall, dass compute_dimension_risks() komplett fehlschlägt, sowie
-        # Diagnose-Referenz während der Migration. Kein Composite-Input mehr.
+        # SUBSCORE-COMPOSITION-AUDIT-01 (S88): SC-10 (compound_risk_score) ist
+        # alleiniger Risk-Lieferant für den Composite — derselbe Score, den der
+        # Potenziale & Risiken-Tab anzeigt, kein unsichtbarer Parallel-Score.
+        # SC-04 (compute_risk_score) war der ursprüngliche Risk-Lieferant vor
+        # S88 und wurde S89 vollständig entfernt (SC04-REMOVAL-01) — hatte
+        # keinen Konsumenten mehr, da sowohl Composite (seit S88) als auch
+        # Frontend (fest auf SC-10 verdrahtet) bereits ohne ihn auskamen.
         components.append((10.0 - result.compound_risk_score, _COMPOSITE_WEIGHTS["risk_inv"]))
 
     if len(components) < 3:
@@ -1744,9 +1651,10 @@ def compute_all_scores(
     _run(result, "financial_score",    lambda: compute_financial_score(company, funding_momentum, headcount_snapshots), all_inputs, "financial",    "SC-01")
     _run(result, "strategic_score",    lambda: compute_strategic_score(company, ma_aggregate),  all_inputs, "strategic",    "SC-02")
     _run(result, "market_score",       lambda: compute_market_score(mkt, company),           all_inputs, "market",       "SC-03")
-    # SC-04: weiterhin berechnet (Frontend-Fallback, Diagnose) — S88 aus dem
-    # Composite entfernt, s. compute_composite_score(). Kein UI-Tab zeigt SC-04.
-    _run(result, "risk_score",         lambda: compute_risk_score(company, sigs, own),       all_inputs, "risk",         "SC-04")
+    # SC-04 (compute_risk_score) vollständig entfernt (S89, SC04-REMOVAL-01) —
+    # war seit S88 bereits kein Composite-Input mehr und hatte im Frontend
+    # keinen Konsumenten mehr (page.tsx fest auf SC-10/compound_risk_score
+    # verdrahtet, kein Fallback). Historie: REQUESTS_ARCHIVE Session 88/89.
     _run(result, "ownership_score",    lambda: compute_ownership_score(company, own),        all_inputs, "ownership",    "SC-08")
     _run(result, "value_driver_score", lambda: compute_value_driver_score(company, vds),    all_inputs, "value_driver", "SC-09")
 
