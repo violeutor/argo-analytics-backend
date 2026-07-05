@@ -261,10 +261,119 @@ async def _fetch_yahoo_ownership(
     return results
 
 
+# SEC-13D-13G-FULL-PARSE-01 / 13DG-XML-PARSE-01 (S89): Verifiziert per Live-
+# Filing (Atlassian/Baillie Gifford, Accession 0001088875-26-000006,
+# primary_doc.xml, Feb 2026) statt geraten:
+#   1. Seit 18.12.2024 sind Schedule 13D/13G SEC-weit PFLICHT im strukturierten
+#      XML-Format. Der neue EDGAR-Formtyp heißt exakt "SCHEDULE 13G"/
+#      "SCHEDULE 13D" (Großschreibung, mit Leerzeichen) — unterscheidbar vom
+#      alten "SC 13G"/"SC 13D" (HTML/Text-Ära, bis 17.12.2024). Beide Varianten
+#      koexistieren aktuell in EDGAR. Der bisherige `forms`-Parameter an EFTS
+#      listete NUR die Alt-Formtypen — jedes Filing seit Dez. 2024 (>1 Jahr)
+#      lief damit am Suchfilter vorbei, unabhängig vom "13G"/"13D"-Substring-
+#      Check weiter unten (der greift erst NACH dem EFTS-Request).
+#   2. Investor-Name sitzt eindeutig unter
+#      coverPageHeaderReportingPersonDetails/reportingPersonName — keine
+#      Rollen-Ambiguität wie bei ESMA party_name (Issuer/Offeror/Guarantor).
+#   3. classPercent existiert ZWEIMAL im Dokument mit leicht abweichenden
+#      Werten: Cover Page (1 Nachkommastelle, deckt sich mit der historischen
+#      SEC-Anweisung "round to nearest tenth") vs. Item 4 (2 Nachkommastellen,
+#      keine erkennbare Rundungsvorschrift für dieses Feld). Cover-Page-Wert
+#      gewählt — regelkonform UND die erste Fundstelle in Document-Order.
+#   4. Gilt nur für Filings ab 18.12.2024 — ältere SC 13G/13D-Filings haben
+#      kein primary_doc.xml (reines HTML/Text). share_pct bleibt dort weiterhin
+#      None — kein HTML-Freitext-Parsing in diesem Schritt, bewusster Scope-
+#      Cut statt Blindfix.
+_13DG_XML_ELIGIBLE_FORMS = ("SCHEDULE 13G", "SCHEDULE 13D", "SCHEDULE 13G/A", "SCHEDULE 13D/A")
+
+
+def _normalize_13dg_source(form_type: str) -> str:
+    """
+    Alte (SC 13G/13D) und neue (SCHEDULE 13G/13D) Formtypen auf denselben
+    Source-Key mappen. SC-08 (compute_ownership_score, score_calculator.py)
+    hat eine feste Transparenz-Tier-Tabelle auf "edgar_sc_13g"/"edgar_sc_13d"
+    verdrahtet (Tier 10.0, Pflicht-Offenlegung). Ohne diese Normalisierung
+    würden alle Filings seit Dez. 2024 unter einem neuen, dort unbekannten
+    Source-Key laufen und still auf eine niedrigere Tier zurückfallen —
+    gleiches Konsistenz-Risiko wie FRONTEND-COMPOSITE-STRATEGIC-01, nur
+    Backend-Backend statt Backend-Frontend.
+    """
+    ft = form_type.upper()
+    if "13G" in ft:
+        return "edgar_sc_13g"
+    if "13D" in ft:
+        return "edgar_sc_13d"
+    return f"edgar_{form_type.lower().replace(' ', '_').replace('/', '_')}"
+
+
+async def _fetch_13dg_xml_details(client: httpx.AsyncClient, hit_id: str) -> dict | None:
+    """
+    Holt primary_doc.xml für ein strukturiertes SCHEDULE 13G/13D-Filing und
+    extrahiert reportingPersonName + classPercent (Cover Page). Nur für die
+    neuen Formtypen aufrufbar, s. Modul-Kommentar oben.
+
+    hit_id: EFTS-`_id`-Feld, Format "{accession-mit-bindestrichen}:{dateiname}"
+    (verifiziert gegen zwei unabhängige EFTS-Doku-Quellen — _id trägt immer
+    die volle Accession-Number, nie nur den Dateinamen). CIK wird wie bei
+    _fetch_edgar_form_d aus dem ersten Accession-Segment abgeleitet (= CIK
+    des Filers, nicht des Issuers — für die URL-Konstruktion unerheblich,
+    beide leben unter derselben Accession).
+    """
+    accession = hit_id.split(":")[0] if hit_id else ""
+    if not accession or "-" not in accession:
+        return None
+    cik = accession.split("-")[0].lstrip("0") or "0"
+    url = (
+        f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+        f"{accession.replace('-', '')}/primary_doc.xml"
+    )
+    try:
+        resp = await client.get(url, headers=HEADERS, timeout=12.0)
+        if resp.status_code != 200:
+            logger.debug("13G/13D primary_doc.xml HTTP %s — %s", resp.status_code, url)
+            return None
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(resp.text)
+
+        def _find_by_suffix(parent, suffix):
+            # Namespace-agnostisches Parsing (Tag-Suffix statt vollem Tag-
+            # Namen) — gleiches Muster wie _fetch_form_d_amount in
+            # discovery_engine.py, fängt Spec-Versions-Drift ab.
+            for el in parent.iter():
+                if el.tag.split("}")[-1] == suffix:
+                    return el
+            return None
+
+        cover = _find_by_suffix(root, "coverPageHeaderReportingPersonDetails")
+        if cover is None:
+            return None
+        name_el = _find_by_suffix(cover, "reportingPersonName")
+        pct_el  = _find_by_suffix(cover, "classPercent")
+        reporting_name = name_el.text.strip() if name_el is not None and name_el.text else None
+        share_pct = None
+        if pct_el is not None and pct_el.text:
+            try:
+                share_pct = float(pct_el.text.strip())
+            except ValueError:
+                share_pct = None
+        return {"reporting_person_name": reporting_name, "share_pct": share_pct}
+    except Exception as e:
+        logger.debug(
+            "13G/13D primary_doc.xml Fetch/Parse fehlgeschlagen: %s — %r (%s)",
+            type(e).__name__, e, url,
+        )
+        return None
+
+
 async def _edgar_fulltext_investors(company_name: str) -> list[dict]:
     """
-    EDGAR EFTS Volltext-Suche — findet Investoren aus SC 13G/13D und Form D.
+    EDGAR EFTS Volltext-Suche — findet Investoren aus SC 13G/13D + den neuen
+    strukturierten SCHEDULE 13G/13D (Pflicht seit 18.12.2024) und Form D.
     Gibt strukturierte Investor-Liste zurück.
+
+    SEC-13D-13G-FULL-PARSE-01 (S89): s. Modul-Kommentar bei
+    _normalize_13dg_source für Formtyp-Historie und verifizierte XML-Struktur.
     """
     results: list[dict] = []
     try:
@@ -273,39 +382,48 @@ async def _edgar_fulltext_investors(company_name: str) -> list[dict]:
                 "https://efts.sec.gov/LATEST/search-index",
                 params={
                     "q": f'"{company_name}"',
-                    "forms": "SC 13G,SC 13D,D",
+                    "forms": "SC 13G,SC 13D,SCHEDULE 13G,SCHEDULE 13D,D",
                     "hits.hits._source": "period_of_report,entity_name,file_num,form_type",
                 },
             )
-        if resp.status_code != 200:
-            return []
+            if resp.status_code != 200:
+                return []
 
-        hits = resp.json().get("hits", {}).get("hits", [])
-        seen: set[str] = set()
+            hits = resp.json().get("hits", {}).get("hits", [])
+            seen: set[str] = set()
 
-        for hit in hits[:8]:
-            src = hit.get("_source", {})
-            entity = src.get("entity_name", "")
-            form_type = src.get("form_type", "")
-            period = src.get("period_of_report", "")
+            for hit in hits[:8]:
+                src = hit.get("_source", {})
+                entity = src.get("entity_name", "")
+                form_type = src.get("form_type", "")
+                period = src.get("period_of_report", "")
 
-            if not entity or entity.lower() == company_name.lower():
-                continue
-            if entity in seen:
-                continue
-            seen.add(entity)
+                if not entity or entity.lower() == company_name.lower():
+                    continue
+                if entity in seen:
+                    continue
+                seen.add(entity)
 
-            # SC 13G/13D = institutioneller Investor mit >5% Beteiligung
-            if "13G" in form_type or "13D" in form_type:
-                results.append({
-                    "name": entity,
-                    "type": _classify_investor_type(entity),
-                    "role": "institutional_investor",
-                    "share_pct": None,  # exakter Wert nur im Filing-XML
-                    "source": f"edgar_{form_type.lower().replace(' ', '_')}",
-                    "as_of_date": period[:10] if period else None,
-                    "notes": f"Filed {form_type}",
-                })
+                # SC 13G/13D = institutioneller Investor mit >5% Beteiligung
+                if "13G" in form_type or "13D" in form_type:
+                    share_pct = None
+                    reporting_name = entity
+                    if form_type.upper() in _13DG_XML_ELIGIBLE_FORMS:
+                        detail = await _fetch_13dg_xml_details(client, hit.get("_id", ""))
+                        await asyncio.sleep(0.15)  # SEC Fair-Access, ≈6.6 req/s
+                        if detail:
+                            share_pct = detail.get("share_pct")
+                            reporting_name = detail.get("reporting_person_name") or entity
+
+                    results.append({
+                        "name": reporting_name,
+                        "type": _classify_investor_type(reporting_name),
+                        "role": "institutional_investor",
+                        "share_pct": share_pct,
+                        "source": _normalize_13dg_source(form_type),
+                        "as_of_date": period[:10] if period else None,
+                        "notes": f"Filed {form_type}",
+                    })
 
     except Exception as e:
         logger.debug("EDGAR fulltext search failed for %s: %s", company_name, e)
