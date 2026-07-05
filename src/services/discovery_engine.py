@@ -236,14 +236,20 @@ def _parse_form_idx(raw_text: str) -> list[dict]:
     return rows
 
 
-async def _fetch_edgar_daily_index(
+async def _fetch_edgar_daily_index_raw(
     client: httpx.AsyncClient,
-    forms: set[str],
     max_lookback_days: int = 5,
 ) -> list[dict]:
     """
-    Holt die form.idx-Datei des letzten Handelstags (mit Rückwärts-Fallback für
-    Wochenenden/Feiertage, max_lookback_days Versuche) und filtert auf `forms`.
+    EDGAR-FORMIDX-TRIPLEFETCH-01 (S84 gefunden, S85 (04.07.) gefixt): holt die
+    form.idx-Datei des letzten Handelstags EINMAL pro Cron-Lauf (mit Rückwärts-
+    Fallback für Wochenenden/Feiertage, max_lookback_days Versuche) und gibt
+    ALLE Zeilen ungefiltert zurück. Vorher rief jeder der drei Töpfe (S-1/S-11,
+    D/D-A, 8-K) eine eigene Fetch+Parse-Funktion auf — 3x dieselbe Datei vom
+    Netz, plus je 1x der vorab abgelehnte 403-Versuch auf den noch nicht
+    veröffentlichten Vortages-Index macht 6 HTTP-Requests für eine einzige
+    Datei pro Lauf. Filterung passiert jetzt separat in _filter_edgar_rows()
+    (reine In-Memory-Funktion, kein weiterer Netzwerk-Call).
     """
     today = date.today()
     for delta in range(1, max_lookback_days + 1):
@@ -258,16 +264,22 @@ async def _fetch_edgar_daily_index(
                 logger.warning("EDGAR full-index HTTP %s für %s", resp.status_code, url)
                 continue
             rows = _parse_form_idx(resp.text)
-            filtered = [r for r in rows if r["form_type"] in forms]
             logger.info(
-                "EDGAR full-index %s: %d Zeilen gesamt, %d nach Form-Filter %s",
-                target.isoformat(), len(rows), len(filtered), sorted(forms),
+                "EDGAR full-index %s: %d Zeilen gesamt (ungefiltert, einmaliger Fetch)",
+                target.isoformat(), len(rows),
             )
-            return filtered
+            return rows
         except Exception as e:
             logger.warning("EDGAR full-index Fetch fehlgeschlagen für %s: %s", url, e)
     logger.warning("EDGAR full-index: kein Treffer in %d Tagen Rückwärtssuche", max_lookback_days)
     return []
+
+
+def _filter_edgar_rows(rows: list[dict], forms: set[str]) -> list[dict]:
+    """Reine In-Memory-Filterung der einmalig geholten form.idx-Zeilen — kein Netzwerk-Call."""
+    filtered = [r for r in rows if r["form_type"] in forms]
+    logger.info("EDGAR full-index Form-Filter %s: %d von %d Zeilen", sorted(forms), len(filtered), len(rows))
+    return filtered
 
 
 _ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
@@ -378,6 +390,20 @@ _ESMA_ISSUER_NAME_KEYS = (
 _ESMA_DATE_KEYS = ("approval_filing_date", "pd_approvalDate", "approvalDate", "approval_date", "pd_publicationDate")
 _ESMA_LOGGED_UNKNOWN_SCHEMA = False   # nur einmal pro Prozess loggen, nicht pro Kandidat
 
+# ESMA-SCHEMA-02 (S89): Roh-Keys der ersten Antwort (S84) enthielten kein
+# issuer_name/issuerName, dafür party_name — plausibelster Kandidat für den
+# Emittenten-Namen, aber NICHT verifiziert: könnte laut Doku (ESMA-HEADER-01/
+# ESMA-SCHEMA-01, Child-Records party_type=ISSR/OFFR/GNTR) auch Underwriter/
+# Zahlstelle sein, oder als Solr-Multivalue-Feld mehrere Parteien (Issuer+
+# Offeror+Guarantor) undifferenziert zusammenfassen. Bisher wurde nur der
+# FeldNAME geloggt, nie der tatsächliche Feldwert — Diagnose ohne Daten war
+# Rätselraten. Diese Liste sind die plausibelsten Kandidaten für den nächsten
+# Dry-Run, keine Behauptung, dass einer davon bereits die Lösung ist.
+_ESMA_DIAGNOSTIC_VALUE_FIELDS = (
+    "party_name", "prospectus_id", "document_type_descr",
+    "home_member_state_descr", "national_document_id",
+)
+
 
 def _extract_esma_field(doc: dict, candidates: tuple[str, ...]) -> str | None:
     for key in candidates:
@@ -391,10 +417,20 @@ def _log_unknown_schema_once(doc: dict) -> None:
     if _ESMA_LOGGED_UNKNOWN_SCHEMA:
         return
     _ESMA_LOGGED_UNKNOWN_SCHEMA = True
+    # ESMA-SCHEMA-02: Wert UND Typ mitloggen (nicht nur Vorhandensein) — ein
+    # str vs. list-Typ bei party_name entscheidet, ob ein einfacher Key-
+    # Zusatz reicht oder ob eine Rollen-Disambiguierung (Issuer vs. Offeror/
+    # Guarantor) nötig ist, bevor der Name blind übernommen werden darf.
+    sample_values = {
+        key: (doc.get(key), type(doc.get(key)).__name__)
+        for key in _ESMA_DIAGNOSTIC_VALUE_FIELDS
+    }
     logger.warning(
         "ESMA PRIII: keiner der bekannten Issuer-Name-Keys %s im Dokument gefunden. "
-        "Roh-Keys der ersten Antwort (für Feld-Abgleich, einmalig geloggt): %s",
-        _ESMA_ISSUER_NAME_KEYS, sorted(doc.keys()),
+        "Roh-Keys der ersten Antwort (für Feld-Abgleich, einmalig geloggt): %s. "
+        "Werte der plausibelsten Kandidaten, Format (Wert, Python-Typ) — "
+        "ESMA-SCHEMA-02, noch nicht verifiziert ob Issuer oder andere Rolle: %s",
+        _ESMA_ISSUER_NAME_KEYS, sorted(doc.keys()), sample_values,
     )
 
 
@@ -421,24 +457,47 @@ async def _fetch_esma_priii_documents(
 
     ESMA-HEADER-01 (S84): Request sendete bisher keinen User-Agent — jetzt
     gleicher deklarierter UA wie SEC (s. _ESMA_HEADERS).
+
+    ESMA-TIMEOUT-DIAG-01 (04.07.): trotz bestätigtem S84-Fix-Deploy (03.07.,
+    13:06 UTC — vor diesem Lauf) weiterhin ReadTimeout, exakt bei ~15s
+    (altes Timeout) nach dem EDGAR-Call. Deploy-Timing scheidet damit als
+    Erklärung aus. Ein Timeout (kein sofortiger 4xx) spricht eher für einen
+    echten langsamen/hängenden Request als für einen harten WAF-Reject —
+    Konstruktion der Solr-Query stimmt mit dem offiziell dokumentierten
+    Block-Join-Muster anderer ESMA-Register überein (upreg, saris_new,
+    mifid_shsexs nutzen dieselbe {!parent which="type_s:parent"}-Syntax),
+    ist also keine erfundene Syntax. NICHT verifizierbar von hier aus: ob
+    genau DIESER Core (esma_registers_priii_documents) einen ungebundenen
+    Block-Join (kein Such-Kriterium nach dem Parent-Operator, nur ein
+    fq-Filter) teuer macht, oder ob es sich um ein IP-/Traffic-Muster-
+    basiertes Rate-Limiting auf Render-Infrastruktur handelt.
+    Zwei rein diagnostische, risikoarme Änderungen (KEINE behauptete
+    Lösung): (1) voller Request wird jetzt VOR dem Call geloggt — bisher
+    nur der Fehler danach, nie der tatsächlich gesendete Request selbst;
+    (2) Timeout testweise auf 45s angehoben, um zu unterscheiden ob der
+    Request bei 45s durchgeht (→ echt langsam, Query-Optimierung nötig)
+    oder weiterhin hängt (→ Netzwerk-/WAF-Block, andere Lösung nötig).
     """
+    params = {
+        "q": '{!parent which="type_s:parent"}',
+        "fq": 'document_type:("URGN" or "REGN" or "SECN" or "SMRY" '
+              'or "BPFT" or "BPWO" or "STDA")',
+        "rows": rows,
+        "wt": "json",
+        "sort": "approval_filing_date desc",
+        # ESMA-FL-PARAM-01 (S83) bleibt in Kraft: ohne fl=* liefert
+        # Solr nur den Request-Handler-Default-Feldsatz.
+        "fl": "*",
+    }
+    logger.info("ESMA PRIII Request: GET %s params=%s", _ESMA_PRIII_SELECT, params)
     candidates: list[dict] = []
+    _t0 = asyncio.get_event_loop().time()
     try:
         resp = await client.get(
             _ESMA_PRIII_SELECT,
             headers=_ESMA_HEADERS,
-            params={
-                "q": '{!parent which="type_s:parent"}',
-                "fq": 'document_type:("URGN" or "REGN" or "SECN" or "SMRY" '
-                      'or "BPFT" or "BPWO" or "STDA")',
-                "rows": rows,
-                "wt": "json",
-                "sort": "approval_filing_date desc",
-                # ESMA-FL-PARAM-01 (S83) bleibt in Kraft: ohne fl=* liefert
-                # Solr nur den Request-Handler-Default-Feldsatz.
-                "fl": "*",
-            },
-            timeout=15.0,
+            params=params,
+            timeout=45.0,
         )
         if resp.status_code != 200:
             logger.warning("ESMA PRIII HTTP %s", resp.status_code)
@@ -461,8 +520,13 @@ async def _fetch_esma_priii_documents(
         # ESMA-EXC-TYPE-LOG-01: str(e) ist bei manchen Exceptions (u.a.
         # asyncio.TimeoutError) leer — ohne Typ+repr nicht diagnostizierbar
         # (S77-Dry-Run-Log zeigte exakt das: "Fetch fehlgeschlagen: " ohne Inhalt).
+        # ESMA-TIMEOUT-DIAG-01: Elapsed-Time zeigt, ob der 45s-Timeout auch
+        # greift (→ hängt weiterhin, wahrscheinlich Netzwerk-/WAF-Block) oder
+        # ob der Request irgendwo dazwischen durchgeht/schneller fehlschlägt.
+        elapsed = asyncio.get_event_loop().time() - _t0
         logger.warning(
-            "ESMA PRIII Fetch fehlgeschlagen: %s — %r", type(e).__name__, e
+            "ESMA PRIII Fetch fehlgeschlagen nach %.1fs: %s — %r",
+            elapsed, type(e).__name__, e,
         )
     return candidates
 
@@ -722,13 +786,21 @@ async def _extract_deal_details(
             timeout=20.0,
         )
         if resp.status_code != 200:
-            logger.debug("Deal-Extraktion Claude HTTP %s", resp.status_code)
+            # COMPTX-EXTRACTION-DIAGNOSTIC-01 (04.07.): war debug — ein Claude-
+            # API-Fehler ist keine Routine-Ablehnung wie "kein klarer Deal im
+            # Text", sondern ein Infrastrukturproblem. Gleiches Prinzip wie
+            # ESMA-EXC-TYPE-LOG-01: technische Fehler laut, fachliche Non-
+            # Matches leise.
+            logger.warning("Deal-Extraktion Claude HTTP %s", resp.status_code)
             return None
         import json as _json
         raw = resp.json()["content"][0]["text"].strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
         parsed = _json.loads(raw)
         if not parsed.get("acquirer_name") or not parsed.get("target_name"):
+            # Legitimer, erwarteter Fall (Claude fand keinen klaren Deal) —
+            # bewusst debug, keine technische Störung.
+            logger.debug("Deal-Extraktion: kein klarer Deal erkannt (kein acquirer/target im Filing-Text)")
             return None
         # Taxonomie-Validierung: Haiku haelt sich i.d.R. an die Vorgabe, aber
         # nicht garantiert — ein ungueltiger Wert wird zu None statt einem
@@ -740,7 +812,13 @@ async def _extract_deal_details(
             parsed["target_funding_stage_at_sale"] = None
         return parsed
     except Exception as e:
-        logger.debug("Deal-Extraktion fehlgeschlagen: %s — %r", type(e).__name__, e)
+        # COMPTX-EXTRACTION-DIAGNOSTIC-01 (04.07.): war debug ohne Typ/Repr —
+        # identisches Muster zum ESMA-EXC-TYPE-LOG-01-Fund (S77): str(e) ist
+        # bei manchen Exceptions leer, ohne Typ+repr nicht diagnostizierbar.
+        # 17/17 comp_tx-Extraktions-Rejects am 04.07. liefen alle unsichtbar
+        # durch genau diesen Pfad oder den obigen Non-Match-Pfad — bisher
+        # nicht unterscheidbar, welcher der beiden dominiert.
+        logger.warning("Deal-Extraktion fehlgeschlagen: %s — %r", type(e).__name__, e)
         return None
 
 
@@ -959,11 +1037,23 @@ async def run_discovery_pipeline() -> dict:
         # EU-NEWS-FUNDING-GRANULARITY-01: unterscheidet, ob ein EU-News-Item
         # am EUR-Floor oder an der Claude-Haiku-Namensextraktion scheitert —
         # vorher beides im selben "funding_seen=0" nicht unterscheidbar.
-        "eu_news_seen": 0, "eu_news_rejected_floor": 0, "eu_news_rejected_extraction": 0,
+        # EU-NEWS-AMOUNT-DIAGNOSTIC-01 (04.07.): "kein Betrag im Text erkannt"
+        # und "Betrag erkannt, aber < Floor" liefen bisher in DENSELBEN
+        # eu_news_rejected_floor-Zähler — macht die Andreas-Hypothese
+        # (EU-Runden kommunizieren Beträge seltener/anders als US) empirisch
+        # nicht von einem Extraktionsbug unterscheidbar. Jetzt getrennt.
+        "eu_news_seen": 0, "eu_news_rejected_no_amount": 0,
+        "eu_news_rejected_floor": 0, "eu_news_rejected_extraction": 0,
         # DEALCOMPS-TRANSACTIONS-01: dritter Topf, kein DAILY_CAP_PER_POT-Limit
         # (eigene Decke COMPTX_DAILY_CAP, andere Logik s. dort).
+        # COMPTX-EXTRACTION-DIAGNOSTIC-01 (04.07.): comp_tx_rejected_extraction
+        # vermischte bisher zwei fachlich verschiedene Fälle (kein Deal vs.
+        # Deal ohne Preis) — bei 17/17 Rejects am 04.07. nicht rekonstruierbar,
+        # welcher Fall vorlag. Aufgeteilt, alter Key bleibt als Summe für
+        # Rückwärts-Kompatibilität mit bestehenden Log-Auswertungen.
         "comp_tx_seen": 0, "comp_tx_written": 0,
         "comp_tx_rejected_no_item": 0, "comp_tx_rejected_extraction": 0,
+        "comp_tx_rejected_no_deal": 0, "comp_tx_rejected_no_price": 0,
         "comp_tx_backfilled": 0,
     }
     new_signals: list[SignalEvent] = []
@@ -971,10 +1061,15 @@ async def run_discovery_pipeline() -> dict:
     timeout = httpx.Timeout(15.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
 
+        # EDGAR-FORMIDX-TRIPLEFETCH-01: EINMAL geholt, dreifach in-memory
+        # gefiltert (S-1/S-11, D/D-A, 8-K) — vorher 3x (effektiv 6x) derselbe
+        # Netzwerk-Fetch für dieselbe Datei.
+        edgar_index_raw = await _fetch_edgar_daily_index_raw(client)
+
         # ── IPO-Intent-Topf: EDGAR S-1/S-11 + ESMA PRIII ─────────────────────
         ipo_intent_candidates: list[dict] = []
 
-        edgar_s1 = await _fetch_edgar_daily_index(client, forms={"S-1", "S-11"})
+        edgar_s1 = _filter_edgar_rows(edgar_index_raw, forms={"S-1", "S-11"})
         for row in edgar_s1:
             ipo_intent_candidates.append({
                 "name": row["company_name"], "source": "edgar_s1",
@@ -1038,7 +1133,7 @@ async def run_discovery_pipeline() -> dict:
         # ── Funding-Topf: EDGAR Form D/D-A + kuratierte EU-News ──────────────
         funding_candidates: list[dict] = []
 
-        edgar_formd = await _fetch_edgar_daily_index(client, forms={"D", "D/A"})
+        edgar_formd = _filter_edgar_rows(edgar_index_raw, forms={"D", "D/A"})
         for row in edgar_formd:
             amount = await _fetch_form_d_amount(client, row["cik"], row["file_name"], row["company_name"])
             if amount is None or amount < FORM_D_FLOOR_USD_MN:
@@ -1057,11 +1152,18 @@ async def run_discovery_pipeline() -> dict:
         for item in eu_news:
             text = f"{item['title']} {item['description']}"
             eur_amount = _extract_eur_funding_amount(text)
-            if eur_amount is None or eur_amount < EU_NEWS_FLOOR_EUR_MN:
+            if eur_amount is None:
+                stats["eu_news_rejected_no_amount"] += 1
+                logger.debug(
+                    "EU-News Reject (kein EUR-Betrag im Text erkennbar): '%s'",
+                    item["title"][:120],
+                )
+                continue
+            if eur_amount < EU_NEWS_FLOOR_EUR_MN:
                 stats["eu_news_rejected_floor"] += 1
                 logger.debug(
-                    "EU-News Floor-Reject (kein/zu kleiner EUR-Betrag erkannt): '%s'",
-                    item["title"][:120],
+                    "EU-News Floor-Reject (€%.1fM erkannt, < €%.1fM Floor): '%s'",
+                    eur_amount, EU_NEWS_FLOOR_EUR_MN, item["title"][:120],
                 )
                 continue
             extracted = await _extract_company_from_news(client, item["title"], item["description"])
@@ -1125,7 +1227,7 @@ async def run_discovery_pipeline() -> dict:
         # DEALCOMPS-BACKFILL-01 (Company-Nachholung für unbekannte Targets)
         # ist hier bewusst NICHT mitgebaut — eigenes, separat zu spezifizierendes
         # Ticket, kein Vermischen von Schema-Aufbau und Backfill-Logik.
-        edgar_8k = await _fetch_edgar_daily_index(client, forms={"8-K"})
+        edgar_8k = _filter_edgar_rows(edgar_index_raw, forms={"8-K"})
         stats["comp_tx_seen"] = len(edgar_8k)
 
         for row in edgar_8k:
@@ -1144,6 +1246,7 @@ async def run_discovery_pipeline() -> dict:
             clean_text = _strip_filing_markup(filing_text)
             deal = await _extract_deal_details(client, clean_text, items, row["date_filed"])
             if not deal:
+                stats["comp_tx_rejected_no_deal"] += 1
                 stats["comp_tx_rejected_extraction"] += 1
                 continue
 
@@ -1151,6 +1254,7 @@ async def run_discovery_pipeline() -> dict:
             if deal_price is None:
                 # Ohne Preis kein Comp — der einzige zwingende Wert (Andreas,
                 # S78: "Kaufpreise reichen, um Transaktionen abzubilden").
+                stats["comp_tx_rejected_no_price"] += 1
                 stats["comp_tx_rejected_extraction"] += 1
                 continue
 
