@@ -177,6 +177,25 @@ COMPTX_DAILY_CAP = 20   # hoeher als DAILY_CAP_PER_POT=2 -- hier keine Company-
                         # mehr Vergleichstransaktionen sind fuer die spaetere
                         # EXIT_ADJUSTMENT-Kalibrierung schlicht mehr Stichprobe.
 
+# DISCOVERY-FUND-VEHICLE-FILTER-01 (S84, im Dry-Run-Log vom 05.07. erneut
+# bestätigt: "Octagon Biotech Opportunities Fund II LP", $175M — derselbe
+# Fall wie S84, kein Einzelfund). Form D deckt jede private Wertpapier-
+# emission ab, auch Fonds-Closings — nicht nur Startup-Runden. Muster laut
+# Andreas (S84: " Fund", " LP", " L.P.", "Partners II") + eigene Erweiterung
+# auf "Partners <Zahl>" allgemein sowie "SPV" — bewusst wortgrenzenbasiert
+# (\b), damit eine echte Portfolio-Company mit "Fund"/"Partners" im Namen
+# (z.B. "FundApp Inc") NICHT fälschlich geblockt wird.
+_FUND_VEHICLE_NAME_RE = re.compile(
+    r"\bfund\b|\bL\.?P\.?\b|\bpartners?\s+(?:i{1,3}|iv|v|vi{1,3})\b|\bSPV\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_fund_vehicle(name: str) -> bool:
+    """True wenn der Name eher nach Investment-Vehikel (Fonds, GP/LP-
+    Struktur) klingt als nach Portfolio-Company. S. Modul-Kommentar oben."""
+    return bool(_FUND_VEHICLE_NAME_RE.search(name))
+
 
 # ── Hilfsfunktionen: EDGAR Full-Index ────────────────────────────────────────
 
@@ -1033,7 +1052,7 @@ async def run_discovery_pipeline() -> dict:
         "ipo_intent_rejected_sector": 0, "ipo_intent_rejected_dedupe": 0,
         "ipo_intent_skipped_cap": 0,
         "funding_rejected_sector": 0, "funding_rejected_dedupe": 0,
-        "funding_skipped_cap": 0,
+        "funding_skipped_cap": 0, "funding_rejected_fund_vehicle": 0,
         # EU-NEWS-FUNDING-GRANULARITY-01: unterscheidet, ob ein EU-News-Item
         # am EUR-Floor oder an der Claude-Haiku-Namensextraktion scheitert —
         # vorher beides im selben "funding_seen=0" nicht unterscheidbar.
@@ -1131,10 +1150,27 @@ async def run_discovery_pipeline() -> dict:
             stats["ipo_intent_written"] += 1
 
         # ── Funding-Topf: EDGAR Form D/D-A + kuratierte EU-News ──────────────
+        # DISCOVERY-FUND-VEHICLE-FILTER-01 (S84, im Log vom 05.07. erneut
+        # bestätigt: 'Octagon Biotech Opportunities Fund II LP', $175M —
+        # derselbe Fall wie S84, kein Einzelfund). Form D deckt jede private
+        # Wertpapieremission ab, auch Fonds-Closings — nicht nur Startup-
+        # Runden. Ein Investmentfonds als "Investment-Target" im Explore-Feed
+        # widerspricht "Datentransparenz als Plattform-Logik" (Andreas, S84).
+        # Gate sitzt VOR _fetch_form_d_amount (spart einen SEC-Request pro
+        # Fund-Treffer) und vor dem späteren Sektor-Gate (spart einen Claude-
+        # Haiku-Call). s. _FUND_VEHICLE_NAME_RE weiter oben für die Muster.
         funding_candidates: list[dict] = []
 
         edgar_formd = _filter_edgar_rows(edgar_index_raw, forms={"D", "D/A"})
         for row in edgar_formd:
+            if _looks_like_fund_vehicle(row["company_name"]):
+                stats["funding_rejected_fund_vehicle"] += 1
+                logger.debug(
+                    "Form D Reject (Namensmuster deutet auf Fonds/Investment-"
+                    "Vehikel statt Portfolio-Company): '%s'",
+                    row["company_name"],
+                )
+                continue
             amount = await _fetch_form_d_amount(client, row["cik"], row["file_name"], row["company_name"])
             if amount is None or amount < FORM_D_FLOOR_USD_MN:
                 continue
