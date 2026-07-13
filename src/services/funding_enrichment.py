@@ -547,9 +547,24 @@ def _rounds_from_signals(company_id: str, company_name: str) -> list[dict]:
             if not amount:
                 continue
             ev_date_raw = sig.get("event_date", "")
-            stage       = _infer_stage(f"{sig.get('raw_title', '')} {sig.get('summary', '')}")
+            raw_text    = f"{sig.get('raw_title', '')} {sig.get('summary', '')}"
+            stage       = _infer_stage(raw_text)
+            # FUNDING-DATE-FALLBACK-01: date.today() als Fallback brach die
+            # Idempotenz (UNIQUE(company_id, date, type) greift nie, wenn date
+            # bei jedem Cron-Lauf neu = heute ist — führte zu wiederkehrenden
+            # Dubletten, s. Fervo-Debt-Fall). Jetzt: erst event_date, sonst
+            # Datum aus Freitext inferieren (Monat/Jahr, Jahr allein reicht für
+            # die UNIQUE-Dedup), nur wenn wirklich nichts erkennbar ist: Signal
+            # überspringen statt ein Datum zu erfinden — no data > wrong data.
+            if ev_date_raw:
+                round_date = ev_date_raw[:10]
+            else:
+                inferred = _infer_date_from_text(raw_text)
+                if not inferred:
+                    continue
+                round_date = inferred.isoformat()
             rounds.append({
-                "date":              ev_date_raw[:10] if ev_date_raw else date.today().isoformat(),
+                "date":              round_date,
                 "type":              stage,
                 "amount_usd_mn":     amount,
                 "source_url":        sig.get("source_url"),
