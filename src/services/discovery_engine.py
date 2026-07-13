@@ -709,25 +709,39 @@ async def _extract_company_from_news(client: httpx.AsyncClient, title: str, desc
 
 # ── DEALCOMPS-TRANSACTIONS-01: 8-K Volltext + Deal-Extraktion ───────────────
 
-async def _fetch_filing_text(client: httpx.AsyncClient, file_name: str) -> str | None:
+async def _fetch_filing_text(client: httpx.AsyncClient, file_name: str, max_bytes: int = 32_000) -> str | None:
     """
-    Holt die komplette Submission als Rohtext. SEC bestaetigt offiziell
-    (sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data):
-    form.idx 'File Name' zeigt direkt auf die ".txt"-Datei mit der "raw text
-    version of the complete disseminated filing content" — keine zweite
-    Index-Auflösung noetig, gleicher Pfad wird schon fuer S-1/Form-D-Zeilen
-    aus form.idx gelesen. Enthaelt SGML/HTML-Markup, ungestrippt — Stripping
-    passiert separat in _strip_filing_markup(), getrennt von der Item-Erkennung
-    (die braucht den Rohtext, "Item 1.01" steht oft in einer Tag-Struktur).
+    Holt nur die ersten max_bytes der Submission, nicht die komplette Datei.
+    SEC bestaetigt offiziell (sec.gov/search-filings/edgar-search-assistance/
+    accessing-edgar-data): form.idx 'File Name' zeigt direkt auf die ".txt"-
+    Datei mit der "raw text version of the complete disseminated filing
+    content" — keine zweite Index-Auflösung noetig, gleicher Pfad wird schon
+    fuer S-1/Form-D-Zeilen aus form.idx gelesen.
+
+    FETCH-FILING-STREAM-01 (13.07.): _8k_item_numbers() und
+    _strip_filing_markup() nutzen beide ausschließlich filing_text[:20000] —
+    die volle Submission (inkl. aller Exhibits: Verträge, Pressemitteilungen)
+    kann bei M&A-relevanten 8-Ks mehrere MB groß sein. Bisher wurde trotzdem
+    die komplette Datei gepuffert (resp.text), nur um dann 95%+ davon zu
+    verwerfen — bei 150 Filings/Lauf ein plausibler Treiber für den Render-
+    Memory-Crash (Instance-Restart mitten in der 8-K-Schleife). Jetzt:
+    Stream, Abbruch nach max_bytes statt vollem Download.
     """
     url = f"https://www.sec.gov/Archives/{file_name}"
     try:
-        resp = await client.get(url, headers=_SEC_HEADERS, timeout=15.0)
-        await asyncio.sleep(_SEC_MIN_DELAY_S)
-        if resp.status_code != 200:
-            logger.debug("Filing-Text HTTP %s — %s", resp.status_code, url)
-            return None
-        return resp.text
+        async with client.stream("GET", url, headers=_SEC_HEADERS, timeout=15.0) as resp:
+            await asyncio.sleep(_SEC_MIN_DELAY_S)
+            if resp.status_code != 200:
+                logger.debug("Filing-Text HTTP %s — %s", resp.status_code, url)
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= max_bytes:
+                    break
+            return b"".join(chunks).decode("utf-8", errors="ignore")
     except Exception as e:
         logger.debug("Filing-Text Fetch fehlgeschlagen für %s: %s — %r", url, type(e).__name__, e)
         return None
